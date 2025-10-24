@@ -14,6 +14,7 @@ import random
 import threading
 import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
 
@@ -42,13 +43,24 @@ class ReceiptStore:
 
 @dataclasses.dataclass
 class ChainAuditConfig:
+    # How many recent receipts to inspect
     window: int = 256
+    # Periodic auditor sleep baseline
     interval_s: float = 15.0
+    # Optional label salt (hex or 0x-prefixed hex) for verification
     label_salt_hex: Optional[str] = None
+    # Keep looping after a failed round
     continue_on_fail: bool = True
+    # If too many bad JSON bodies appear, back off more
     max_bad_bodies: int = 8
+    # Minimum sleep floor
     min_sleep_s: float = 0.05
+    # Sleep base used when a round fails
     fail_retry_s: float = 1.0
+    # Optional timeout for verify step (seconds); 0/None means no timeout
+    verify_timeout_s: Optional[float] = 1.0
+    # Optional cap on total bytes from bodies considered in one round
+    max_window_bytes: Optional[int] = 512 * 1024  # 512 KiB
 
 
 @dataclasses.dataclass
@@ -70,6 +82,8 @@ class _Metrics(NamedTuple):
     store_count: Gauge
     store_size: Gauge
     store_last_ts: Gauge
+    chain_verify_timeout: Counter
+    chain_parse_error_total: Counter
 
 
 def build_metrics(registry: Optional[CollectorRegistry] = None) -> _Metrics:
@@ -89,24 +103,24 @@ def build_metrics(registry: Optional[CollectorRegistry] = None) -> _Metrics:
         store_count=Gauge("tcd_store_count", "Total receipts (store-reported)", registry=reg),
         store_size=Gauge("tcd_store_size_bytes", "Approx store size (bytes)", registry=reg),
         store_last_ts=Gauge("tcd_store_last_ts_seconds", "Timestamp of last receipt (epoch seconds)", registry=reg),
+        chain_verify_timeout=Counter("tcd_chain_verify_timeout_total", "Verify step timed out", registry=reg),
+        chain_parse_error_total=Counter("tcd_chain_parse_error_total", "Receipt JSON parse errors", registry=reg),
     )
 
 
 _METRICS = build_metrics()
+_EXECUTOR = ThreadPoolExecutor(max_workers=1)  # tiny pool; verification is cheap
 
 
 def _normalize_rows(rows: Iterable[Any]) -> List[ReceiptRow]:
     out: List[ReceiptRow] = []
     for r in rows:
         if isinstance(r, ReceiptRow):
-            out.append(r)
-            continue
+            out.append(r); continue
         if isinstance(r, tuple) and len(r) == 2:
-            out.append(ReceiptRow(str(r[0]), str(r[1])))
-            continue
+            out.append(ReceiptRow(str(r[0]), str(r[1]))); continue
         if isinstance(r, dict):
-            out.append(ReceiptRow(str(r["head_hex"]), str(r["body_json"])))
-            continue
+            out.append(ReceiptRow(str(r["head_hex"]), str(r["body_json"]))); continue
         head = getattr(r, "head_hex", None)
         body = getattr(r, "body_json", None)
         if head is None or body is None:
@@ -115,7 +129,29 @@ def _normalize_rows(rows: Iterable[Any]) -> List[ReceiptRow]:
     return out
 
 
-def _prev_gap_count(heads: List[str], bodies: List[str]) -> Tuple[int, int]:
+def _hex_ok(s: Optional[str]) -> Optional[str]:
+    if s is None or s == "":
+        return None
+    if s.startswith("0x") or s.startswith("0X"):
+        s = s[2:]
+    try:
+        bytes.fromhex(s)
+        return "0x" + s
+    except Exception:
+        return None
+
+
+def _extract_ts_ns_safe(body: str) -> Optional[int]:
+    try:
+        obj = json.loads(body)
+        v = obj.get("ts_ns")
+        return int(v) if isinstance(v, int) else None
+    except Exception:
+        return None
+
+
+def _prev_gap_count_ordered(heads: List[str], bodies: List[str]) -> Tuple[int, int]:
+    """Assumes ascending order: body[i]['prev'] should equal heads[i-1]."""
     gaps = 0
     bad = 0
     for i in range(len(bodies)):
@@ -132,7 +168,26 @@ def _prev_gap_count(heads: List[str], bodies: List[str]) -> Tuple[int, int]:
     return gaps, bad
 
 
-def _verify_chain(heads: List[str], bodies: List[str], label_salt_hex: Optional[str]) -> bool:
+def _choose_order(heads: List[str], bodies: List[str]) -> Tuple[List[str], List[str]]:
+    """Pick an order that best matches prev pointers. Prefer ts_ns ascending when available."""
+    # Try ts_ns if present in a majority
+    ts_list = [_extract_ts_ns_safe(b) for b in bodies]
+    present = sum(1 for t in ts_list if t is not None)
+    if present >= max(3, len(bodies) // 2):
+        order = sorted(range(len(bodies)), key=lambda i: (ts_list[i] if ts_list[i] is not None else 0))
+        return [heads[i] for i in order], [bodies[i] for i in order]
+    # Otherwise, compare forward vs. reversed match counts
+    f_gaps, f_bad = _prev_gap_count_ordered(heads, bodies)
+    r_heads = list(reversed(heads))
+    r_bodies = list(reversed(bodies))
+    r_gaps, r_bad = _prev_gap_count_ordered(r_heads, r_bodies)
+    # Prefer fewer gaps; tie-breaker uses fewer parse errors; final fallback keeps forward
+    if r_gaps < f_gaps or (r_gaps == f_gaps and r_bad <= f_bad):
+        return r_heads, r_bodies
+    return heads, bodies
+
+
+def _verify_chain_call(heads: List[str], bodies: List[str], label_salt_hex: Optional[str]) -> bool:
     from .verify import verify_chain
     return bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
 
@@ -167,16 +222,47 @@ def audit(store: ReceiptStore, cfg: ChainAuditConfig, *, metrics: _Metrics = _ME
     heads = [r.head_hex for r in rows]
     bodies = [r.body_json for r in rows]
 
+    # Observe sizes, but keep a running budget to avoid pathological payloads
+    budget = cfg.max_window_bytes if (cfg.max_window_bytes and cfg.max_window_bytes > 0) else None
+    consumed = 0
+    parse_bad = 0
     for b in bodies:
         try:
-            metrics.rcpt_size.observe(len(b.encode("utf-8")))
+            size = len(b.encode("utf-8"))
         except Exception:
-            metrics.rcpt_size.observe(len(b))
+            size = len(b)
+        metrics.rcpt_size.observe(size)
+        if budget is not None:
+            consumed += size
+            if consumed > budget:
+                # Truncate on size budget; safe because verify_chain can handle prefixes
+                cut = max(1, int(len(bodies) * 0.7))
+                heads = heads[:cut]
+                bodies = bodies[:cut]
+                break
 
-    gaps, parse_bad = _prev_gap_count(heads, bodies)
+    # Choose the most plausible chronological order
+    heads, bodies = _choose_order(heads, bodies)
+    f_gaps, f_bad = _prev_gap_count_ordered(heads, bodies)
+    parse_bad += f_bad
+    if parse_bad:
+        metrics.chain_parse_error_total.inc(parse_bad)
 
+    # Normalize salt (accept "0x" or bare hex)
+    salt = _hex_ok(cfg.label_salt_hex)
+
+    # Verify with an optional timeout
+    ok = False
     try:
-        ok = _verify_chain(heads, bodies, cfg.label_salt_hex)
+        if cfg.verify_timeout_s and cfg.verify_timeout_s > 0:
+            fut = _EXECUTOR.submit(_verify_chain_call, heads, bodies, salt)
+            ok = bool(fut.result(timeout=float(cfg.verify_timeout_s)))
+        else:
+            ok = _verify_chain_call(heads, bodies, salt)
+    except TimeoutError:
+        metrics.chain_verify_timeout.inc()
+        ok = False
+        logger.warning("chain verify timeout after %.3fs", float(cfg.verify_timeout_s or 0.0))
     except Exception as e:
         logger.exception("verify_chain raised: %s", e)
         ok = False
@@ -195,13 +281,13 @@ def audit(store: ReceiptStore, cfg: ChainAuditConfig, *, metrics: _Metrics = _ME
 
     metrics.chain_latency.observe(dur)
     metrics.chain_ok.set(1.0 if ok else 0.0)
-    metrics.chain_gap_window.set(gaps)
-    if gaps > 0:
-        metrics.chain_gap_total.inc(gaps)
+    metrics.chain_gap_window.set(int(f_gaps))
+    if f_gaps > 0:
+        metrics.chain_gap_total.inc(int(f_gaps))
     if not ok:
         metrics.chain_fail.inc()
 
-    return ChainAuditReport(ok=ok, checked=len(rows), gaps=gaps, parse_errors=parse_bad, latency_s=dur)
+    return ChainAuditReport(ok=ok, checked=len(bodies), gaps=int(f_gaps), parse_errors=int(parse_bad), latency_s=dur)
 
 
 class ChainAuditor:
