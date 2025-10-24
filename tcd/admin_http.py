@@ -4,14 +4,14 @@ from __future__ import annotations
 """
 Admin-only HTTP surface for policies, verification, receipts access, and runtime info.
 
-This module builds a FastAPI app exposing /admin/* endpoints guarded by a minimal
-token auth. The implementation intentionally keeps collaborators pluggable:
-- PolicyStore is passed in via AdminContext
-- Receipt storage implements a light Protocol
-- Verifiers are imported but can be monkeypatched in tests
-
-Functional behavior is unchanged from the prior version; this file only refines
-style, comments, logging, and exports.
+Enhancements in this revision:
+- Optional IP allowlist (env TCD_ADMIN_IP_ALLOWLIST)
+- Lightweight token-bucket rate limiting (env TCD_ADMIN_RPS / TCD_ADMIN_BURST)
+- Request size guard middleware (env TCD_ADMIN_MAX_BODY_BYTES)
+- Production-safe docs switch (env TCD_ADMIN_ENABLE_DOCS=0 to disable OpenAPI/Docs)
+- Request ID propagation via X-Request-Id / X-TCD-Request-Id headers
+- Boundaries on input sizes (pydantic max_length / max_items) to prevent DoS
+- Optional orjson for faster canonical dumps
 """
 
 import json
@@ -23,8 +23,9 @@ import time
 from dataclasses import dataclass, asdict, is_dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Protocol, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.routing import APIRouter
+from pydantic import BaseModel, Field, field_validator, conlist
 
 from .config import make_reloadable_settings
 from .crypto import Blake3Hash
@@ -55,10 +56,20 @@ try:
 except Exception:  # pragma: no cover
     Attestor = object  # type: ignore[misc,assignment]
 
-logger = logging.getLogger(__name__)
+# Optional fast JSON
+try:  # pragma: no cover - perf sugar; correctness covered by json fallback
+    import orjson as _orjson
+
+    def _dumps(obj: Any) -> bytes:
+        return _orjson.dumps(obj, option=_orjson.OPT_SORT_KEYS)
+except Exception:  # pragma: no cover
+    def _dumps(obj: Any) -> bytes:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+logger = logging.getLogger("tcd.admin")
 
 # -----------------------------------------------------------------------------
-
 
 class ReceiptStorageProtocol(Protocol):
     """Optional receipt store used by admin APIs; implementations may be in-memory or persistent."""
@@ -82,6 +93,18 @@ _SETTINGS_HOT = make_reloadable_settings()
 _ADMIN_LOCK = threading.RLock()
 _ADMIN_API_VERSION = os.getenv("TCD_ADMIN_API_VERSION", "0.10.3")
 
+# Security knobs
+_IP_ALLOWLIST = tuple(
+    [x.strip() for x in os.getenv("TCD_ADMIN_IP_ALLOWLIST", "").split(",") if x.strip()]
+)
+_ENABLE_DOCS = os.getenv("TCD_ADMIN_ENABLE_DOCS", "0") == "1"
+_MAX_BODY = int(os.getenv("TCD_ADMIN_MAX_BODY_BYTES", str(1 * 1024 * 1024)))  # 1 MiB
+_RPS = float(os.getenv("TCD_ADMIN_RPS", "10"))  # per key
+_BURST = int(os.getenv("TCD_ADMIN_BURST", "20"))
+
+# -----------------------------------------------------------------------------
+# Auth & Guards
+# -----------------------------------------------------------------------------
 
 def _require_admin(token: Optional[str] = Header(default=None, alias="X-TCD-Admin-Token")) -> None:
     """
@@ -101,8 +124,94 @@ def _require_admin(token: Optional[str] = Header(default=None, alias="X-TCD-Admi
         raise HTTPException(status_code=403, detail="forbidden")
 
 
-# Utilities -------------------------------------------------------------------
+def _require_ip_allowlist(req: Request) -> None:
+    """Optional IP allowlist; when set, only listed client IPs are allowed."""
+    if not _IP_ALLOWLIST:
+        return
+    client_ip = (req.client.host if req.client else "") or ""
+    if client_ip not in _IP_ALLOWLIST:
+        raise HTTPException(status_code=403, detail="ip not allowed")
 
+# -----------------------------------------------------------------------------
+# Middlewares
+# -----------------------------------------------------------------------------
+
+class _TokenBucket:
+    """Simple token bucket keyed by admin token or client IP."""
+    __slots__ = ("capacity", "rate", "tokens", "updated")
+
+    def __init__(self, rate: float, capacity: int):
+        self.rate = max(0.1, rate)
+        self.capacity = max(1, capacity)
+        self.tokens = float(self.capacity)
+        self.updated = time.monotonic()
+
+    def allow(self) -> bool:
+        now = time.monotonic()
+        delta = now - self.updated
+        self.updated = now
+        self.tokens = min(self.capacity, self.tokens + delta * self.rate)
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
+_BUCKETS: Dict[str, _TokenBucket] = {}
+_BUCKETS_LOCK = threading.Lock()
+
+
+async def _req_context_mw(req: Request, call_next: Callable):
+    """Inject X-Request-Id and version headers; basic IP allowlist."""
+    # IP allowlist check (fast path)
+    try:
+        _require_ip_allowlist(req)
+    except HTTPException as e:
+        return Response(status_code=e.status_code, content=e.detail)
+
+    rid = req.headers.get("X-Request-Id") or f"r-{int(time.time()*1000)}-{os.getpid()}"
+    start = time.perf_counter()
+    resp: Response
+    try:
+        resp = await call_next(req)
+    finally:
+        dt_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "admin.req: path=%s method=%s rid=%s dt_ms=%.3f",
+            req.url.path, req.method, rid, dt_ms
+        )
+    resp.headers["X-TCD-Request-Id"] = rid
+    resp.headers["X-TCD-Admin-Version"] = _ADMIN_API_VERSION
+    return resp
+
+
+async def _size_guard_mw(req: Request, call_next: Callable):
+    """Reject requests with large Content-Length to avoid excessive memory usage."""
+    cl = req.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > _MAX_BODY:
+                return Response(status_code=413, content="payload too large")
+        except Exception:
+            return Response(status_code=400, content="invalid content-length")
+    return await call_next(req)
+
+
+async def _rate_limit_mw(req: Request, call_next: Callable):
+    """In-memory token bucket keyed by admin token or client IP."""
+    key = req.headers.get("X-TCD-Admin-Token") or (req.client.host if req.client else "unknown")
+    with _BUCKETS_LOCK:
+        b = _BUCKETS.get(key)
+        if b is None:
+            b = _TokenBucket(rate=_RPS, capacity=_BURST)
+            _BUCKETS[key] = b
+    if not b.allow():
+        return Response(status_code=429, content="rate limit exceeded")
+    return await call_next(req)
+
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
 
 def _dump_cfg(obj: Any) -> Dict[str, Any]:
     """Best-effort, side-effect-free dict dump for config-like objects."""
@@ -121,6 +230,8 @@ def _dump_cfg(obj: Any) -> Dict[str, Any]:
 def _is_hex(s: Optional[str]) -> bool:
     if not s:
         return True
+    if s.startswith("0x"):
+        s = s[2:]
     if len(s) % 2 != 0:
         return False
     try:
@@ -129,9 +240,9 @@ def _is_hex(s: Optional[str]) -> bool:
     except Exception:
         return False
 
-
-# Schemas ---------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Schemas
+# -----------------------------------------------------------------------------
 
 class ReloadRequest(BaseModel):
     source: Literal["env", "file"] = "env"
@@ -167,16 +278,20 @@ class BoundOut(BaseModel):
     match: Dict[str, str]
 
 
+# Length-bounded inputs to avoid DoS
+_MAX_BODY_JSON = 128 * 1024  # 128 KiB per receipt body JSON
+_MAX_CHAIN = 2000            # max items in chain verification
+
 class VerifyReceiptIn(BaseModel):
-    head_hex: str
-    body_json: str
-    sig_hex: Optional[str] = None
-    verify_key_hex: Optional[str] = None
+    head_hex: str = Field(..., min_length=2, max_length=130)  # "0x"+64 hex typical
+    body_json: str = Field(..., min_length=2, max_length=_MAX_BODY_JSON)
+    sig_hex: Optional[str] = Field(default=None, max_length=200)
+    verify_key_hex: Optional[str] = Field(default=None, max_length=200)
     req_obj: Optional[Dict[str, Any]] = None
     comp_obj: Optional[Dict[str, Any]] = None
     e_obj: Optional[Dict[str, Any]] = None
     witness_segments: Optional[Tuple[List[int], List[int], List[int]]] = None
-    label_salt_hex: Optional[str] = None
+    label_salt_hex: Optional[str] = Field(default=None, max_length=130)
     strict: bool = True
 
     @field_validator("head_hex", "sig_hex", "verify_key_hex", "label_salt_hex")
@@ -188,9 +303,9 @@ class VerifyReceiptIn(BaseModel):
 
 
 class VerifyChainIn(BaseModel):
-    heads: List[str]
-    bodies: List[str]
-    label_salt_hex: Optional[str] = None
+    heads: conlist(str, min_length=1, max_length=_MAX_CHAIN)  # type: ignore[arg-type]
+    bodies: conlist(str, min_length=1, max_length=_MAX_CHAIN)  # type: ignore[arg-type]
+    label_salt_hex: Optional[str] = Field(default=None, max_length=130)
 
     @field_validator("heads")
     @classmethod
@@ -236,9 +351,9 @@ class RuntimeOut(BaseModel):
     settings: Dict[str, Any]
     stats: Dict[str, Any]
 
-
-# Factory ---------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Factory
+# -----------------------------------------------------------------------------
 
 def create_admin_app(ctx: AdminContext) -> FastAPI:
     """
@@ -246,8 +361,20 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
     protected by _require_admin. Control-plane only: policies, verification,
     receipts, runtime info, and settings reload.
     """
-    app = FastAPI(title="tcd-admin", version=_ADMIN_API_VERSION)
+    openapi_url = "/openapi.json" if _ENABLE_DOCS else None
+    docs_url = "/docs" if _ENABLE_DOCS else None
+    redoc_url = "/redoc" if _ENABLE_DOCS else None
+
+    app = FastAPI(title="tcd-admin", version=_ADMIN_API_VERSION,
+                  openapi_url=openapi_url, docs_url=docs_url, redoc_url=redoc_url)
+
+    # Middlewares
+    app.middleware("http")(_req_context_mw)
+    app.middleware("http")(_size_guard_mw)
+    app.middleware("http")(_rate_limit_mw)
+
     hasher = Blake3Hash()
+    router = APIRouter(prefix="/admin", dependencies=[Depends(_require_admin)])
 
     # Cache digest keyed by rules list identity (avoids re-hashing on frequent GETs)
     _policy_digest_cache: Dict[int, str] = {}
@@ -258,10 +385,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
             if key in _policy_digest_cache:
                 return _policy_digest_cache[key]
             canon = {"rules": [r.model_dump() for r in rules], "version": "1"}
-            digest = hasher.hex(
-                json.dumps(canon, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-                ctx="tcd:policyset",
-            )
+            digest = hasher.hex(_dumps(canon), ctx="tcd:policyset")
             _policy_digest_cache[key] = digest
             return digest
         except Exception as e:  # pragma: no cover
@@ -270,12 +394,12 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     # ---- Endpoints ----------------------------------------------------------
 
-    @app.get("/admin/healthz", dependencies=[Depends(_require_admin)])
+    @router.get("/healthz")
     def healthz():
         s = _SETTINGS_HOT.get()
         return {"ok": True, "ts": time.time(), "version": _ADMIN_API_VERSION, "config_hash": s.config_hash()}
 
-    @app.get("/admin/runtime", response_model=RuntimeOut, dependencies=[Depends(_require_admin)])
+    @router.get("/runtime", response_model=RuntimeOut)
     def runtime():
         s = _SETTINGS_HOT.get()
         stats: Dict[str, Any] = {}
@@ -289,26 +413,26 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     # Policies ---------------------------------------------------------------
 
-    @app.get("/admin/policies", response_model=PolicySet, dependencies=[Depends(_require_admin)])
+    @router.get("/policies", response_model=PolicySet)
     def policies_get():
         with _ADMIN_LOCK:
             return PolicySet(rules=ctx.policies.rules())
 
-    @app.get("/admin/policies/ref", dependencies=[Depends(_require_admin)])
+    @router.get("/policies/ref")
     def policies_ref():
         with _ADMIN_LOCK:
             rules = ctx.policies.rules()
             digest = _policy_digest(rules)
             return {"policyset_ref": f"set@1#{digest[:12]}", "rules": [r.policy_ref() for r in rules]}
 
-    @app.put("/admin/policies", response_model=Dict[str, Any], dependencies=[Depends(_require_admin)])
+    @router.put("/policies", response_model=Dict[str, Any])
     def policies_put(ps: PolicySet):
         with _ADMIN_LOCK:
             ctx.policies.replace_rules(ps.rules or [])
             digest = _policy_digest(ctx.policies.rules())
             return {"ok": True, "policyset_ref": f"set@1#{digest[:12]}", "count": len(ctx.policies.rules())}
 
-    @app.post("/admin/policies/reload", response_model=Dict[str, Any], dependencies=[Depends(_require_admin)])
+    @router.post("/policies/reload", response_model=Dict[str, Any])
     def policies_reload(req: ReloadRequest):
         with _ADMIN_LOCK:
             if req.source == "env":
@@ -321,7 +445,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
             digest = _policy_digest(ctx.policies.rules())
             return {"ok": True, "policyset_ref": f"set@1#{digest[:12]}", "count": len(ctx.policies.rules())}
 
-    @app.post("/admin/policies/bind", response_model=BoundOut, dependencies=[Depends(_require_admin)])
+    @router.post("/policies/bind", response_model=BoundOut)
     def policies_bind(ctx_in: BindContext):
         with _ADMIN_LOCK:
             bound: BoundPolicy = ctx.policies.bind(ctx_in.model_dump())
@@ -348,7 +472,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     # Receipts & Verification -------------------------------------------------
 
-    @app.get("/admin/receipts/{head_hex}", response_model=ReceiptGetOut, dependencies=[Depends(_require_admin)])
+    @router.get("/receipts/{head_hex}", response_model=ReceiptGetOut)
     def receipt_get(head_hex: str):
         if not ctx.storage:
             return ReceiptGetOut(head_hex=head_hex, body_json=None, found=False)
@@ -359,7 +483,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
             raise HTTPException(status_code=500, detail="storage error")
         return ReceiptGetOut(head_hex=head_hex, body_json=body, found=bool(body))
 
-    @app.get("/admin/receipts/tail", response_model=ReceiptTailOut, dependencies=[Depends(_require_admin)])
+    @router.get("/receipts/tail", response_model=ReceiptTailOut)
     def receipt_tail(n: int = 50):
         if not ctx.storage:
             return ReceiptTailOut(items=[], total=0)
@@ -371,7 +495,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
             raise HTTPException(status_code=500, detail="storage error")
         return ReceiptTailOut(items=items, total=len(items))
 
-    @app.post("/admin/verify/receipt", response_model=VerifyOut, dependencies=[Depends(_require_admin)])
+    @router.post("/verify/receipt", response_model=VerifyOut)
     def verify_receipt_api(payload: VerifyReceiptIn):
         t0 = time.perf_counter()
         ok = verify_receipt(
@@ -389,7 +513,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
         dt = (time.perf_counter() - t0) * 1000.0
         return VerifyOut(ok=bool(ok), latency_ms=float(dt))
 
-    @app.post("/admin/verify/chain", response_model=VerifyOut, dependencies=[Depends(_require_admin)])
+    @router.post("/verify/chain", response_model=VerifyOut)
     def verify_chain_api(payload: VerifyChainIn):
         if len(payload.heads) != len(payload.bodies):
             raise HTTPException(status_code=400, detail="heads and bodies length mismatch")
@@ -400,7 +524,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     # Alpha wealth probe (optional) ------------------------------------------
 
-    @app.get("/admin/alpha/{tenant}/{user}/{session}", response_model=AlphaOut, dependencies=[Depends(_require_admin)])
+    @router.get("/alpha/{tenant}/{user}/{session}", response_model=AlphaOut)
     def alpha_state(tenant: str, user: str, session: str):
         state = None
         if ctx.alpha_probe_fn:
@@ -413,19 +537,21 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     # Settings hot-reload -----------------------------------------------------
 
-    @app.get("/admin/config", dependencies=[Depends(_require_admin)])
+    @router.get("/config")
     def config_get():
         s = _SETTINGS_HOT.get()
         return {"config_hash": s.config_hash(), "settings": s.model_dump()}
 
-    @app.post("/admin/config/reload", dependencies=[Depends(_require_admin)])
+    @router.post("/config/reload")
     def config_reload():
         try:
-            _SETTINGS_HOT._reload()  # type: ignore[attr-defined]
+            with _ADMIN_LOCK:
+                _SETTINGS_HOT._reload()  # type: ignore[attr-defined]
         except Exception as e:
             logger.exception("settings reload failed: %s", e)
             raise HTTPException(status_code=500, detail="reload failed")
         s = _SETTINGS_HOT.get()
         return {"ok": True, "config_hash": s.config_hash()}
 
+    app.include_router(router)
     return app
