@@ -6,9 +6,9 @@ import os
 import re
 import threading
 from dataclasses import dataclass, fields, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 from .crypto import Blake3Hash
 from .detector import TCDConfig
@@ -26,34 +26,16 @@ __all__ = [
     "PolicyStore",
 ]
 
+# ---------------------------------------------------------------------------
+# Matching helpers + canonicalization
+# ---------------------------------------------------------------------------
 
-# -------------------------
-# Matching helpers
-# -------------------------
+_HASH_CTX_RULE = "tcd:policy"
+_HASH_CTX_SET = "tcd:policyset"
 
-def _is_regex(p: str) -> bool:
+
+def _is_regex(p: Optional[str]) -> bool:
     return isinstance(p, str) and len(p) >= 2 and p.startswith("/") and p.endswith("/")
-
-
-def _match_token(value: str, pattern: str) -> bool:
-    if pattern is None or pattern == "*":
-        return True
-    if _is_regex(pattern):
-        try:
-            rgx = re.compile(pattern[1:-1])
-            return bool(rgx.fullmatch(value or ""))
-        except Exception:
-            return False
-    return (value or "") == pattern
-
-
-def _specificity(match: "MatchSpec") -> int:
-    score = 0
-    for pat in [match.tenant, match.user, match.session, match.model_id, match.gpu_id, match.task, match.lang]:
-        if pat is None or pat == "*":
-            continue
-        score += 1 if _is_regex(pat) else 2
-    return score
 
 
 def _canon_json(obj: Any) -> str:
@@ -61,6 +43,7 @@ def _canon_json(obj: Any) -> str:
 
 
 def _dc_update(dc, override: Dict[str, Any]):
+    """Shallow, field-safe dataclass update (ignores unknown keys)."""
     if not override:
         return dc
     valid = {f.name for f in fields(dc)}
@@ -68,11 +51,12 @@ def _dc_update(dc, override: Dict[str, Any]):
     return replace(dc, **kwargs) if kwargs else dc
 
 
-# -------------------------
-# Schemas
-# -------------------------
+# ---------------------------------------------------------------------------
+# Schemas (Pydantic v2; extra=forbid to catch typos in policy files)
+# ---------------------------------------------------------------------------
 
 class MatchSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     tenant: str = "*"
     user: str = "*"
     session: str = "*"
@@ -83,6 +67,7 @@ class MatchSpec(BaseModel):
 
 
 class DetectorOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     window_size: Optional[int] = None
     ewma_alpha: Optional[float] = None
     entropy_floor: Optional[float] = None
@@ -98,10 +83,12 @@ class DetectorOverrides(BaseModel):
 
 
 class AVOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     alpha_base: Optional[float] = None
 
 
 class RoutingOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     t_low: Optional[float] = None
     t_high: Optional[float] = None
     top_p_low: Optional[float] = None
@@ -110,16 +97,23 @@ class RoutingOverrides(BaseModel):
 
 
 class ReceiptOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enable_issue: bool = False
     enable_verify_metrics: bool = False
 
 
 class SREOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     slo_latency_ms: Optional[float] = None
     token_cost_divisor: Optional[float] = Field(default=None, ge=1.0)
 
 
 class PolicyRule(BaseModel):
+    """
+    A single policy rule. Regex patterns are denoted as '/.../'.
+    """
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     version: str = "1"
     priority: int = 0
@@ -142,13 +136,13 @@ class PolicyRule(BaseModel):
             "receipt": self.receipt.model_dump() if self.receipt else {},
             "sre": self.sre.model_dump() if self.sre else {},
         }
-        h = Blake3Hash().hex(_canon_json(payload).encode("utf-8"), ctx="tcd:policy")
+        h = Blake3Hash().hex(_canon_json(payload).encode("utf-8"), ctx=_HASH_CTX_RULE)
         return f"{self.name}@{self.version}#{h[:12]}"
 
 
-# -------------------------
-# Bound output
-# -------------------------
+# ---------------------------------------------------------------------------
+# Bound output (immutable)
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class BoundPolicy:
@@ -161,7 +155,7 @@ class BoundPolicy:
     detector_cfg: TCDConfig
     av_cfg: AlwaysValidConfig
 
-    # routing knobs (None means service default)
+    # routing knobs (None -> service default)
     t_low: Optional[float]
     t_high: Optional[float]
     top_p_low: Optional[float]
@@ -174,17 +168,109 @@ class BoundPolicy:
 
     # SRE knobs
     slo_latency_ms: Optional[float]
-    token_cost_divisor: float  # defaulted if None in rule
+    token_cost_divisor: float
 
-    # original match (for audit/debug)
+    # original match
     match: Dict[str, str]
 
 
-# -------------------------
+# ---------------------------------------------------------------------------
+# Internal: compiled rules for fast, deterministic matching
+# ---------------------------------------------------------------------------
+
+_BAD_RE = object()  # sentinel: never matches
+
+_Pat = Union[str, re.Pattern, object]
+
+
+def _compile_pat(p: Optional[str]) -> Optional[_Pat]:
+    if p is None or p == "*":
+        return None
+    if _is_regex(p):
+        try:
+            # Compile inner pattern; we will use fullmatch at evaluation time.
+            return re.compile(p[1:-1])
+        except Exception:
+            return _BAD_RE
+    return p  # literal string
+
+
+def _match_token_compiled(value: str, pat: Optional[_Pat]) -> bool:
+    if pat is None:
+        return True
+    if pat is _BAD_RE:
+        return False
+    if isinstance(pat, re.Pattern):
+        return bool(pat.fullmatch(value or ""))
+    return (value or "") == pat
+
+
+def _specificity_from_match(match: MatchSpec) -> int:
+    score = 0
+    for pat in [match.tenant, match.user, match.session, match.model_id, match.gpu_id, match.task, match.lang]:
+        if pat is None or pat == "*":
+            continue
+        score += 1 if _is_regex(pat) else 2
+    return score
+
+
+@dataclass(frozen=True)
+class _CompiledRule:
+    rule: PolicyRule
+    # compiled patterns
+    tenant: Optional[_Pat]
+    user: Optional[_Pat]
+    session: Optional[_Pat]
+    model_id: Optional[_Pat]
+    gpu_id: Optional[_Pat]
+    task: Optional[_Pat]
+    lang: Optional[_Pat]
+    specificity: int
+    policy_ref: str
+    order: int  # original order for stable tie-breaking
+
+
+def _compile_rule(rule: PolicyRule, idx: int) -> _CompiledRule:
+    m = rule.match
+    return _CompiledRule(
+        rule=rule,
+        tenant=_compile_pat(m.tenant),
+        user=_compile_pat(m.user),
+        session=_compile_pat(m.session),
+        model_id=_compile_pat(m.model_id),
+        gpu_id=_compile_pat(m.gpu_id),
+        task=_compile_pat(m.task),
+        lang=_compile_pat(m.lang),
+        specificity=_specificity_from_match(m),
+        policy_ref=rule.policy_ref(),
+        order=idx,
+    )
+
+
+def _matches_compiled(ctx: Dict[str, str], cr: _CompiledRule) -> bool:
+    return (
+        _match_token_compiled(ctx.get("tenant", ""), cr.tenant)
+        and _match_token_compiled(ctx.get("user", ""), cr.user)
+        and _match_token_compiled(ctx.get("session", ""), cr.session)
+        and _match_token_compiled(ctx.get("model_id", ""), cr.model_id)
+        and _match_token_compiled(ctx.get("gpu_id", ""), cr.gpu_id)
+        and _match_token_compiled(ctx.get("task", ""), cr.task)
+        and _match_token_compiled(ctx.get("lang", ""), cr.lang)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Policy store
-# -------------------------
+# ---------------------------------------------------------------------------
 
 class PolicyStore:
+    """
+    Thread-safe policy store with:
+      - deterministic selection (specificity, priority, then original order)
+      - precompiled regex patterns
+      - domain-separated set digest for audits
+    """
+
     def __init__(
         self,
         rules: List[PolicyRule],
@@ -194,10 +280,15 @@ class PolicyStore:
         default_token_cost_divisor: float = 50.0,
     ):
         self._lock = threading.RLock()
-        self._rules: List[PolicyRule] = list(rules or [])
         self._base_detector = base_detector or TCDConfig()
         self._base_av = base_av or AlwaysValidConfig()
         self._default_token_cost_divisor = float(default_token_cost_divisor)
+
+        self._hasher = Blake3Hash()
+        self._rules: List[PolicyRule] = []
+        self._compiled: List[_CompiledRule] = []
+        self._set_ref: str = "set@1#000000000000"
+        self.replace_rules(rules or [])
 
     # ---------- construction ----------
 
@@ -214,63 +305,81 @@ class PolicyStore:
             try:
                 out.append(PolicyRule.model_validate(item))
             except ValidationError:
+                # Skip invalid entries to avoid failing the entire set on a single bad rule.
                 continue
         return out
 
     @classmethod
-    def from_env(cls, env_key: str = "TCD_POLICIES_JSON") -> "PolicyStore":
+    def from_env(cls, env_key: str = "TCD_POLICIES_JSON", **kwargs) -> "PolicyStore":
         txt = os.environ.get(env_key, "").strip()
         if not txt:
-            return cls(rules=[])
+            return cls(rules=[], **kwargs)
         try:
             obj = json.loads(txt)
         except Exception:
-            return cls(rules=[])
-        return cls(rules=cls._parse_rules(obj))
+            return cls(rules=[], **kwargs)
+        return cls(rules=cls._parse_rules(obj), **kwargs)
 
     @classmethod
-    def from_file(cls, path: str) -> "PolicyStore":
+    def from_file(cls, path: str, **kwargs) -> "PolicyStore":
         try:
             with open(path, "r", encoding="utf-8") as fr:
                 obj = json.load(fr)
         except Exception:
-            return cls(rules=[])
-        return cls(rules=cls._parse_rules(obj))
+            return cls(rules=[], **kwargs)
+        return cls(rules=cls._parse_rules(obj), **kwargs)
 
     # ---------- mutation / read ----------
 
     def replace_rules(self, rules: List[PolicyRule]) -> None:
+        """
+        Replace the rule set and rebuild compiled cache + set digest atomically.
+        """
         with self._lock:
             self._rules = list(rules or [])
+            self._compiled = [_compile_rule(r, idx) for idx, r in enumerate(self._rules)]
+            # Pre-sort by deterministic keys to accelerate bind():
+            # primary: specificity (desc), secondary: priority (desc), tertiary: original order (asc)
+            self._compiled.sort(key=lambda cr: (cr.specificity, int(cr.rule.priority), -cr.order), reverse=True)
+            # Compute a stable set reference for audits
+            canon = {"rules": [r.model_dump() for r in self._rules], "version": "1"}
+            digest = self._hasher.hex(_canon_json(canon).encode("utf-8"), ctx=_HASH_CTX_SET)
+            self._set_ref = f"set@1#{digest[:12]}"
 
     def rules(self) -> List[PolicyRule]:
         with self._lock:
             return list(self._rules)
 
+    def policyset_ref(self) -> str:
+        """
+        Return the canonical reference of the current rule set (stable digest).
+        """
+        with self._lock:
+            return self._set_ref
+
+    def rules_refs(self) -> List[str]:
+        """
+        Return the list of per-rule refs (cached).
+        """
+        with self._lock:
+            return [cr.policy_ref for cr in self._compiled]
+
     # ---------- binding ----------
 
-    @staticmethod
-    def _matches(ctx: Dict[str, str], rule: PolicyRule) -> bool:
-        m = rule.match
-        return (
-            _match_token(ctx.get("tenant", ""), m.tenant)
-            and _match_token(ctx.get("user", ""), m.user)
-            and _match_token(ctx.get("session", ""), m.session)
-            and _match_token(ctx.get("model_id", ""), m.model_id)
-            and _match_token(ctx.get("gpu_id", ""), m.gpu_id)
-            and _match_token(ctx.get("task", ""), m.task)
-            and _match_token(ctx.get("lang", ""), m.lang)
-        )
-
-    @staticmethod
-    def _score(rule: PolicyRule) -> Tuple[int, int]:
-        # Higher specificity first, then higher priority.
-        return (_specificity(rule.match), int(rule.priority))
-
     def bind(self, ctx: Dict[str, str]) -> BoundPolicy:
+        """
+        Determine the effective policy for a request context.
+        Selection is deterministic and stable across processes given the same rule order.
+        """
         with self._lock:
-            candidates = [r for r in self._rules if self._matches(ctx, r)]
-            if not candidates:
+            # Fast path: iterate pre-sorted compiled rules until first match
+            chosen: Optional[_CompiledRule] = None
+            for cr in self._compiled:
+                if _matches_compiled(ctx, cr):
+                    chosen = cr
+                    break
+
+            if chosen is None:
                 # default fallback
                 det = self._base_detector
                 av = self._base_av
@@ -301,9 +410,7 @@ class PolicyStore:
                     },
                 )
 
-            # deterministic selection
-            candidates.sort(key=lambda r: self._score(r), reverse=True)
-            rule = candidates[0]
+            rule = chosen.rule
 
             # effective detector cfg
             det = self._base_detector
@@ -323,7 +430,7 @@ class PolicyStore:
             top_p_high = r.get("top_p_high")
             fallback_decoder = r.get("fallback_decoder")
 
-            # receipt / metrics
+            # receipts / metrics
             enable_receipts = bool(rule.receipt.enable_issue) if rule.receipt else False
             enable_verify_metrics = bool(rule.receipt.enable_verify_metrics) if rule.receipt else False
 
@@ -335,7 +442,7 @@ class PolicyStore:
             return BoundPolicy(
                 name=rule.name,
                 version=rule.version,
-                policy_ref=rule.policy_ref(),
+                policy_ref=chosen.policy_ref,  # cached
                 priority=int(rule.priority),
                 detector_cfg=det,
                 av_cfg=av,
@@ -350,4 +457,3 @@ class PolicyStore:
                 token_cost_divisor=token_cost_divisor,
                 match=rule.match.model_dump(),
             )
-
