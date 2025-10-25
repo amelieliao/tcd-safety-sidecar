@@ -1,0 +1,19 @@
+# Core runtime
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<0.30
+pydantic>=2.6,<3.0
+numpy>=1.24,<2.0
+blake3>=0.4,<0.5
+prometheus-client>=0.17,<1.0
+
+# Optional telemetry (safe to install even if unused)
+opentelemetry-api>=1.24,<2.0
+opentelemetry-sdk>=1.24,<2.0
+opentelemetry-exporter-otlp>=1.24,<2.0
+
+# Optional gRPC (only if you use service_grpc)
+grpcio>=1.60,<2.0
+protobuf>=4.25,<5.0
+
+# Optional GPU sampling (ignored if you leave TCD_GPU_ENABLE=0)
+pynvml>=11.5,<12.0
