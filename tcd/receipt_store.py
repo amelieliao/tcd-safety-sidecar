@@ -1,3 +1,4 @@
+# FILE: tcd/receipts.py
 from __future__ import annotations
 
 """
@@ -10,13 +11,13 @@ Goals
   - Be SRE-friendly: safe appends (fsync), rotation hooks, Prom/OTel metric surfaces.
 
 Design notes
-  - Interface: ReceiptStore (append/get/last_head/verify_chain_window/stats).
+  - Interface: ReceiptStore (append/get/tail/last_head/count/verify_chain_window/stats).
   - JSONL backend is the default for simplicity and portability; SQLite is optional.
   - All backends are thread-safe (RLock). These stores are process-local; for
     cross-process deployments, mount a shared volume or use the SQLite backend.
   - We do not index by tenant by default (to avoid accidental deanonymization).
     If multi-tenant partitioning is required, run separate store instances per tenant
-    or put a tenant-hash prefix in the JSONL path.
+    or put a tenant-hash prefix in the JSONL/SQLite path.
 
 Security & privacy
   - We persist only the attested canonical body and the head (and optional signature + key).
@@ -34,9 +35,76 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Protocol
 
-from .exporter import TCDPrometheusExporter
 from .verify import verify_chain
 
+try:
+    # Optional native Prometheus metrics (kept very lightweight).
+    from prometheus_client import REGISTRY, Counter, Histogram, Gauge  # type: ignore
+    _HAS_PROM = True
+except Exception:  # pragma: no cover
+    _HAS_PROM = False
+
+
+# =============================================================================
+# Metrics (optional, no-op if prometheus_client is unavailable)
+# =============================================================================
+
+if _HAS_PROM:
+    _RCPT_APPEND = Counter(
+        "tcd_receipts_append_total",
+        "Receipt append operations",
+        ["backend"],
+        registry=REGISTRY,
+    )
+    _RCPT_BYTES = Counter(
+        "tcd_receipts_body_bytes_total",
+        "Total appended receipt body bytes",
+        ["backend"],
+        registry=REGISTRY,
+    )
+    _RCPT_COUNT = Gauge(
+        "tcd_receipts_count",
+        "Approx number of receipts in store",
+        ["backend"],
+        registry=REGISTRY,
+    )
+    _RCPT_APPEND_LAT = Histogram(
+        "tcd_receipts_append_latency_seconds",
+        "Append latency",
+        ["backend"],
+        registry=REGISTRY,
+        buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1),
+    )
+    _RCPT_VERIFY_LAT = Histogram(
+        "tcd_receipts_verify_latency_seconds",
+        "Verification latency over a window",
+        ["backend"],
+        registry=REGISTRY,
+        buckets=(0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1),
+    )
+    _RCPT_VERIFY_FAIL = Counter(
+        "tcd_receipts_verify_fail_total",
+        "Chain verification failures",
+        ["backend"],
+        registry=REGISTRY,
+    )
+else:
+    class _Nop:
+        def labels(self, *_, **__): return self
+        def inc(self, *_ , **__): pass
+        def set(self, *_ , **__): pass
+        def observe(self, *_ , **__): pass
+    _RCPT_APPEND = _Nop()
+    _RCPT_BYTES = _Nop()
+    _RCPT_COUNT = _Nop()
+    _RCPT_APPEND_LAT = _Nop()
+    _RCPT_VERIFY_LAT = _Nop()
+    _RCPT_VERIFY_FAIL = _Nop()
+
+
+# =============================================================================
+# Data model + interface
+# =============================================================================
 
 @dataclasses.dataclass(frozen=True)
 class ReceiptRow:
@@ -44,10 +112,10 @@ class ReceiptRow:
     A single persisted receipt entry.
 
     id: monotonically increasing integer (per backend instance).
-    head_hex: the computed receipt head (domain-separated BLAKE3).
+    head_hex: the computed receipt head (domain-separated BLAKE3 or equivalent).
     body_json: canonical JSON string (the "receipt_body" from issuer).
-    sig_hex: optional Ed25519 signature hex string (may be empty).
-    verify_key_hex: optional Ed25519 verify key hex string (may be empty).
+    sig_hex: optional signature hex string (may be empty).
+    verify_key_hex: optional verify key hex string (may be empty).
     ts: storage timestamp (seconds since epoch, float).
     """
     id: int
@@ -59,7 +127,7 @@ class ReceiptRow:
 
 
 class ReceiptStore(Protocol):
-    """Minimal contract every store backend must satisfy."""
+    """Minimal contract every store backend must satisfy (thread-safe)."""
 
     def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
         """Append a receipt, returns assigned id."""
@@ -84,42 +152,92 @@ class ReceiptStore(Protocol):
     def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
         """
         Verify linear chain for the last `window` receipts.
-        Uses verify_chain(heads, bodies) to assert prev pointers and body/head binding.
+        Uses verify_chain(heads, bodies) to assert prev pointers and head/body binding.
         """
         ...
 
     def stats(self) -> Dict[str, float]:
-        """Basic SRE stats: count, size_bytes (if applicable), last_ts, append_qps estimate."""
+        """Basic SRE stats: count, size_bytes (if applicable), last_ts, append_qps_ema."""
         ...
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _qps_ema(prev: float, last_ts: float, now: float, alpha: float = 0.1) -> float:
+    """
+    Exponentially-weighted estimate of instantaneous QPS using time delta.
+    """
+    if last_ts <= 0.0 or now <= last_ts:
+        return (1.0 - alpha) * prev + alpha * 1.0
+    inst = 1.0 / max(1e-6, (now - last_ts))
+    return (1.0 - alpha) * prev + alpha * inst
+
+
+def _tail_lines(path: Path, n: int, *, block_size: int = 64 * 1024) -> List[str]:
+    """
+    Read last n non-empty lines from a text file efficiently without loading the whole file.
+    Returns lines in file order (oldest .. newest).
+    """
+    if n <= 0 or not path.exists():
+        return []
+    out: List[str] = []
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        buf = b""
+        pos = end
+        while pos > 0 and len(out) < n:
+            step = max(0, pos - block_size)
+            size = pos - step
+            f.seek(step)
+            chunk = f.read(size)
+            pos = step
+            buf = chunk + buf
+            *lines, buf = buf.split(b"\n")
+            for line in reversed(lines):
+                s = line.decode("utf-8", errors="ignore").strip()
+                if s:
+                    out.append(s)
+                if len(out) >= n:
+                    break
+        if len(out) < n and buf:
+            s = buf.decode("utf-8", errors="ignore").strip()
+            if s:
+                out.append(s)
+    out.reverse()
+    return out[-n:]
 
 
 # =============================================================================
 # In-memory backend
 # =============================================================================
 
-
 class InMemoryReceiptStore(ReceiptStore):
-    """Process-local in-memory store (good for tests)."""
+    """Process-local in-memory store (good for tests or single-worker dev)."""
 
-    def __init__(self, prom: Optional[TCDPrometheusExporter] = None):
+    def __init__(self):
         self._rows: List[ReceiptRow] = []
         self._id = 0
         self._lk = threading.RLock()
-        self._prom = prom
         self._append_ema = 0.0
-        self._ema_alpha = 0.1
+        self._last_ts = 0.0
 
     def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
         ts = time.time()
         with self._lk:
             self._id += 1
             rid = self._id
             row = ReceiptRow(rid, head_hex, body_json, sig_hex or "", verify_key_hex or "", ts)
             self._rows.append(row)
-            # qps ema
-            self._append_ema = (1 - self._ema_alpha) * self._append_ema + self._ema_alpha * 1.0
-        if self._prom:
-            self._prom.observe_latency(0.0)  # placeholder to keep metric surfaced
+            self._append_ema = _qps_ema(self._append_ema, self._last_ts, ts)
+            self._last_ts = ts
+            _RCPT_COUNT.labels("memory").set(len(self._rows))
+        _RCPT_APPEND.labels("memory").inc()
+        _RCPT_BYTES.labels("memory").inc(len(body_json.encode("utf-8")))
+        _RCPT_APPEND_LAT.labels("memory").observe(max(0.0, time.perf_counter() - t0))
         return rid
 
     def get(self, rid: int) -> Optional[ReceiptRow]:
@@ -131,7 +249,7 @@ class InMemoryReceiptStore(ReceiptStore):
 
     def tail(self, n: int) -> List[ReceiptRow]:
         with self._lk:
-            return list(self._rows[-max(0, n):])
+            return list(self._rows[-max(0, int(n)):])
 
     def last_head(self) -> Optional[str]:
         with self._lk:
@@ -142,65 +260,98 @@ class InMemoryReceiptStore(ReceiptStore):
             return len(self._rows)
 
     def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
         with self._lk:
-            rows = self._rows[-max(0, window):]
+            rows = self._rows[-max(0, int(window)):]
             if not rows:
+                _RCPT_VERIFY_LAT.labels("memory").observe(max(0.0, time.perf_counter() - t0))
                 return True
             heads = [r.head_hex for r in rows]
             bodies = [r.body_json for r in rows]
-        return bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        if not ok:
+            _RCPT_VERIFY_FAIL.labels("memory").inc()
+        _RCPT_VERIFY_LAT.labels("memory").observe(max(0.0, time.perf_counter() - t0))
+        return ok
 
     def stats(self) -> Dict[str, float]:
         with self._lk:
             last_ts = self._rows[-1].ts if self._rows else 0.0
-            return {"count": float(len(self._rows)), "size_bytes": 0.0, "last_ts": float(last_ts), "append_qps_ema": float(self._append_ema)}
+            return {
+                "count": float(len(self._rows)),
+                "size_bytes": 0.0,
+                "last_ts": float(last_ts),
+                "append_qps_ema": float(self._append_ema),
+            }
 
 
 # =============================================================================
 # JSONL backend (append-only)
 # =============================================================================
 
-
 class JsonlReceiptStore(ReceiptStore):
     """
-    Append-only JSONL store with fsync for durability.
+    Append-only JSONL store with optional fsync for durability.
 
     File format: one object per line
-      {"id": int, "ts": float, "receipt": "<head_hex>", "receipt_body": "<canonical body json>",
+      {"id": int, "ts": float, "receipt": "<head_hex>", "receipt_body": "<canonical JSON>",
        "receipt_sig": "<sig hex or empty>", "verify_key": "<vk hex or empty>"}
 
-    Rotation (manual): create a new store instance pointing to a new path; the old file remains as archive.
+    Rotation: instantiate a new store with a new path; the old file remains as archive.
     """
 
-    def __init__(self, path: str, prom: Optional[TCDPrometheusExporter] = None, *, create_dirs: bool = True, fsync_writes: bool = True):
+    def __init__(
+        self,
+        path: str,
+        *,
+        create_dirs: bool = True,
+        fsync_writes: bool = True,
+        fsync_dir: bool = False,
+    ):
         self._path = Path(path)
         if create_dirs:
             self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lk = threading.RLock()
-        self._prom = prom
         self._fsync = bool(fsync_writes)
+        self._fsync_dir = bool(fsync_dir)
         self._next_id = 1
         self._last_head: Optional[str] = None
         self._append_ema = 0.0
-        self._ema_alpha = 0.1
+        self._last_ts = 0.0
 
-        # Initialize next_id from file contents, without loading entire file into memory
+        # Initialize next_id/last_head from the last good line (robust against partial last line).
         if self._path.exists():
             try:
-                with self._path.open("r", encoding="utf-8") as fr:
-                    last_line = ""
-                    for line in fr:
-                        if line.strip():
-                            last_line = line
-                    if last_line:
-                        obj = json.loads(last_line)
-                        self._next_id = int(obj.get("id", 0)) + 1
-                        self._last_head = str(obj.get("receipt", "")) or None
+                tail = _tail_lines(self._path, 1)
+                if tail:
+                    obj = json.loads(tail[0])
+                    self._next_id = int(obj.get("id", 0)) + 1
+                    self._last_head = str(obj.get("receipt") or "") or None
             except Exception:
-                # If file is corrupted, continue with a conservative fallback (append from next id)
+                # File present but unreadable; fall back to append from id=1
+                self._next_id = 1
+                self._last_head = None
+
+    def _atomic_append(self, text_line: str) -> None:
+        # A single-file append with flush+fsync. Directory fsync is optional (off by default).
+        with self._path.open("a", encoding="utf-8") as fw:
+            fw.write(text_line)
+            fw.flush()
+            if self._fsync:
+                os.fsync(fw.fileno())
+        if self._fsync_dir:
+            try:
+                dir_fd = os.open(str(self._path.parent), os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                # Directory fsync may not be supported on all platforms; ignore.
                 pass
 
     def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
         ts = time.time()
         with self._lk:
             rid = self._next_id
@@ -214,81 +365,43 @@ class JsonlReceiptStore(ReceiptStore):
                 "receipt_sig": sig_hex or "",
                 "verify_key": verify_key_hex or "",
             }
-            data = json.dumps(obj, ensure_ascii=False) + "\n"
-
-            # atomic-ish append
-            with self._path.open("a", encoding="utf-8") as fw:
-                fw.write(data)
-                fw.flush()
-                if self._fsync:
-                    os.fsync(fw.fileno())
+            data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+            self._atomic_append(data)
 
             self._last_head = head_hex
-            self._append_ema = (1 - self._ema_alpha) * self._append_ema + self._ema_alpha * 1.0
+            self._append_ema = _qps_ema(self._append_ema, self._last_ts, ts)
+            self._last_ts = ts
 
-        if self._prom:
-            # Hook point for a histogram like tcd_receipt_size_bytes; we reuse observe_latency to surface
-            self._prom.observe_latency(0.0)
+        _RCPT_APPEND.labels("jsonl").inc()
+        _RCPT_BYTES.labels("jsonl").inc(len(body_json.encode("utf-8")))
+        _RCPT_COUNT.labels("jsonl").set(float(self.count()))  # approximate, O(n) but infrequent
+        _RCPT_APPEND_LAT.labels("jsonl").observe(max(0.0, time.perf_counter() - t0))
         return rid
 
     def _iter_tail(self, n: int) -> List[ReceiptRow]:
-        # Efficient tail read without loading whole file: read blocks from end.
-        if not self._path.exists() or n <= 0:
-            return []
-
-        rows: List[ReceiptRow] = []
-        # Simple approach: read entire file if small; otherwise do a two-pass tail (acceptable for tests/demo).
-        try:
-            size = self._path.stat().st_size
-            if size < 4 * 1024 * 1024:
-                lines = self._path.read_text(encoding="utf-8").splitlines()
-                for s in lines[-n:]:
-                    obj = json.loads(s)
-                    rows.append(
-                        ReceiptRow(
-                            id=int(obj["id"]),
-                            head_hex=str(obj["receipt"]),
-                            body_json=str(obj["receipt_body"]),
-                            sig_hex=str(obj.get("receipt_sig", "")),
-                            verify_key_hex=str(obj.get("verify_key", "")),
-                            ts=float(obj["ts"]),
-                        )
-                    )
-                return rows
-        except Exception:
-            # Fallback to slow path
-            pass
-
-        # Slow path: iterate forward (still streaming), keep last n
-        try:
-            dq: List[str] = []
-            with self._path.open("r", encoding="utf-8") as fr:
-                for line in fr:
-                    if not line.strip():
-                        continue
-                    dq.append(line)
-                    if len(dq) > n:
-                        dq.pop(0)
-            for s in dq:
+        lines = _tail_lines(self._path, n)
+        out: List[ReceiptRow] = []
+        for s in lines:
+            try:
                 obj = json.loads(s)
-                rows.append(
-                    ReceiptRow(
-                        id=int(obj["id"]),
-                        head_hex=str(obj["receipt"]),
-                        body_json=str(obj["receipt_body"]),
-                        sig_hex=str(obj.get("receipt_sig", "")),
-                        verify_key_hex=str(obj.get("verify_key", "")),
-                        ts=float(obj["ts"]),
-                    )
+            except Exception:
+                continue
+            out.append(
+                ReceiptRow(
+                    id=int(obj["id"]),
+                    head_hex=str(obj["receipt"]),
+                    body_json=str(obj["receipt_body"]),
+                    sig_hex=str(obj.get("receipt_sig", "")),
+                    verify_key_hex=str(obj.get("verify_key", "")),
+                    ts=float(obj["ts"]),
                 )
-        except Exception:
-            return []
-        return rows
+            )
+        return out
 
     def get(self, rid: int) -> Optional[ReceiptRow]:
         if rid <= 0:
             return None
-        # Scan; for JSONL this is O(n). Intended for tests/operator usage.
+        # O(n) scan; acceptable for operator/debug usage.
         try:
             with self._path.open("r", encoding="utf-8") as fr:
                 for line in fr:
@@ -317,7 +430,7 @@ class JsonlReceiptStore(ReceiptStore):
             return self._last_head
 
     def count(self) -> int:
-        # Count lines; for large files this is O(n). For production, prefer SQLite.
+        # Count lines; for very large files this is O(n). For production at scale, prefer SQLite.
         try:
             c = 0
             with self._path.open("r", encoding="utf-8") as fr:
@@ -328,12 +441,18 @@ class JsonlReceiptStore(ReceiptStore):
             return 0
 
     def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
         rows = self.tail(window)
         if not rows:
+            _RCPT_VERIFY_LAT.labels("jsonl").observe(max(0.0, time.perf_counter() - t0))
             return True
         heads = [r.head_hex for r in rows]
         bodies = [r.body_json for r in rows]
-        return bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        if not ok:
+            _RCPT_VERIFY_FAIL.labels("jsonl").inc()
+        _RCPT_VERIFY_LAT.labels("jsonl").observe(max(0.0, time.perf_counter() - t0))
+        return ok
 
     def stats(self) -> Dict[str, float]:
         size = 0.0
@@ -358,57 +477,60 @@ class JsonlReceiptStore(ReceiptStore):
 # SQLite backend (optional; stdlib only)
 # =============================================================================
 
-
 _SQL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL NOT NULL,
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts   REAL NOT NULL,
     head TEXT NOT NULL,
     body TEXT NOT NULL,
-    sig TEXT,
-    vk TEXT
+    sig  TEXT,
+    vk   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
 """
 
-
 class SqliteReceiptStore(ReceiptStore):
     """
     SQLite-backed store with indexes. Suitable for multi-process access on the same host
-    (subject to SQLite locking semantics); for highly concurrent usage, consider a proper
-    DB. Uses WAL and synchronous=NORMAL by default for decent durability/perf tradeoff.
+    (subject to SQLite locking semantics). Uses WAL and synchronous=NORMAL by default.
     """
 
-    def __init__(self, path: str, prom: Optional[TCDPrometheusExporter] = None):
+    def __init__(self, path: str):
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lk = threading.RLock()
-        self._prom = prom
-        self._conn = sqlite3.connect(str(self._path), timeout=30.0, isolation_level=None, detect_types=sqlite3.PARSE_DECLTYPES)
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._conn.executescript(_SQL_SCHEMA)
+        self._conn = sqlite3.connect(
+            str(self._path),
+            timeout=30.0,
+            isolation_level=None,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            check_same_thread=False,
+        )
+        with self._conn:
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA synchronous=NORMAL;")
+            self._conn.execute("PRAGMA busy_timeout=30000;")
+            self._conn.executescript(_SQL_SCHEMA)
 
     def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
         ts = time.time()
-        with self._lk:
-            cur = self._conn.cursor()
-            cur.execute(
+        with self._lk, self._conn:  # implicit transaction
+            cur = self._conn.execute(
                 "INSERT INTO receipts (ts, head, body, sig, vk) VALUES (?, ?, ?, ?, ?)",
                 (ts, head_hex, body_json, sig_hex or "", verify_key_hex or ""),
             )
             rid = int(cur.lastrowid)
-            cur.close()
-        if self._prom:
-            self._prom.observe_latency(0.0)
+        _RCPT_APPEND.labels("sqlite").inc()
+        _RCPT_BYTES.labels("sqlite").inc(len(body_json.encode("utf-8")))
+        _RCPT_COUNT.labels("sqlite").set(float(self.count()))
+        _RCPT_APPEND_LAT.labels("sqlite").observe(max(0.0, time.perf_counter() - t0))
         return rid
 
     def get(self, rid: int) -> Optional[ReceiptRow]:
         with self._lk:
-            cur = self._conn.cursor()
-            cur.execute("SELECT id, ts, head, body, sig, vk FROM receipts WHERE id=?", (int(rid),))
+            cur = self._conn.execute("SELECT id, ts, head, body, sig, vk FROM receipts WHERE id=?", (int(rid),))
             row = cur.fetchone()
-            cur.close()
         if not row:
             return None
         rid, ts, head, body, sig, vk = row
@@ -416,10 +538,10 @@ class SqliteReceiptStore(ReceiptStore):
 
     def tail(self, n: int) -> List[ReceiptRow]:
         with self._lk:
-            cur = self._conn.cursor()
-            cur.execute("SELECT id, ts, head, body, sig, vk FROM receipts ORDER BY id DESC LIMIT ?", (int(max(0, n)),))
-            rows = cur.fetchall()
-            cur.close()
+            rows = self._conn.execute(
+                "SELECT id, ts, head, body, sig, vk FROM receipts ORDER BY id DESC LIMIT ?",
+                (int(max(0, n)),),
+            ).fetchall()
         out: List[ReceiptRow] = []
         for rid, ts, head, body, sig, vk in reversed(rows):
             out.append(ReceiptRow(int(rid), str(head), str(body), str(sig or ""), str(vk or ""), float(ts)))
@@ -427,27 +549,27 @@ class SqliteReceiptStore(ReceiptStore):
 
     def last_head(self) -> Optional[str]:
         with self._lk:
-            cur = self._conn.cursor()
-            cur.execute("SELECT head FROM receipts ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            cur.close()
+            row = self._conn.execute("SELECT head FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
         return str(row[0]) if row else None
 
     def count(self) -> int:
         with self._lk:
-            cur = self._conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM receipts")
-            c = cur.fetchone()[0]
-            cur.close()
+            (c,) = self._conn.execute("SELECT COUNT(*) FROM receipts").fetchone()
         return int(c)
 
     def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
         rows = self.tail(window)
         if not rows:
+            _RCPT_VERIFY_LAT.labels("sqlite").observe(max(0.0, time.perf_counter() - t0))
             return True
         heads = [r.head_hex for r in rows]
         bodies = [r.body_json for r in rows]
-        return bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+        if not ok:
+            _RCPT_VERIFY_FAIL.labels("sqlite").inc()
+        _RCPT_VERIFY_LAT.labels("sqlite").observe(max(0.0, time.perf_counter() - t0))
+        return ok
 
     def stats(self) -> Dict[str, float]:
         last_ts = 0.0
@@ -459,21 +581,25 @@ class SqliteReceiptStore(ReceiptStore):
             size_bytes = float(self._path.stat().st_size)
         except Exception:
             pass
-        return {"count": float(self.count()), "size_bytes": size_bytes, "last_ts": last_ts}
+        return {
+            "count": float(self.count()),
+            "size_bytes": size_bytes,
+            "last_ts": last_ts,
+        }
 
 
 # =============================================================================
 # Factory & helpers
 # =============================================================================
 
-
-def build_store_from_env(prom: Optional[TCDPrometheusExporter] = None) -> ReceiptStore:
+def build_store_from_env() -> ReceiptStore:
     """
     Construct a store backend using environment knobs:
 
       TCD_RECEIPT_STORE = "jsonl" | "sqlite" | "memory"   (default: "jsonl")
       TCD_RECEIPT_PATH  = path to file (jsonl or sqlite). default: "./data/receipts.jsonl"
       TCD_RECEIPT_FSYNC = "1" | "0" for JSONL fsync writes (default: "1")
+      TCD_RECEIPT_FSYNC_DIR = "1" | "0" fsync the directory entry (default: "0")
 
     For SQLite, path should end with ".db" (by convention).
     """
@@ -481,22 +607,24 @@ def build_store_from_env(prom: Optional[TCDPrometheusExporter] = None) -> Receip
     path = os.environ.get("TCD_RECEIPT_PATH") or "./data/receipts.jsonl"
 
     if backend == "memory":
-        return InMemoryReceiptStore(prom=prom)
+        return InMemoryReceiptStore()
+
     if backend == "sqlite":
-        # If a jsonl-looking path is provided, map to a .db file in the same directory.
         p = Path(path)
         if p.suffix.lower() != ".db":
             path = str(p.with_suffix(".db"))
-        return SqliteReceiptStore(path=path, prom=prom)
+        return SqliteReceiptStore(path=path)
+
     # default: jsonl
-    fsync = (os.environ.get("TCD_RECEIPT_FSYNC", "1").strip() == "1")
-    return JsonlReceiptStore(path=path, prom=prom, fsync_writes=fsync)
+    fsync = os.environ.get("TCD_RECEIPT_FSYNC", "1").strip() == "1"
+    fsync_dir = os.environ.get("TCD_RECEIPT_FSYNC_DIR", "0").strip() == "1"
+    return JsonlReceiptStore(path=path, fsync_writes=fsync, fsync_dir=fsync_dir)
 
 
 def verify_recent_chain(store: ReceiptStore, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
     """
     Convenience wrapper for periodic SRE audits. Intended to be called by a background job
-    (e.g., cron, k8s CronJob, or a /admin/health endpoint). Returns True if chain is valid.
+    (e.g., cron, k8s CronJob, or an /admin/health endpoint). Returns True if chain is valid.
     """
     try:
         return store.verify_chain_window(window, label_salt_hex=label_salt_hex)
