@@ -2,31 +2,50 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Union, Protocol
-
+from typing import Dict, List, Optional, Tuple, Union
 
 # ------------------------------
-# Common types
+# Common types & helpers
 # ------------------------------
 
 Subject = Tuple[str, str, str]  # (tenant, user, session)
 
 
-@dataclass(frozen=True)
+def _finite_float(x: Union[float, int, None], default: float = 0.0) -> float:
+    """Coerce to a finite float; return default for NaN/Inf/None."""
+    try:
+        v = float(x) if x is not None else float(default)
+    except Exception:
+        return float(default)
+    if math.isfinite(v):
+        return v
+    return float(default)
+
+
+# ------------------------------
+# Data models
+# ------------------------------
+
+@dataclass(frozen=True, slots=True)
 class InvestingStep:
     """
-    Canonical investing step to apply on a subject's alpha-wealth ledger.
+    Canonical investing step applied on a subject's alpha-wealth ledger.
 
     Semantics:
-      - wealth_next = max(0, wealth_cur - alpha_alloc + earn_if_reject + reward)
-      - 'reject' means the detector fired (earn is applied)
-      - Idempotency key prevents double-spend on retries
+      wealth_next = max(0, wealth_cur - alpha_alloc + (earn if reject else 0) + reward)
+
+    Notes
+      - 'reject' models the detector firing; 'earn' is only credited on reject=True.
+      - 'idem_key' enables idempotent replay protection across retries.
+      - 'ts' allows callers to supply an external event timestamp.
     """
     alpha_alloc: float
     reject: bool
@@ -34,12 +53,12 @@ class InvestingStep:
     reward: float = 0.0
     policy_ref: str = "default"
     idem_key: Optional[str] = None
-    ts: Optional[float] = None  # allow external timestamp if needed
+    ts: Optional[float] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class InvestingResult:
-    applied: bool          # whether this update was applied (False means idempotent replay)
+    applied: bool            # False => idempotent replay (no state mutation)
     wealth_before: float
     wealth_after: float
     alpha_alloc: float
@@ -47,11 +66,11 @@ class InvestingResult:
     idem_key: Optional[str]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ReceiptRecord:
     """
     Persisted receipt line item.
-    'body_json' must be the canonical JSON string used to calculate the head.
+    'body_json' must be the canonical JSON string used to compute the head.
     """
     head: str
     body_json: str
@@ -59,7 +78,7 @@ class ReceiptRecord:
     verify_key_hex: str = ""
     prev: Optional[str] = None
     ts: Optional[float] = None
-    chain_id: str = "default"  # optional chain namespace (helps multi-tenant separation)
+    chain_id: str = "default"  # optional namespace for multi-tenant separation
 
 
 # ------------------------------
@@ -71,14 +90,11 @@ class AlphaWealthLedger(ABC):
 
     @abstractmethod
     def get(self, subject: Subject, *, policy_ref: str = "default", default_alpha0: float = 0.05) -> float:
-        """Return current wealth for subject (creating with alpha0 if not exists)."""
+        """Return current wealth for subject (creating with alpha0 if missing)."""
 
     @abstractmethod
     def apply(self, subject: Subject, step: InvestingStep, *, default_alpha0: float = 0.05) -> InvestingResult:
-        """
-        Apply an investing step with idempotency and transactional safety.
-        Returns InvestingResult including whether it was applied or replayed.
-        """
+        """Apply an investing step with idempotency and transactional safety."""
 
 
 class ReceiptStore(ABC):
@@ -86,9 +102,7 @@ class ReceiptStore(ABC):
 
     @abstractmethod
     def append(self, rec: ReceiptRecord) -> bool:
-        """
-        Insert a receipt (idempotent by head). Return True if newly inserted, False if existed.
-        """
+        """Insert a receipt (idempotent by head). Return True if newly inserted, False if existed."""
 
     @abstractmethod
     def get(self, head: str) -> Optional[ReceiptRecord]:
@@ -96,22 +110,15 @@ class ReceiptStore(ABC):
 
     @abstractmethod
     def latest(self, *, chain_id: Optional[str] = None) -> Optional[ReceiptRecord]:
-        """
-        Get most recent receipt (per chain_id if provided). For SQLite we use rowid/ts as recency.
-        """
+        """Get most recent receipt (per chain_id if provided)."""
 
     @abstractmethod
     def walk_back(self, head: Optional[str], *, limit: int = 100, chain_id: Optional[str] = None) -> List[ReceiptRecord]:
-        """
-        Starting from 'head' (or latest if None), follow prev pointers backwards up to 'limit'.
-        """
+        """Starting at 'head' (or latest), follow prev pointers backwards up to 'limit'."""
 
     @abstractmethod
     def check_integrity(self, head: Optional[str], *, limit: int = 100, chain_id: Optional[str] = None) -> Dict[str, Union[bool, int, str]]:
-        """
-        Verify 'prev' linkage for last 'limit' receipts from 'head' (or latest).
-        Returns {"ok": bool, "checked": int, "bad_head": str?}
-        """
+        """Verify 'prev' linkage for the last 'limit' receipts. Returns {'ok', 'checked', 'bad_head'?}."""
 
 
 # ------------------------------
@@ -123,6 +130,7 @@ class InMemoryAlphaWealthLedger(AlphaWealthLedger):
     Thread-safe in-memory ledger with idempotency window (TTL + LRU).
     Intended for tests and local dev; production should use SQLite or Redis.
     """
+
     def __init__(self, *, idem_ttl_s: float = 900.0, idem_max: int = 200_000):
         self._wealth: Dict[Tuple[Subject, str], float] = {}
         self._idem: OrderedDict[str, Tuple[float, InvestingResult]] = OrderedDict()
@@ -130,7 +138,7 @@ class InMemoryAlphaWealthLedger(AlphaWealthLedger):
         self._idem_max = int(idem_max)
         self._g = threading.RLock()
 
-    def _prune_idem(self, now: float):
+    def _prune_idem(self, now: float) -> None:
         # Drop expired items
         keys = list(self._idem.keys())
         for k in keys:
@@ -145,7 +153,7 @@ class InMemoryAlphaWealthLedger(AlphaWealthLedger):
         with self._g:
             key = (subject, policy_ref)
             if key not in self._wealth:
-                self._wealth[key] = float(default_alpha0)
+                self._wealth[key] = float(_finite_float(default_alpha0, default_alpha0))
             return float(self._wealth[key])
 
     def apply(self, subject: Subject, step: InvestingStep, *, default_alpha0: float = 0.05) -> InvestingResult:
@@ -156,8 +164,8 @@ class InMemoryAlphaWealthLedger(AlphaWealthLedger):
                 self._prune_idem(now)
                 cached = self._idem.get(step.idem_key)
                 if cached is not None:
-                    # Touch LRU
                     ts, res = cached
+                    # Touch LRU
                     self._idem.pop(step.idem_key, None)
                     self._idem[step.idem_key] = (ts, res)
                     return InvestingResult(
@@ -170,12 +178,12 @@ class InMemoryAlphaWealthLedger(AlphaWealthLedger):
                     )
 
             key = (subject, step.policy_ref)
-            wealth_before = self._wealth.get(key, float(default_alpha0))
+            wealth_before = float(self._wealth.get(key, _finite_float(default_alpha0, default_alpha0)))
 
-            a = max(0.0, float(step.alpha_alloc))
-            earn = float(step.earn if step.reject else 0.0)
-            delta = -a + earn + float(step.reward)
-            wealth_after = max(0.0, wealth_before + delta)
+            a = max(0.0, _finite_float(step.alpha_alloc))
+            earn = _finite_float(step.earn if step.reject else 0.0)
+            reward = _finite_float(step.reward)
+            wealth_after = max(0.0, wealth_before - a + earn + reward)
 
             self._wealth[key] = wealth_after
             res = InvestingResult(
@@ -223,7 +231,11 @@ class InMemoryReceiptStore(ReceiptStore):
     def walk_back(self, head: Optional[str], *, limit: int = 100, chain_id: Optional[str] = None) -> List[ReceiptRecord]:
         out: List[ReceiptRecord] = []
         with self._g:
-            cur = head or (self.latest(chain_id=chain_id).head if self.latest(chain_id=chain_id) else None)
+            start = head
+            if start is None:
+                last = self.latest(chain_id=chain_id)
+                start = last.head if last else None
+            cur = start
             while cur and len(out) < int(limit):
                 rec = self._by_head.get(cur)
                 if not rec:
@@ -236,13 +248,12 @@ class InMemoryReceiptStore(ReceiptStore):
         seq = self.walk_back(head, limit=limit, chain_id=chain_id)
         if not seq:
             return {"ok": True, "checked": 0}
-        prev = None
+        # Validate forward 'prev' pointers
         checked = 0
-        for rec in reversed(seq):
-            # forward traversal to validate linear prev
-            if prev is not None and rec.prev != prev.head:
-                return {"ok": False, "checked": checked, "bad_head": rec.head}
-            prev = rec
+        for i in range(1, len(seq)):
+            # seq is [newest,...,oldest]; for linear chain: seq[i-1].prev == seq[i].head
+            if seq[i - 1].prev != seq[i].head:
+                return {"ok": False, "checked": checked, "bad_head": seq[i - 1].head}
             checked += 1
         return {"ok": True, "checked": checked}
 
@@ -254,6 +265,7 @@ class InMemoryReceiptStore(ReceiptStore):
 _SQL_SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS wealth (
   tenant TEXT NOT NULL,
@@ -287,7 +299,6 @@ CREATE TABLE IF NOT EXISTS receipts (
   chain_id TEXT DEFAULT 'default'
 );
 
--- helpful index for latest per chain
 CREATE INDEX IF NOT EXISTS idx_receipts_chain_ts ON receipts(chain_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_receipts_prev ON receipts(prev);
 """
@@ -301,37 +312,61 @@ class _SQLite:
         self._g = threading.RLock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # be resilient under load
+        try:
+            self._conn.execute("PRAGMA busy_timeout=30000;")
+        except Exception:
+            pass
         with self._conn:
-            for stmt in _SQL_SCHEMA.strip().split(";\n\n"):
-                s = stmt.strip()
-                if s:
-                    self._conn.execute(s)
+            self._conn.executescript(_SQL_SCHEMA)
 
     def tx(self):
         """Context manager for IMMEDIATE transactions."""
+        outer = self
+
         class _Tx:
-            def __init__(_s, outer: "_SQLite"):
-                _s.outer = outer
+            def __enter__(self):
+                outer._g.acquire()
+                outer._conn.execute("BEGIN IMMEDIATE;")
+                return outer._conn
 
-            def __enter__(_s):
-                _s.outer._g.acquire()
-                _s.outer._conn.execute("BEGIN IMMEDIATE;")
-                return _s.outer._conn
-
-            def __exit__(_s, exc_type, exc, tb):
+            def __exit__(self, exc_type, exc, tb):
                 try:
                     if exc_type is None:
-                        _s.outer._conn.execute("COMMIT;")
+                        outer._conn.execute("COMMIT;")
                     else:
-                        _s.outer._conn.execute("ROLLBACK;")
+                        outer._conn.execute("ROLLBACK;")
                 finally:
-                    _s.outer._g.release()
-        return _Tx(self)
+                    outer._g.release()
+
+        return _Tx()
+
+    def close(self) -> None:
+        with self._g:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 
 class SQLiteAlphaWealthLedger(AlphaWealthLedger):
-    def __init__(self, path: str = "tcd.db"):
+    def __init__(self, path: str = "tcd.db", *, idem_retention_s: float = 24 * 3600, purge_prob: float = 0.01):
         self._db = _SQLite(path)
+        self._idem_retention_s = float(idem_retention_s)
+        self._purge_prob = max(0.0, min(1.0, float(purge_prob)))
+
+    def _maybe_purge_idem(self, now: float) -> None:
+        if self._idem_retention_s <= 0:
+            return
+        if random.random() > self._purge_prob:
+            return
+        cutoff = now - self._idem_retention_s
+        with self._db.tx() as conn:
+            try:
+                conn.execute("DELETE FROM wealth_idem WHERE applied_at < ?", (cutoff,))
+            except Exception:
+                # Best-effort purge; ignore errors
+                pass
 
     def get(self, subject: Subject, *, policy_ref: str = "default", default_alpha0: float = 0.05) -> float:
         t, u, s = subject
@@ -345,20 +380,23 @@ class SQLiteAlphaWealthLedger(AlphaWealthLedger):
                 return float(row["wealth"])
             conn.execute(
                 "INSERT INTO wealth(tenant,user,session,policy_ref,wealth,updated_at) VALUES(?,?,?,?,?,?)",
-                (t, u, s, policy_ref, float(default_alpha0), now),
+                (t, u, s, policy_ref, float(_finite_float(default_alpha0, default_alpha0)), now),
             )
-            return float(default_alpha0)
+            return float(_finite_float(default_alpha0, default_alpha0))
 
     def apply(self, subject: Subject, step: InvestingStep, *, default_alpha0: float = 0.05) -> InvestingResult:
         t, u, s = subject
-        now = step.ts or time.time()
+        now = float(step.ts if step.ts is not None else time.time())
         with self._db.tx() as conn:
             # Idempotent replay?
             if step.idem_key:
-                row = conn.execute("SELECT wealth_before, wealth_after, alpha_alloc, policy_ref "
-                                   "FROM wealth_idem WHERE idem_key=?", (step.idem_key,)).fetchone()
+                row = conn.execute(
+                    "SELECT wealth_before, wealth_after, alpha_alloc, policy_ref FROM wealth_idem WHERE idem_key=?",
+                    (step.idem_key,),
+                ).fetchone()
                 if row:
-                    return InvestingResult(
+                    # opportunistic purge (out of txn to avoid holding lock longer)
+                    pass_result = InvestingResult(
                         applied=False,
                         wealth_before=float(row["wealth_before"]),
                         wealth_after=float(row["wealth_after"]),
@@ -366,44 +404,64 @@ class SQLiteAlphaWealthLedger(AlphaWealthLedger):
                         policy_ref=str(row["policy_ref"]),
                         idem_key=step.idem_key,
                     )
-
-            row = conn.execute(
-                "SELECT wealth FROM wealth WHERE tenant=? AND user=? AND session=? AND policy_ref=?",
-                (t, u, s, step.policy_ref),
-            ).fetchone()
-            wealth_before = float(row["wealth"]) if row else float(default_alpha0)
-
-            a = max(0.0, float(step.alpha_alloc))
-            earn = float(step.earn if step.reject else 0.0)
-            delta = -a + earn + float(step.reward)
-            wealth_after = max(0.0, wealth_before + delta)
-
-            if row:
-                conn.execute(
-                    "UPDATE wealth SET wealth=?, updated_at=? WHERE tenant=? AND user=? AND session=? AND policy_ref=?",
-                    (wealth_after, now, t, u, s, step.policy_ref),
-                )
+                    # Purge outside the tx lock to minimize contention
+                    # (we still hold tx lock here; schedule purge after commit)
+                    # Defer purge by returning and letting caller trigger.
+                    # To keep simple, we do a second best-effort purge after tx.
+                    res = pass_result
+                    # end of tx
+                    # (commit happens in __exit__)
+                    # fall-through to return outside 'with'
+                else:
+                    res = None
             else:
-                conn.execute(
-                    "INSERT INTO wealth(tenant,user,session,policy_ref,wealth,updated_at) VALUES(?,?,?,?,?,?)",
-                    (t, u, s, step.policy_ref, wealth_after, now),
+                res = None
+
+            if res is not None:
+                # commit then maybe purge
+                pass
+            else:
+                row = conn.execute(
+                    "SELECT wealth FROM wealth WHERE tenant=? AND user=? AND session=? AND policy_ref=?",
+                    (t, u, s, step.policy_ref),
+                ).fetchone()
+                wealth_before = float(row["wealth"]) if row else float(_finite_float(default_alpha0, default_alpha0))
+
+                a = max(0.0, _finite_float(step.alpha_alloc))
+                earn = _finite_float(step.earn if step.reject else 0.0)
+                reward = _finite_float(step.reward)
+                wealth_after = max(0.0, wealth_before - a + earn + reward)
+
+                if row:
+                    conn.execute(
+                        "UPDATE wealth SET wealth=?, updated_at=? WHERE tenant=? AND user=? AND session=? AND policy_ref=?",
+                        (wealth_after, now, t, u, s, step.policy_ref),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO wealth(tenant,user,session,policy_ref,wealth,updated_at) VALUES(?,?,?,?,?,?)",
+                        (t, u, s, step.policy_ref, wealth_after, now),
+                    )
+
+                if step.idem_key:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO wealth_idem(idem_key, tenant, user, session, policy_ref, wealth_before, wealth_after, alpha_alloc, applied_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (step.idem_key, t, u, s, step.policy_ref, wealth_before, wealth_after, a, now),
+                    )
+
+                res = InvestingResult(
+                    applied=True,
+                    wealth_before=wealth_before,
+                    wealth_after=wealth_after,
+                    alpha_alloc=a,
+                    policy_ref=step.policy_ref,
+                    idem_key=step.idem_key,
                 )
 
-            if step.idem_key:
-                conn.execute(
-                    "INSERT OR IGNORE INTO wealth_idem(idem_key, tenant, user, session, policy_ref, wealth_before, wealth_after, alpha_alloc, applied_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (step.idem_key, t, u, s, step.policy_ref, wealth_before, wealth_after, a, now),
-                )
-
-            return InvestingResult(
-                applied=True,
-                wealth_before=wealth_before,
-                wealth_after=wealth_after,
-                alpha_alloc=a,
-                policy_ref=step.policy_ref,
-                idem_key=step.idem_key,
-            )
+        # post-commit: opportunistic idempotency purge
+        self._maybe_purge_idem(now)
+        return res  # type: ignore[return-value]
 
 
 class SQLiteReceiptStore(ReceiptStore):
@@ -411,7 +469,7 @@ class SQLiteReceiptStore(ReceiptStore):
         self._db = _SQLite(path)
 
     def append(self, rec: ReceiptRecord) -> bool:
-        ts = rec.ts or _extract_ts(rec.body_json) or time.time()
+        ts = rec.ts if rec.ts is not None else _extract_ts(rec.body_json) or time.time()
         with self._db.tx() as conn:
             try:
                 conn.execute(
@@ -421,44 +479,48 @@ class SQLiteReceiptStore(ReceiptStore):
                 )
                 return True
             except sqlite3.IntegrityError:
-                # PK conflict -> already exists => idempotent
+                # PK conflict -> already exists (idempotent)
                 return False
 
     def get(self, head: str) -> Optional[ReceiptRecord]:
         with self._db.tx() as conn:
-            row = conn.execute("SELECT head, body_json, sig_hex, verify_key_hex, prev, ts, chain_id "
-                               "FROM receipts WHERE head=?", (head,)).fetchone()
-            if not row:
-                return None
-            return ReceiptRecord(
-                head=row["head"],
-                body_json=row["body_json"],
-                sig_hex=row["sig_hex"] or "",
-                verify_key_hex=row["verify_key_hex"] or "",
-                prev=row["prev"],
-                ts=float(row["ts"]) if row["ts"] is not None else None,
-                chain_id=row["chain_id"] or "default",
-            )
+            row = conn.execute(
+                "SELECT head, body_json, sig_hex, verify_key_hex, prev, ts, chain_id FROM receipts WHERE head=?",
+                (head,),
+            ).fetchone()
+        if not row:
+            return None
+        return ReceiptRecord(
+            head=row["head"],
+            body_json=row["body_json"],
+            sig_hex=row["sig_hex"] or "",
+            verify_key_hex=row["verify_key_hex"] or "",
+            prev=row["prev"],
+            ts=float(row["ts"]) if row["ts"] is not None else None,
+            chain_id=row["chain_id"] or "default",
+        )
 
     def latest(self, *, chain_id: Optional[str] = None) -> Optional[ReceiptRecord]:
         chain = chain_id or "default"
         with self._db.tx() as conn:
+            # Order by ts (NULLS LAST) then rowid as tie-breaker for recency
             row = conn.execute(
                 "SELECT head, body_json, sig_hex, verify_key_hex, prev, ts, chain_id "
-                "FROM receipts WHERE chain_id=? ORDER BY ts DESC LIMIT 1",
+                "FROM receipts WHERE chain_id=? "
+                "ORDER BY (ts IS NULL), ts DESC, rowid DESC LIMIT 1",
                 (chain,),
             ).fetchone()
-            if not row:
-                return None
-            return ReceiptRecord(
-                head=row["head"],
-                body_json=row["body_json"],
-                sig_hex=row["sig_hex"] or "",
-                verify_key_hex=row["verify_key_hex"] or "",
-                prev=row["prev"],
-                ts=float(row["ts"]) if row["ts"] is not None else None,
-                chain_id=row["chain_id"] or "default",
-            )
+        if not row:
+            return None
+        return ReceiptRecord(
+            head=row["head"],
+            body_json=row["body_json"],
+            sig_hex=row["sig_hex"] or "",
+            verify_key_hex=row["verify_key_hex"] or "",
+            prev=row["prev"],
+            ts=float(row["ts"]) if row["ts"] is not None else None,
+            chain_id=row["chain_id"] or "default",
+        )
 
     def walk_back(self, head: Optional[str], *, limit: int = 100, chain_id: Optional[str] = None) -> List[ReceiptRecord]:
         out: List[ReceiptRecord] = []
@@ -492,11 +554,12 @@ class SQLiteReceiptStore(ReceiptStore):
         seq = self.walk_back(head, limit=limit, chain_id=chain_id)
         if not seq:
             return {"ok": True, "checked": 0}
-        # Validate forward prev pointers for deterministic reporting
+        # Validate forward 'prev' pointers. seq = [newest,...,oldest]
         checked = 0
         for i in range(1, len(seq)):
-            if seq[i - 1].head != seq[i].prev:
-                return {"ok": False, "checked": checked, "bad_head": seq[i].head}
+            # Correct relation: newest.prev == older.head
+            if seq[i - 1].prev != seq[i].head:
+                return {"ok": False, "checked": checked, "bad_head": seq[i - 1].head}
             checked += 1
         return {"ok": True, "checked": checked}
 
@@ -514,12 +577,13 @@ def _extract_ts(body_json: str) -> Optional[float]:
         return None
 
 
-def make_ledger(dsn: str | None) -> AlphaWealthLedger:
+def make_ledger(dsn: Optional[str]) -> AlphaWealthLedger:
     """
     Factory:
-      - None or "mem://" -> in-memory
-      - "sqlite:///path/to/tcd.db" or "sqlite:///:memory:" -> SQLite
-      - "redis://..." -> NotImplementedError (reserved for future)
+      - None or "mem://"                          -> InMemoryAlphaWealthLedger
+      - "sqlite:///path/to/tcd.db"                -> SQLiteAlphaWealthLedger
+      - "sqlite:///:memory:" or "sqlite:///:mem:" -> SQLiteAlphaWealthLedger (in-memory)
+      - "redis://..."                             -> NotImplementedError (reserved)
     """
     if not dsn or dsn.strip().lower().startswith("mem://"):
         return InMemoryAlphaWealthLedger()
@@ -527,17 +591,16 @@ def make_ledger(dsn: str | None) -> AlphaWealthLedger:
     if dsn_l.startswith("sqlite:///"):
         path = dsn[len("sqlite:///") :]
         return SQLiteAlphaWealthLedger(path=path)
-    if dsn_l.startswith("sqlite:///:memory:"):
+    if dsn_l.startswith("sqlite:///:memory:") or dsn_l.startswith("sqlite:///:mem:"):
         return SQLiteAlphaWealthLedger(path=":memory:")
     if dsn_l.startswith("redis://") or dsn_l.startswith("rediss://"):
-        # Reserved: real Redis backend would implement atomic LUA scripts for idempotent apply
         raise NotImplementedError("Redis ledger backend is not implemented in this release.")
     raise ValueError(f"Unsupported ledger dsn: {dsn}")
 
 
-def make_receipt_store(dsn: str | None) -> ReceiptStore:
+def make_receipt_store(dsn: Optional[str]) -> ReceiptStore:
     """
-    Factory mirrors make_ledger(). It is common to co-locate both in same SQLite file.
+    Factory mirrors make_ledger(). It is common to co-locate both in the same SQLite file.
     """
     if not dsn or dsn.strip().lower().startswith("mem://"):
         return InMemoryReceiptStore()
@@ -545,10 +608,9 @@ def make_receipt_store(dsn: str | None) -> ReceiptStore:
     if dsn_l.startswith("sqlite:///"):
         path = dsn[len("sqlite:///") :]
         return SQLiteReceiptStore(path=path)
-    if dsn_l.startswith("sqlite:///:memory:"):
+    if dsn_l.startswith("sqlite:///:memory:") or dsn_l.startswith("sqlite:///:mem:"):
         return SQLiteReceiptStore(path=":memory:")
     if dsn_l.startswith("redis://") or dsn_l.startswith("rediss://"):
-        # Reserved for a Redis-based append-only receipt log with stream semantics.
         raise NotImplementedError("Redis receipt backend is not implemented in this release.")
     raise ValueError(f"Unsupported receipt store dsn: {dsn}")
 
