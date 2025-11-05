@@ -12,6 +12,9 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
+from starlette.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
 from .config import make_reloadable_settings
 from .detector import TCDConfig, TraceCollapseDetector
 from .exporter import TCDPrometheusExporter
@@ -22,6 +25,7 @@ from .routing import StrategyRouter
 from .signals import DefaultLLMSignals, SignalProvider
 from .telemetry_gpu import GpuSampler
 from .utils import sanitize_floats
+from .middleware import RequestContextMiddleware, RateLimitMiddleware, MetricsMiddleware
 
 # receipts
 from .attest import Attestor
@@ -50,9 +54,10 @@ _settings = make_reloadable_settings()
 _MAX_TRACE = 4096
 _MAX_SPECT = 4096
 _MAX_FEATS = 2048
-_JSON_COMPONENT_LIMIT = 256_000  # bytes
-_RECEIPT_BODY_LIMIT = 512_000     # bytes
+_JSON_COMPONENT_LIMIT = 256_000
+_RECEIPT_BODY_LIMIT = 512_000
 _TOKENS_DIVISOR_DEFAULT = 50.0
+
 
 # ---------- Pydantic I/O ----------
 class DiagnoseRequest(BaseModel):
@@ -129,7 +134,6 @@ class SnapshotState(BaseModel):
 
 
 class VerifyRequest(BaseModel):
-    # single-receipt verification
     receipt_head_hex: Optional[str] = None
     receipt_body_json: Optional[str] = None
     verify_key_hex: Optional[str] = None
@@ -137,10 +141,7 @@ class VerifyRequest(BaseModel):
     req_obj: Optional[Dict] = None
     comp_obj: Optional[Dict] = None
     e_obj: Optional[Dict] = None
-    # witnesses (trace/spectrum/feat)
     witness_segments: Optional[Tuple[List[int], List[int], List[int]]] = None
-
-    # chain verification
     heads: Optional[List[str]] = None
     bodies: Optional[List[str]] = None
 
@@ -176,7 +177,9 @@ def _safe_context_subset(ctx: Dict) -> Dict:
 
 
 def _compact_json(obj: Dict) -> str:
-    txt = "" if obj is None else __import__("json").dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    txt = "" if obj is None else __import__("json").dumps(
+        obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     if len(txt.encode("utf-8")) > _JSON_COMPONENT_LIMIT:
         return "{}"
     return txt
@@ -200,14 +203,50 @@ def create_app(*args, **kwargs) -> FastAPI:
     if settings.prom_http_enable:
         prom.ensure_server()
 
-    # OTEL exporter (no endpoint args in your stub)
     otel = TCDOtelExporter()
     otel.enabled = settings.otel_enable
+
+    # --- CORS whitelist ---
+    allowed_origins = [
+        "http://127.0.0.1",
+        "http://127.0.0.1:3000",
+        "http://localhost",
+        "http://localhost:3000",
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-Id", "X-Session-Id"],
+    )
+
+    # --- Prometheus instruments for HTTP layer ---
+    REQ_COUNTER = Counter(
+        "tcd_requests_total",
+        "HTTP requests",
+        ["route", "status"],
+    )
+    REQ_LATENCY = Histogram(
+        "tcd_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["route"],
+    )
+
+    # --- HTTP middlewares: context, per-IP guard, metrics/logging ---
+    app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(RateLimitMiddleware, rate_per_sec=10.0, burst=20.0)
+    app.add_middleware(MetricsMiddleware, counter=REQ_COUNTER, histogram=REQ_LATENCY)
+
+    # --- /metrics endpoint for default registry ---
+    @app.get("/metrics")
+    def metrics():
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     signals: SignalProvider = DefaultLLMSignals()
     gpu = GpuSampler(0) if settings.gpu_enable else None
 
-    # rate limiting
+    # token-bucket per subject (tenant/user/session)
     rlim = RateLimiter(
         capacity=float(getattr(settings, "http_rate_capacity", 60.0)),
         refill_per_s=float(getattr(settings, "http_rate_refill_per_s", 30.0)),
@@ -332,7 +371,7 @@ def create_app(*args, **kwargs) -> FastAPI:
         subject = (req.tenant, req.user, req.session)
         av = _get_av(subject)
 
-        # IMPORTANT: match your current risk_av.step(self, request) signature
+        # match your current risk_av API
         av_out = av.step(request)
 
         decision_fail = bool(verdict_pack.get("verdict", False) or av_out.get("trigger", False))
@@ -493,7 +532,6 @@ def create_app(*args, **kwargs) -> FastAPI:
             verify_key=vk_hex,
         )
 
-    # versioned path that proxies to the same handler
     @app.post("/v1/diagnose", response_model=RiskResponse)
     def diagnose_v1(req: DiagnoseRequest, request: Request, response: Response):
         return diagnose(req, request, response)

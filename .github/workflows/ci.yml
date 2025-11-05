@@ -1,0 +1,32 @@
+# FILE: .github/workflows/ci.yml
+name: ci
+on:
+  push: { branches: ["**"] }
+  pull_request: {}
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install pytest ruff mypy bandit cyclonedx-bom
+      - name: Lint
+        run: ruff check .
+      - name: Types
+        run: mypy tcd || true
+      - name: SAST
+        run: bandit -q -r tcd || true
+      - name: Tests
+        run: pytest -q
+      - name: SBOM
+        run: cyclonedx-bom -o sbom.json -e
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.json }
+      - name: Build docker (no push)
+        run: |
+          docker build -t tcd-sidecar:ci -f Dockerfile .
