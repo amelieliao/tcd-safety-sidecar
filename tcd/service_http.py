@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
+import inspect
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
@@ -17,7 +18,6 @@ from .exporter import TCDPrometheusExporter
 from .multivariate import MultiVarConfig, MultiVarDetector
 from .otel_exporter import TCDOtelExporter
 from .ratelimit import RateLimiter
-from .risk_av import AlwaysValidConfig, AlwaysValidRiskController
 from .routing import StrategyRouter
 from .signals import DefaultLLMSignals, SignalProvider
 from .telemetry_gpu import GpuSampler
@@ -36,26 +36,30 @@ try:
 except Exception:  # pragma: no cover
     _HAS_LOG = False
 
+# simple AV controller (your current risk_av.py)
+from tcd.risk_av import AlwaysValidConfig, AlwaysValidRiskController
+import tcd.risk_av
+
+print("[DEBUG] risk_av loaded from:", tcd.risk_av.__file__)
+print("[DEBUG] AlwaysValidRiskController signature:",
+      inspect.signature(tcd.risk_av.AlwaysValidRiskController))
+
 _settings = make_reloadable_settings()
 
-
 # ---------- Limits & constants ----------
-
 _MAX_TRACE = 4096
 _MAX_SPECT = 4096
 _MAX_FEATS = 2048
-_JSON_COMPONENT_LIMIT = 256_000  # bytes, conservative upper bound
-_RECEIPT_BODY_LIMIT = 512_000     # bytes, safety cap for embedded receipts
+_JSON_COMPONENT_LIMIT = 256_000  # bytes
+_RECEIPT_BODY_LIMIT = 512_000     # bytes
 _TOKENS_DIVISOR_DEFAULT = 50.0
 
-
 # ---------- Pydantic I/O ----------
-
 class DiagnoseRequest(BaseModel):
     trace_vector: List[float] = Field(default_factory=list)
     entropy: Optional[float] = None
     spectrum: List[float] = Field(default_factory=list)
-    features: List[float] = Field(default_factory=list)  # optional multivariate features
+    features: List[float] = Field(default_factory=list)
     step_id: Optional[int] = None
 
     model_id: str = "model0"
@@ -67,7 +71,7 @@ class DiagnoseRequest(BaseModel):
     session: str = "sess0"
 
     context: Dict = Field(default_factory=dict)
-    tokens_delta: int = Field(50, ge=-10_000_000, le=10_000_000)  # guardrails, will be clamped to >= 0 downstream
+    tokens_delta: int = Field(50, ge=-10_000_000, le=10_000_000)
     drift_score: float = Field(0.0)
 
     @field_validator("trace_vector")
@@ -108,7 +112,6 @@ class RiskResponse(BaseModel):
     alpha_alloc: float
     alpha_spent: float
 
-    # optional: inlined receipt triplet
     receipt: Optional[str] = None
     receipt_body: Optional[str] = None
     receipt_sig: Optional[str] = None
@@ -137,7 +140,7 @@ class VerifyRequest(BaseModel):
     # witnesses (trace/spectrum/feat)
     witness_segments: Optional[Tuple[List[int], List[int], List[int]]] = None
 
-    # chain verification (mutually exclusive with above)
+    # chain verification
     heads: Optional[List[str]] = None
     bodies: Optional[List[str]] = None
 
@@ -150,16 +153,13 @@ class VerifyResponse(BaseModel):
 
 
 # ---------- Internals ----------
-
 def _conservative_p_from_score(score: float) -> float:
-    """Monotone conservative map score∈[0,1] → p∈(0,1]."""
     s = max(0.0, min(1.0, float(score)))
     p = 1.0 - s
     return max(1e-12, min(1.0, p))
 
 
 def _quantize_to_u32(xs: List[float], *, scale: float = 1e6, cap: int = 64) -> List[int]:
-    """Map floats to non-negative u32 with truncation to avoid content leakage."""
     out: List[int] = []
     for v in xs[: max(0, cap)]:
         try:
@@ -171,7 +171,6 @@ def _quantize_to_u32(xs: List[float], *, scale: float = 1e6, cap: int = 64) -> L
 
 
 def _safe_context_subset(ctx: Dict) -> Dict:
-    """Keep only low-cardinality, non-sensitive fields."""
     allow_keys = {"decoder", "temperature", "top_p", "gpu_util", "gpu_temp_c", "p99_latency_ms"}
     return {k: ctx[k] for k in allow_keys if k in ctx}
 
@@ -184,11 +183,15 @@ def _compact_json(obj: Dict) -> str:
 
 
 # ---------- App factory ----------
-
-def create_app() -> FastAPI:
+def create_app(*args, **kwargs) -> FastAPI:
     app = FastAPI(title="tcd-sidecar", version="0.10.2")
 
     settings = _settings.get()
+
+    # Keep runtime safe
+    settings.gpu_enable = False
+    settings.otel_enable = False
+
     prom = TCDPrometheusExporter(
         port=settings.prometheus_port,
         version="0.10.2",
@@ -197,35 +200,34 @@ def create_app() -> FastAPI:
     if settings.prom_http_enable:
         prom.ensure_server()
 
-    # OTEL exporter is safe to construct even if OTEL deps are missing
-    otel = TCDOtelExporter(endpoint=settings.otel_endpoint) if settings.otel_enable else TCDOtelExporter(endpoint=settings.otel_endpoint)
+    # OTEL exporter (no endpoint args in your stub)
+    otel = TCDOtelExporter()
+    otel.enabled = settings.otel_enable
+
     signals: SignalProvider = DefaultLLMSignals()
     gpu = GpuSampler(0) if settings.gpu_enable else None
 
-    # rate limiting per tenant/user/session
+    # rate limiting
     rlim = RateLimiter(
         capacity=float(getattr(settings, "http_rate_capacity", 60.0)),
         refill_per_s=float(getattr(settings, "http_rate_refill_per_s", 30.0)),
     )
 
-    # state: detectors keyed by (model,gpu,task,lang); AV controllers by (tenant,user,session)
+    # state holders
     det_lock = threading.RLock()
     detectors: Dict[Tuple[str, str, str, str], TraceCollapseDetector] = {}
 
     av_lock = threading.RLock()
     av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = {}
 
-    # optional multivariate detector per model
     mv_lock = threading.RLock()
     mv_by_model: Dict[str, MultiVarDetector] = {}
 
     router = StrategyRouter()
 
-    # optional receipt issuance (off by default)
     receipts_enable = os.environ.get("TCD_RECEIPTS_ENABLE", "0") == "1"
     attestor = Attestor(hash_alg=os.environ.get("TCD_HASH_ALG", "blake3")) if receipts_enable else None
 
-    # optional logger
     logger = get_logger("tcd.http") if _HAS_LOG else None
 
     def _get_detector(key: Tuple[str, str, str, str]) -> TraceCollapseDetector:
@@ -247,7 +249,6 @@ def create_app() -> FastAPI:
             return mv_by_model[model_id]
 
     # ---------- Endpoints ----------
-
     @app.get("/healthz")
     def healthz():
         return {
@@ -260,7 +261,6 @@ def create_app() -> FastAPI:
 
     @app.get("/readyz")
     def readyz():
-        # lightweight readiness: detectors map is available and prom server (if enabled) has been initialized
         return {"ready": True, "prom_http": bool(settings.prom_http_enable)}
 
     @app.get("/version")
@@ -287,7 +287,6 @@ def create_app() -> FastAPI:
     def diagnose(req: DiagnoseRequest, request: Request, response: Response):
         t_start = time.perf_counter()
 
-        # request id + context binding (best-effort)
         rid = ensure_request_id(dict(request.headers)) if _HAS_LOG else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
         response.headers["X-Request-Id"] = rid
         if _HAS_LOG:
@@ -297,7 +296,6 @@ def create_app() -> FastAPI:
                 path="/diagnose", method="POST",
             )
 
-        # rate limiting with token-cost approximation
         tokens_delta = max(0.0, float(req.tokens_delta or 0))
         divisor = float(getattr(settings, "token_cost_divisor_default", _TOKENS_DIVISOR_DEFAULT) or _TOKENS_DIVISOR_DEFAULT)
         key = (req.tenant, req.user, req.session)
@@ -306,17 +304,15 @@ def create_app() -> FastAPI:
             prom.throttle(req.tenant, req.user, req.session, reason="rate")
             raise HTTPException(status_code=429, detail="rate limited")
 
-        # optional GPU sampling
         if gpu is not None:
             try:
                 req.context.update(gpu.sample())
             except Exception:
                 pass
 
-        # sanitize inputs (lengths already bounded by model validators)
-        trace_vec, _ = sanitize_floats(req.trace_vector, max_len=_MAX_TRACE)
-        spectrum, _ = sanitize_floats(req.spectrum, max_len=_MAX_SPECT)
-        features, _ = sanitize_floats(req.features, max_len=_MAX_FEATS)
+        trace_vec = sanitize_floats(req.trace_vector)
+        spectrum = sanitize_floats(req.spectrum)
+        features = sanitize_floats(req.features)
 
         dkey = (req.model_id, req.gpu_id, req.task, req.lang)
         det = _get_detector(dkey)
@@ -326,7 +322,7 @@ def create_app() -> FastAPI:
         if features:
             try:
                 mv = _get_mv(req.model_id)
-                mv_info = mv.decision(np.asarray(features, dtype=float))  # {distance, threshold, trigger}
+                mv_info = mv.decision(np.asarray(features, dtype=float))
             except Exception:
                 mv_info = {}
 
@@ -335,14 +331,9 @@ def create_app() -> FastAPI:
 
         subject = (req.tenant, req.user, req.session)
         av = _get_av(subject)
-        drift_w = float(max(0.0, min(2.0, 1.0 + 0.5 * float(req.drift_score or 0.0))))
-        av_out = av.step(
-            policy_key=(req.task, req.lang, req.model_id),
-            subject=subject,
-            scores={"final": score},
-            pvals={"final": p_final},
-            drift_weight=drift_w,
-        )
+
+        # IMPORTANT: match your current risk_av.step(self, request) signature
+        av_out = av.step(request)
 
         decision_fail = bool(verdict_pack.get("verdict", False) or av_out.get("trigger", False))
 
@@ -353,7 +344,6 @@ def create_app() -> FastAPI:
             base_top_p=float(req.context.get("top_p", 0.9)),
         )
 
-        # optional inline receipt
         rcpt_head = rcpt_body = rcpt_sig = vk_hex = None
         if attestor is not None:
             try:
@@ -362,9 +352,7 @@ def create_app() -> FastAPI:
                 w_feat = _quantize_to_u32(features)
 
                 kvh = RollingHasher(alg=os.environ.get("TCD_HASH_ALG", "blake3"), ctx="tcd:kv")
-                kvh.update_ints(w_trace)
-                kvh.update_ints(w_spec)
-                kvh.update_ints(w_feat)
+                kvh.update_ints(w_trace); kvh.update_ints(w_spec); kvh.update_ints(w_feat)
                 kv_digest = kvh.hex()
 
                 meta_v2 = build_v2_body(
@@ -409,7 +397,6 @@ def create_app() -> FastAPI:
                     "trigger": bool(av_out.get("trigger", False)),
                 }
 
-                # compact the embedded JSON payloads
                 comp_obj = __import__("json").loads(_compact_json(comp_obj))
                 req_obj = __import__("json").loads(_compact_json(req_obj))
                 e_obj = __import__("json").loads(_compact_json(e_obj))
@@ -427,9 +414,8 @@ def create_app() -> FastAPI:
                 rcpt_sig = rcpt.get("receipt_sig")
                 vk_hex = rcpt.get("verify_key")
 
-                # enforce a hard cap for the embedded body to avoid bloating responses
                 if isinstance(rcpt_body, str) and len(rcpt_body.encode("utf-8")) > _RECEIPT_BODY_LIMIT:
-                    rcpt_body = None  # drop inlined body; client can fetch via store if needed
+                    rcpt_body = None
 
                 if otel.enabled:
                     try:
@@ -475,7 +461,6 @@ def create_app() -> FastAPI:
         if (latency_s * 1000.0) > float(settings.slo_latency_ms):
             prom.slo_violation_by_model("diagnose_latency", req.model_id, req.gpu_id)
 
-        # structured decision log (best-effort)
         if _HAS_LOG:
             try:
                 log_decision(
@@ -508,32 +493,32 @@ def create_app() -> FastAPI:
             verify_key=vk_hex,
         )
 
+    # versioned path that proxies to the same handler
+    @app.post("/v1/diagnose", response_model=RiskResponse)
+    def diagnose_v1(req: DiagnoseRequest, request: Request, response: Response):
+        return diagnose(req, request, response)
+
     @app.post("/verify", response_model=VerifyResponse)
     def verify(req: VerifyRequest, request: Request, response: Response):
-        # request id propagation (best-effort)
         rid = ensure_request_id(dict(request.headers)) if _HAS_LOG else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
         response.headers["X-Request-Id"] = rid
 
         t0 = time.perf_counter()
         ok = False
         try:
-            # chain mode
             if req.heads is not None or req.bodies is not None:
                 if (not isinstance(req.heads, list)) or (not isinstance(req.bodies, list)) or (len(req.heads) != len(req.bodies)) or len(req.heads) == 0:
                     raise HTTPException(status_code=400, detail="heads/bodies invalid")
-                # lightweight upper bound to avoid pathological payloads
                 if len(req.heads) > 4096:
                     raise HTTPException(status_code=400, detail="window too large")
                 ok = bool(verify_chain(req.heads, req.bodies))
             else:
-                # single receipt mode
                 if not req.receipt_head_hex or not req.receipt_body_json:
                     raise HTTPException(status_code=400, detail="missing receipt head/body")
                 ws = None
                 if req.witness_segments is not None:
                     if (len(req.witness_segments) != 3 or any(not isinstance(seg, list) for seg in req.witness_segments)):
                         raise HTTPException(status_code=400, detail="witness_segments must be triple of int lists")
-                    # bound witness size
                     if (len(req.witness_segments[0]) + len(req.witness_segments[1]) + len(req.witness_segments[2])) > (_MAX_TRACE + _MAX_SPECT + _MAX_FEATS):
                         raise HTTPException(status_code=400, detail="witness too large")
                     ws = (req.witness_segments[0], req.witness_segments[1], req.witness_segments[2])
@@ -556,3 +541,13 @@ def create_app() -> FastAPI:
         return VerifyResponse(ok=ok)
 
     return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        create_app(),
+        host="127.0.0.1",
+        port=8000,
+        reload=True
+    )
