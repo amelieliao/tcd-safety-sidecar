@@ -7,4 +7,4 @@ metadata:
 spec:
   minAvailable: 1
   selector:
-    matchLabels: {{- include "tcd.selectorLabels" . | nindent 6 }}
+  matchLabels: {{- include "tcd.selectorLabels" . | nindent 6 }}
