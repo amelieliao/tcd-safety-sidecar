@@ -36,17 +36,33 @@ from .verify import verify_receipt, verify_chain
 # optional structured logging (safe to import; noop if not configured)
 try:
     from .logging import bind_request_meta, ensure_request_id, get_logger, log_decision
+
     _HAS_LOG = True
 except Exception:  # pragma: no cover
     _HAS_LOG = False
 
-# simple AV controller (your current risk_av.py)
+# simple AV controller
 from tcd.risk_av import AlwaysValidConfig, AlwaysValidRiskController
 import tcd.risk_av
 
 print("[DEBUG] risk_av loaded from:", tcd.risk_av.__file__)
-print("[DEBUG] AlwaysValidRiskController signature:",
-      inspect.signature(tcd.risk_av.AlwaysValidRiskController))
+print(
+    "[DEBUG] AlwaysValidRiskController signature:",
+    inspect.signature(tcd.risk_av.AlwaysValidRiskController),
+)
+
+# trust OS modules (best-effort import)
+try:
+    from .decision_engine import DecisionEngine, DecisionContext
+    from .agent import TrustAgent
+    from .rewrite_engine import RewriteEngine
+    from .trust_graph import TrustGraph
+    from .patch_runtime import PatchRuntime
+
+    _HAS_TRUST_OS = True
+except Exception:  # pragma: no cover
+    DecisionEngine = DecisionContext = TrustAgent = RewriteEngine = TrustGraph = PatchRuntime = None  # type: ignore
+    _HAS_TRUST_OS = False
 
 _settings = make_reloadable_settings()
 
@@ -191,7 +207,7 @@ def create_app(*args, **kwargs) -> FastAPI:
 
     settings = _settings.get()
 
-    # Keep runtime safe
+    # Safe defaults for local dev
     settings.gpu_enable = False
     settings.otel_enable = False
 
@@ -222,12 +238,12 @@ def create_app(*args, **kwargs) -> FastAPI:
     )
 
     # --- Prometheus instruments for HTTP layer ---
-    REQ_COUNTER = Counter(
+    req_counter = Counter(
         "tcd_requests_total",
         "HTTP requests",
         ["route", "status"],
     )
-    REQ_LATENCY = Histogram(
+    req_latency = Histogram(
         "tcd_request_latency_seconds",
         "HTTP request latency in seconds",
         ["route"],
@@ -236,7 +252,11 @@ def create_app(*args, **kwargs) -> FastAPI:
     # --- HTTP middlewares: context, per-IP guard, metrics/logging ---
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(RateLimitMiddleware, rate_per_sec=10.0, burst=20.0)
-    app.add_middleware(MetricsMiddleware, counter=REQ_COUNTER, histogram=REQ_LATENCY)
+    app.add_middleware(
+        MetricsMiddleware,
+        counter=req_counter,
+        histogram=req_latency,
+    )
 
     # --- /metrics endpoint for default registry ---
     @app.get("/metrics")
@@ -269,6 +289,23 @@ def create_app(*args, **kwargs) -> FastAPI:
 
     logger = get_logger("tcd.http") if _HAS_LOG else None
 
+    # Trust OS runtime (best-effort)
+    trust_runtime = None
+    if _HAS_TRUST_OS:
+        decision_engine = DecisionEngine()
+        agent = TrustAgent()
+        rewriter = RewriteEngine()
+        trust_graph = TrustGraph()
+        patch_runtime = PatchRuntime()
+        trust_runtime = {
+            "decision_engine": decision_engine,
+            "agent": agent,
+            "rewriter": rewriter,
+            "trust_graph": trust_graph,
+            "patch_runtime": patch_runtime,
+        }
+        app.state.trust_runtime = trust_runtime
+
     def _get_detector(key: Tuple[str, str, str, str]) -> TraceCollapseDetector:
         with det_lock:
             if key not in detectors:
@@ -278,24 +315,32 @@ def create_app(*args, **kwargs) -> FastAPI:
     def _get_av(subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
         with av_lock:
             if subject not in av_by_subject:
-                av_by_subject[subject] = AlwaysValidRiskController(AlwaysValidConfig(alpha_base=settings.alpha))
+                av_by_subject[subject] = AlwaysValidRiskController(
+                    AlwaysValidConfig(alpha_base=settings.alpha)
+                )
             return av_by_subject[subject]
 
     def _get_mv(model_id: str) -> MultiVarDetector:
         with mv_lock:
             if model_id not in mv_by_model:
-                mv_by_model[model_id] = MultiVarDetector(MultiVarConfig(estimator="lw", alpha=0.01))
+                mv_by_model[model_id] = MultiVarDetector(
+                    MultiVarConfig(estimator="lw", alpha=0.01)
+                )
             return mv_by_model[model_id]
 
     # ---------- Endpoints ----------
     @app.get("/healthz")
     def healthz():
+        print("[DEBUG] _HAS_TRUST_OS =", _HAS_TRUST_OS)
+        print("[DEBUG] trust_runtime is None =", (trust_runtime is None))
+
         return {
             "ok": True,
             "config_hash": settings.config_hash(),
             "otel": bool(otel.enabled),
             "prom": True,
             "receipts": bool(receipts_enable),
+            "trust_os": bool(trust_runtime is not None),
         }
 
     @app.get("/readyz")
@@ -312,12 +357,23 @@ def create_app(*args, **kwargs) -> FastAPI:
         }
 
     @app.get("/state/get")
-    def state_get(model_id: str = "model0", gpu_id: str = "gpu0", task: str = "chat", lang: str = "en"):
+    def state_get(
+        model_id: str = "model0",
+        gpu_id: str = "gpu0",
+        task: str = "chat",
+        lang: str = "en",
+    ):
         det = _get_detector((model_id, gpu_id, task, lang))
         return {"detector": det.snapshot_state()}
 
     @app.post("/state/load")
-    def state_load(payload: SnapshotState, model_id: str = "model0", gpu_id: str = "gpu0", task: str = "chat", lang: str = "en"):
+    def state_load(
+        payload: SnapshotState,
+        model_id: str = "model0",
+        gpu_id: str = "gpu0",
+        task: str = "chat",
+        lang: str = "en",
+    ):
         det = _get_detector((model_id, gpu_id, task, lang))
         det.load_state(payload.state)
         return {"ok": True}
@@ -326,17 +382,30 @@ def create_app(*args, **kwargs) -> FastAPI:
     def diagnose(req: DiagnoseRequest, request: Request, response: Response):
         t_start = time.perf_counter()
 
-        rid = ensure_request_id(dict(request.headers)) if _HAS_LOG else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
+        rid = (
+            ensure_request_id(dict(request.headers))
+            if _HAS_LOG
+            else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
+        )
         response.headers["X-Request-Id"] = rid
         if _HAS_LOG:
             bind_request_meta(
-                tenant=req.tenant, user=req.user, session=req.session,
-                model_id=req.model_id, gpu_id=req.gpu_id, task=req.task, lang=req.lang,
-                path="/diagnose", method="POST",
+                tenant=req.tenant,
+                user=req.user,
+                session=req.session,
+                model_id=req.model_id,
+                gpu_id=req.gpu_id,
+                task=req.task,
+                lang=req.lang,
+                path="/diagnose",
+                method="POST",
             )
 
         tokens_delta = max(0.0, float(req.tokens_delta or 0))
-        divisor = float(getattr(settings, "token_cost_divisor_default", _TOKENS_DIVISOR_DEFAULT) or _TOKENS_DIVISOR_DEFAULT)
+        divisor = float(
+            getattr(settings, "token_cost_divisor_default", _TOKENS_DIVISOR_DEFAULT)
+            or _TOKENS_DIVISOR_DEFAULT
+        )
         key = (req.tenant, req.user, req.session)
         cost = max(1.0, tokens_delta / max(1.0, divisor))
         if not rlim.consume(key, cost=cost):
@@ -355,7 +424,9 @@ def create_app(*args, **kwargs) -> FastAPI:
 
         dkey = (req.model_id, req.gpu_id, req.task, req.lang)
         det = _get_detector(dkey)
-        verdict_pack = det.diagnose(trace_vec, req.entropy, spectrum, step_id=req.step_id)
+        verdict_pack = det.diagnose(
+            trace_vec, req.entropy, spectrum, step_id=req.step_id
+        )
 
         mv_info = {}
         if features:
@@ -371,10 +442,10 @@ def create_app(*args, **kwargs) -> FastAPI:
         subject = (req.tenant, req.user, req.session)
         av = _get_av(subject)
 
-        # match your current risk_av API
         av_out = av.step(request)
-
-        decision_fail = bool(verdict_pack.get("verdict", False) or av_out.get("trigger", False))
+        decision_fail = bool(
+            verdict_pack.get("verdict", False) or av_out.get("trigger", False)
+        )
 
         route = router.decide(
             decision_fail,
@@ -383,6 +454,18 @@ def create_app(*args, **kwargs) -> FastAPI:
             base_top_p=float(req.context.get("top_p", 0.9)),
         )
 
+        # Trust OS decision label (best-effort)
+        action_str: str
+        if _HAS_TRUST_OS and trust_runtime is not None:
+            try:
+                ctx = DecisionContext(score=score, verdict=decision_fail)
+                decision_obj = trust_runtime["decision_engine"].decide(ctx)
+                action_str = getattr(decision_obj, "value", str(decision_obj))
+            except Exception:
+                action_str = "degrade" if decision_fail else "allow"
+        else:
+            action_str = "degrade" if decision_fail else "allow"
+
         rcpt_head = rcpt_body = rcpt_sig = vk_hex = None
         if attestor is not None:
             try:
@@ -390,8 +473,12 @@ def create_app(*args, **kwargs) -> FastAPI:
                 w_spec = _quantize_to_u32(spectrum)
                 w_feat = _quantize_to_u32(features)
 
-                kvh = RollingHasher(alg=os.environ.get("TCD_HASH_ALG", "blake3"), ctx="tcd:kv")
-                kvh.update_ints(w_trace); kvh.update_ints(w_spec); kvh.update_ints(w_feat)
+                kvh = RollingHasher(
+                    alg=os.environ.get("TCD_HASH_ALG", "blake3"), ctx="tcd:kv"
+                )
+                kvh.update_ints(w_trace)
+                kvh.update_ints(w_spec)
+                kvh.update_ints(w_feat)
                 kv_digest = kvh.hex()
 
                 meta_v2 = build_v2_body(
@@ -415,9 +502,13 @@ def create_app(*args, **kwargs) -> FastAPI:
 
                 req_obj = {
                     "ts": time.time(),
-                    "tenant": req.tenant, "user": req.user, "session": req.session,
-                    "model_id": req.model_id, "gpu_id": req.gpu_id,
-                    "task": req.task, "lang": req.lang,
+                    "tenant": req.tenant,
+                    "user": req.user,
+                    "session": req.session,
+                    "model_id": req.model_id,
+                    "gpu_id": req.gpu_id,
+                    "task": req.task,
+                    "lang": req.lang,
                     "context": _safe_context_subset(req.context),
                     "tokens_delta": int(req.tokens_delta),
                     "step": int(verdict_pack.get("step", 0)),
@@ -425,8 +516,14 @@ def create_app(*args, **kwargs) -> FastAPI:
                 comp_obj = {
                     "score": score,
                     "verdict": bool(verdict_pack.get("verdict", False)),
-                    "route": {"temperature": route.temperature, "top_p": route.top_p, "decoder": route.decoder, "tags": route.tags},
+                    "route": {
+                        "temperature": route.temperature,
+                        "top_p": route.top_p,
+                        "decoder": route.decoder,
+                        "tags": route.tags,
+                    },
                     "components": verdict_pack.get("components", {}),
+                    "mv": mv_info,
                 }
                 e_obj = {
                     "e_value": float(av_out.get("e_value", 1.0)),
@@ -453,24 +550,39 @@ def create_app(*args, **kwargs) -> FastAPI:
                 rcpt_sig = rcpt.get("receipt_sig")
                 vk_hex = rcpt.get("verify_key")
 
-                if isinstance(rcpt_body, str) and len(rcpt_body.encode("utf-8")) > _RECEIPT_BODY_LIMIT:
+                if (
+                    isinstance(rcpt_body, str)
+                    and len(rcpt_body.encode("utf-8")) > _RECEIPT_BODY_LIMIT
+                ):
                     rcpt_body = None
 
                 if otel.enabled:
                     try:
-                        size_bytes = len(rcpt_body.encode("utf-8")) if isinstance(rcpt_body, str) else 0
-                        otel.push_metrics(score, attrs={
-                            "tcd.receipt.present": rcpt_body is not None,
-                            "tcd.receipt.size_bytes": size_bytes,
-                            "tcd.decision.verdict": str(decision_fail),
-                            "model_id": req.model_id, "gpu_id": req.gpu_id,
-                            "tenant": req.tenant, "user": req.user, "session": req.session,
-                        })
+                        size_bytes = (
+                            len(rcpt_body.encode("utf-8"))
+                            if isinstance(rcpt_body, str)
+                            else 0
+                        )
+                        otel.push_metrics(
+                            score,
+                            attrs={
+                                "tcd.receipt.present": rcpt_body is not None,
+                                "tcd.receipt.size_bytes": size_bytes,
+                                "tcd.decision.verdict": str(decision_fail),
+                                "model_id": req.model_id,
+                                "gpu_id": req.gpu_id,
+                                "tenant": req.tenant,
+                                "user": req.user,
+                                "session": req.session,
+                            },
+                        )
                     except Exception:
                         pass
             except Exception:
                 if otel.enabled:
-                    otel.push_metrics(score, attrs={"tcd.receipt.present": False})
+                    otel.push_metrics(
+                        score, attrs={"tcd.receipt.present": False}
+                    )
 
         latency_s = max(0.0, time.perf_counter() - t_start)
         prom.observe_latency(latency_s)
@@ -486,16 +598,24 @@ def create_app(*args, **kwargs) -> FastAPI:
             alpha_wealth=float(av_out.get("alpha_wealth", 0.0)),
         )
         prom.update_budget_metrics(
-            req.tenant, req.user, req.session,
+            req.tenant,
+            req.user,
+            req.session,
             remaining=float(av_out.get("alpha_wealth", 0.0)),
             spent=bool(av_out.get("alpha_spent", 0.0) > 0.0),
         )
         if decision_fail:
             prom.record_action(req.model_id, req.gpu_id, action="degrade")
-        otel.push_metrics(score, attrs={
-            "model_id": req.model_id, "gpu_id": req.gpu_id,
-            "tenant": req.tenant, "user": req.user, "session": req.session,
-        })
+        otel.push_metrics(
+            score,
+            attrs={
+                "model_id": req.model_id,
+                "gpu_id": req.gpu_id,
+                "tenant": req.tenant,
+                "user": req.user,
+                "session": req.session,
+            },
+        )
 
         if (latency_s * 1000.0) > float(settings.slo_latency_ms):
             prom.slo_violation_by_model("diagnose_latency", req.model_id, req.gpu_id)
@@ -509,7 +629,12 @@ def create_app(*args, **kwargs) -> FastAPI:
                     e_value=float(av_out.get("e_value", 1.0)),
                     alpha_alloc=float(av_out.get("alpha_alloc", 0.0)),
                     message="diagnose",
-                    extra={"route_decoder": route.decoder, "route_temp": route.temperature, "route_top_p": route.top_p},
+                    extra={
+                        "route_decoder": route.decoder,
+                        "route_temp": route.temperature,
+                        "route_top_p": route.top_p,
+                        "action": action_str,
+                    },
                 )
             except Exception:
                 pass
@@ -520,8 +645,12 @@ def create_app(*args, **kwargs) -> FastAPI:
             threshold=float(av_out.get("threshold", 0.0)),
             budget_remaining=float(av_out.get("alpha_wealth", 0.0)),
             components=verdict_pack.get("components", {}),
-            cause=("detector" if verdict_pack.get("verdict", False) else ("av" if av_out.get("trigger", False) else "")),
-            action=("degrade" if decision_fail else "none"),
+            cause=(
+                "detector"
+                if verdict_pack.get("verdict", False)
+                else ("av" if av_out.get("trigger", False) else "")
+            ),
+            action=action_str,
             step=int(verdict_pack.get("step", 0)),
             e_value=float(av_out.get("e_value", 1.0)),
             alpha_alloc=float(av_out.get("alpha_alloc", 0.0)),
@@ -538,39 +667,73 @@ def create_app(*args, **kwargs) -> FastAPI:
 
     @app.post("/verify", response_model=VerifyResponse)
     def verify(req: VerifyRequest, request: Request, response: Response):
-        rid = ensure_request_id(dict(request.headers)) if _HAS_LOG else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
+        rid = (
+            ensure_request_id(dict(request.headers))
+            if _HAS_LOG
+            else (request.headers.get("x-request-id") or uuid.uuid4().hex[:16])
+        )
         response.headers["X-Request-Id"] = rid
 
         t0 = time.perf_counter()
         ok = False
         try:
             if req.heads is not None or req.bodies is not None:
-                if (not isinstance(req.heads, list)) or (not isinstance(req.bodies, list)) or (len(req.heads) != len(req.bodies)) or len(req.heads) == 0:
-                    raise HTTPException(status_code=400, detail="heads/bodies invalid")
+                if (
+                    not isinstance(req.heads, list)
+                    or not isinstance(req.bodies, list)
+                    or (len(req.heads) != len(req.bodies))
+                    or len(req.heads) == 0
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="heads/bodies invalid"
+                    )
                 if len(req.heads) > 4096:
-                    raise HTTPException(status_code=400, detail="window too large")
+                    raise HTTPException(
+                        status_code=400, detail="window too large"
+                    )
                 ok = bool(verify_chain(req.heads, req.bodies))
             else:
                 if not req.receipt_head_hex or not req.receipt_body_json:
-                    raise HTTPException(status_code=400, detail="missing receipt head/body")
+                    raise HTTPException(
+                        status_code=400, detail="missing receipt head/body"
+                    )
                 ws = None
                 if req.witness_segments is not None:
-                    if (len(req.witness_segments) != 3 or any(not isinstance(seg, list) for seg in req.witness_segments)):
-                        raise HTTPException(status_code=400, detail="witness_segments must be triple of int lists")
-                    if (len(req.witness_segments[0]) + len(req.witness_segments[1]) + len(req.witness_segments[2])) > (_MAX_TRACE + _MAX_SPECT + _MAX_FEATS):
-                        raise HTTPException(status_code=400, detail="witness too large")
-                    ws = (req.witness_segments[0], req.witness_segments[1], req.witness_segments[2])
-                ok = bool(verify_receipt(
-                    receipt_head_hex=req.receipt_head_hex,
-                    receipt_body_json=req.receipt_body_json,
-                    verify_key_hex=req.verify_key_hex,
-                    receipt_sig_hex=req.receipt_sig_hex,
-                    req_obj=req.req_obj,
-                    comp_obj=req.comp_obj,
-                    e_obj=req.e_obj,
-                    witness_segments=ws,
-                    strict=True
-                ))
+                    if len(req.witness_segments) != 3 or any(
+                        not isinstance(seg, list)
+                        for seg in req.witness_segments
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="witness_segments must be triple of int lists",
+                        )
+                    if (
+                        len(req.witness_segments[0])
+                        + len(req.witness_segments[1])
+                        + len(req.witness_segments[2])
+                        > (_MAX_TRACE + _MAX_SPECT + _MAX_FEATS)
+                    ):
+                        raise HTTPException(
+                            status_code=400, detail="witness too large"
+                        )
+                    ws = (
+                        req.witness_segments[0],
+                        req.witness_segments[1],
+                        req.witness_segments[2],
+                    )
+                ok = bool(
+                    verify_receipt(
+                        receipt_head_hex=req.receipt_head_hex,
+                        receipt_body_json=req.receipt_body_json,
+                        verify_key_hex=req.verify_key_hex,
+                        receipt_sig_hex=req.receipt_sig_hex,
+                        req_obj=req.req_obj,
+                        comp_obj=req.comp_obj,
+                        e_obj=req.e_obj,
+                        witness_segments=ws,
+                        strict=True,
+                    )
+                )
         finally:
             latency = max(0.0, time.perf_counter() - t0)
             prom.observe_latency(latency)
@@ -583,9 +746,10 @@ def create_app(*args, **kwargs) -> FastAPI:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         create_app(),
         host="127.0.0.1",
         port=8000,
-        reload=True
+        reload=True,
     )
