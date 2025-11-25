@@ -390,6 +390,8 @@ Version + core config snapshot:
 - `alpha` (default alpha budget)  
 - `slo_latency_ms`  
 
+---
+
 ### `GET /state/get`
 
 Returns detector state for a given `(model_id, gpu_id, task, lang)` key:
