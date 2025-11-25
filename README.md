@@ -398,191 +398,245 @@ Returns detector state for a given `(model_id, gpu_id, task, lang)` key:
 {
   "detector": { "...": "..." }
 }
+```
 
 Used to snapshot or migrate online detector state.
 
-⸻
+---
 
-POST /state/load
+### POST /state/load
 
-Loads a previously captured state into the detector keyed by (model_id, gpu_id, task, lang).
+Loads a previously captured state into the detector keyed by `(model_id, gpu_id, task, lang)`.
 
-⸻
+---
 
-gRPC interface (optional)
+## gRPC interface (optional)
 
-If you want a gRPC surface instead of HTTP, service_grpc.py exposes:
-	•	Diagnose – mirrors POST /diagnose
-	•	Verify – mirrors POST /verify
+If you want a gRPC surface instead of HTTP, `service_grpc.py` exposes:
 
-The protobuf file is designed to be as close as possible to the HTTP schemas, so you can:
-	•	run HTTP and gRPC side-by-side
-	•	choose whichever is easier for your environment
-	•	reuse the same receipts and ledgers, regardless of protocol
+- Diagnose — mirrors `POST /diagnose`
+- Verify — mirrors `POST /verify`
 
-⸻
+The protobuf file is designed to be as close as possible to the HTTP schemas, enabling:
 
-Admin / control plane
+- Running HTTP and gRPC side-by-side
+- Choosing whichever protocol fits your environment
+- Reusing receipts, keys, and ledger entries across both
 
-The admin surface is not meant for end-user tenants. It is an operator API with stronger security and stricter rate limits. Core areas:
-	•	Config & policies
-	•	Manage alpha budgets, thresholds, routing presets
-	•	Configure per-tenant / per-model overrides
-	•	Receipts & ledger
-	•	Search receipts by subject, time range, model, or decision
-	•	Inspect receipt bodies and chain relationships
-	•	Trigger chain checks and repair tasks (where supported)
-	•	Audits
-	•	Run auditor jobs over historical data
-	•	Export reports for compliance / governance
-	•	Calibration
-	•	Evaluate detector score distributions
-	•	Adjust thresholds / policies based on benchmarks
+---
+
+## Admin / control plane
+
+The admin surface is not meant for end-user tenants.  
+It is an operator API with strong security and stricter rate limits.
+
+Core areas:
+
+- **Config & policies**
+  - Manage alpha budgets, thresholds, routing presets  
+  - Configure per-tenant / per-model overrides  
+
+- **Receipts & ledger**
+  - Search receipts by subject, time range, model, or decision  
+  - Inspect receipt bodies and chain relationships  
+  - Trigger chain checks and repair tasks  
+
+- **Audits**
+  - Run auditor jobs over historical data  
+  - Export reports for compliance / governance  
+
+- **Calibration**
+  - Evaluate detector score distributions  
+  - Adjust thresholds / policies based on benchmarks  
 
 Admin endpoints reuse the same underlying components as the service plane, but with:
-	•	authentication & authorization via middleware_security
-	•	replay protection, stricter rate limits, and more detailed logging
 
-⸻
+- Authentication & authorization via `middleware_security`
+- Replay protection  
+- Stricter rate limits  
+- More detailed operator logging  
 
-Observability
+---
 
-Prometheus
+## Observability
 
-exporter.py exposes:
-	•	detector metrics (scores, verdict counts)
-	•	always-valid controller metrics (e-values, alpha wealth, spends)
-	•	HTTP / gRPC metrics (latency, status codes, SLO violations)
-	•	verify failures and replay / audit stats
+### Prometheus
 
-Default HTTP /metrics is available for scraping; there is also an embedded Prometheus server that can be bound to a dedicated port if desired.
+`exporter.py` exposes:
 
-⸻
+- Detector metrics (scores, verdict counts)
+- Always-valid controller metrics (e-values, alpha wealth, spends)
+- HTTP / gRPC metrics (latency, status codes, SLO violations)
+- Verify failures and replay / audit stats
 
-OpenTelemetry
+Prometheus scraping available at:
 
-otel_exporter.py pushes metrics and optional spans:
-	•	tagged by model_id, gpu_id, tenant, user, session
-	•	mark receipts as present/absent and approximate size
-	•	mark decisions with action labels and verdict flags
+```
+/metrics
+```
 
-You can wire this into any OTEL-compatible backend.
+A dedicated embedded Prometheus server is available if needed.
 
-⸻
+---
 
-Logging
+### OpenTelemetry
 
-logging.py provides:
-	•	request IDs and session IDs injected into each log line
-	•	structured fields for subject, model, GPU, and action
-	•	clear separation of service vs admin decisions
+`otel_exporter.py` pushes metrics + spans:
 
-All logs are structured so they can be indexed by common log aggregators.
+- Tagged by model_id, gpu_id, tenant, user, session  
+- Marks receipts as present/absent with approximate size  
+- Marks decisions with action labels and verdict flags  
 
-⸻
+Works with any OTEL backend.
 
-Configuration
+---
 
-config.py defines a reloadable settings object. Typical configuration sources:
-	•	Environment variables – easy for containers and CI
-	•	Config file – for local dev or on-prem installations
+## Logging
 
-Key settings include:
-	•	HTTP / gRPC bind addresses & ports
-	•	global SLO thresholds
-	•	alpha budgets and detector defaults
-	•	toggles for GPU telemetry, receipts, OTEL, etc.
-	•	rate-limit capacities / refill rates
+`logging.py` provides:
 
-Settings are accessed through make_reloadable_settings(), so long-running processes can reload without a full restart if the environment or config file changes.
+- request IDs and session IDs in every log line  
+- structured logging fields for subject, model, GPU, action  
+- clear separation between service and admin logs  
 
-⸻
+---
 
-Running locally
+## Configuration
 
-Prerequisites
-	•	Python 3.10+
-	•	poetry or pip environment
-	•	Optional: uvicorn, prometheus_client, fastapi, numpy, etc.
+`config.py` defines a reloadable settings object.
 
-Basic dev run (HTTP service plane)
+Configuration sources:
 
-# install dependencies (example)
+- Environment variables  
+- Config file (local dev or on-prem)
+
+Key settings:
+
+- HTTP / gRPC bind ports  
+- Global SLO thresholds  
+- Alpha budgets & detector defaults  
+- GPU telemetry toggles  
+- Receipt/OTEL toggles  
+- Rate-limit capacities  
+
+Reloadable via:
+
+```
+make_reloadable_settings()
+```
+
+---
+
+## Running locally
+
+### Prerequisites
+
+- Python 3.10+  
+- poetry or pip  
+- Optional: uvicorn, prometheus_client, fastapi, numpy  
+
+### Dev run (HTTP service plane)
+
+```bash
 pip install -r requirements.txt
 
-# run the service HTTP app
-export TCD_RECEIPTS_ENABLE=1  # optional
+export TCD_RECEIPTS_ENABLE=1   # optional
+
 uvicorn tcd.service_http:create_app \
   --factory \
   --host 127.0.0.1 \
   --port 8000 \
   --reload
+```
 
-Then:
-	•	http://127.0.0.1:8000/healthz
-	•	http://127.0.0.1:8000/version
-	•	POST http://127.0.0.1:8000/diagnose
+Test endpoints:
 
-⸻
+- http://127.0.0.1:8000/healthz  
+- http://127.0.0.1:8000/version  
+- POST http://127.0.0.1:8000/diagnose  
 
-Admin plane
+---
 
+## Admin plane
+
+```bash
 uvicorn tcd.admin_http:create_app \
   --factory \
   --host 127.0.0.1 \
   --port 8001 \
   --reload
+```
 
-Admin bindings and security setup are controlled via config.
+Admin security is governed by config.
 
-⸻
+---
 
-Docker & deployment (high-level sketch)
+## Docker & deployment (high-level)
 
-A minimal Dockerfile can:
-	1.	Copy the project into an image.
-	2.	Install requirements.
-	3.	Start uvicorn with either tcd.service_http:create_app or tcd.admin_http:create_app.
+A minimal Dockerfile:
 
-Example entrypoint (service plane):
+1. Copy project into image  
+2. Install requirements  
+3. Start uvicorn with service/admin plane  
 
+Example service entrypoint:
+
+```bash
 uvicorn tcd.service_http:create_app \
   --factory \
   --host 0.0.0.0 \
   --port 8000
+```
 
-Typical deployment patterns:
-	•	Sidecar – run one container next to each model server pod.
-	•	Shared gateway – run a shared sidecar cluster in front of multiple model backends, tagged by model_id/task.
-	•	On-prem – run as a standalone service with internal DNS and mTLS, fronted by an API gateway.
+### Deployment patterns:
 
-If you use Kubernetes, a Helm chart can encapsulate:
-	•	service / deployment for service plane
-	•	deployment for admin plane (restricted namespace)
-	•	Prometheus and OTEL integration
-	•	config & secret management
+- **Sidecar** — one container per model server  
+- **Shared gateway** — front multiple model servers  
+- **On-prem** — internal DNS + mTLS + API gateway  
 
-⸻
+### Kubernetes (Helm chart)
 
-Development workflow
-	•	All core logic is in tcd/:
-	•	keep HTTP/grpc surfaces thin
-	•	keep detector / AV / receipts / audit logic testable without network
-	•	Unit tests live under tests/ and cover:
-	•	detector behavior
-	•	AV controller guarantees
-	•	receipt issuance & verification
-	•	audit flows and chain checks
+- Deploy service plane  
+- Deploy admin plane (restricted namespace)  
+- Prometheus + OTEL integration  
+- Config + secrets  
 
-You can run tests with your preferred test runner (e.g. pytest).
+---
 
-PRs and feature work are expected to:
-	•	extend schemas in schemas.py where possible
-	•	update config defaults in config.py
-	•	add metrics in exporter.py / otel_exporter.py for new behaviors
-	•	keep service plane and admin plane surfaces cohesive but separated
+## Development workflow
 
-⸻
+Core logic lives in `tcd/`.
 
-This section is meant to give a complete picture of how the system is structured and how the pieces fit together, without tying it to any specific vendor. You can plug it next to any model runtime, from a simple single-GPU server to a large multi-tenant cluster, while preserving verifiable receipts, e-process budgets, and clear SRE-style observability.
+- Keep HTTP/gRPC surfaces thin  
+- Keep detector, AV, receipts, audit logic testable  
+- Tests under `tests/` cover:
+  - detector behavior  
+  - AV controller invariants  
+  - receipt issuance & verification  
+  - audit flows & chain checks  
+
+Run tests:
+
+```
+pytest
+```
+
+Feature PR expectations:
+
+- extend schemas in `schemas.py`  
+- update defaults in `config.py`  
+- add metrics in `exporter.py` / `otel_exporter.py`  
+- keep service & admin plane cohesive but separated  
+
+---
+
+This section provides a complete picture of how the system is structured and how components interact.  
+The system can attach to any model runtime—from a single-GPU server to a multi-tenant cluster—while preserving:
+
+- verifiable receipts  
+- always-valid e-process budgets  
+- full SRE-grade observability  
+
+
+
 
