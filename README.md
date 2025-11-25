@@ -390,9 +390,7 @@ Version + core config snapshot:
 - `alpha` (default alpha budget)  
 - `slo_latency_ms`  
 
----
-
-### `GET /state/get`
+### GET /state/get
 
 Returns detector state for a given `(model_id, gpu_id, task, lang)` key:
 
@@ -575,7 +573,8 @@ Development workflow
 	•	AV controller guarantees
 	•	receipt issuance & verification
 	•	audit flows and chain checks
-	•	You can run tests with your preferred test runner (e.g. pytest).
+
+You can run tests with your preferred test runner (e.g. pytest).
 
 PRs and feature work are expected to:
 	•	extend schemas in schemas.py where possible
