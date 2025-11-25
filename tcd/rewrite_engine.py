@@ -1,4 +1,3 @@
-# tcd/rewrite_engine.py
 from __future__ import annotations
 
 import difflib
@@ -11,6 +10,31 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Optional hashing primitive for patch_ref (kept opaque here).
+try:
+    from .crypto import Blake3Hash  # type: ignore
+except Exception:  # pragma: no cover
+    Blake3Hash = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Guard rails / limits
+# ---------------------------------------------------------------------------
+
+# Hard limits to keep this engine firmly in the "small, local edits" regime.
+_MAX_SEGMENT_LINES = 64
+_MAX_CHANGED_LINES = 32
+
+# Sensitive areas which should not be rewritten automatically.
+# Paths are interpreted relative to the repository root.
+_SENSITIVE_PATH_PREFIXES: Tuple[str, ...] = (
+    "tcd/crypto",
+    "tcd/verify",
+    "tcd/receipts",
+    "tcd/ratelimit",
+    "tcd/security_router",
+)
+
 
 # ---------------------------------------------------------------------------
 # Patch data structures
@@ -21,14 +45,39 @@ class PatchRisk(str, Enum):
     """
     Risk level of an automatically generated patch.
 
-    LOW    – can be auto-applied by an agent in a canary or low-traffic env.
-    MEDIUM – should go through human review; agent should not auto-apply.
-    HIGH   – diagnostic only; auto-apply must be disabled.
+    LOW
+        Small, local, configuration-style change. Eligible for auto-apply
+        only under strict outer control (and static-rule origin).
+    MEDIUM
+        Behaviour / observability affecting change. Must go through review.
+    HIGH
+        Diagnostic only, or large / structural edit. Auto-apply must be
+        disabled; intended for human inspection and patch tooling.
     """
 
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class PatchOrigin(str, Enum):
+    """
+    Origin of a patch proposal, for supply-chain and security auditing.
+
+    STATIC_RULE
+        Deterministic local rule, no opaque external suggestion involved.
+    LLM_ASSISTED
+        Any use of model-suggested edits (even if also rule-based).
+    HUMAN_REVIEW
+        Manually edited / merged proposal produced by a reviewer.
+    EXTERNAL_TOOL
+        Patch derived from a separate static analysis / scanning tool.
+    """
+
+    STATIC_RULE = "static_rule"
+    LLM_ASSISTED = "llm_assisted"
+    HUMAN_REVIEW = "human_review"
+    EXTERNAL_TOOL = "external_tool"
 
 
 @dataclass
@@ -64,14 +113,18 @@ class PatchHunk:
 @dataclass
 class PatchProposal:
     """
-    A cohesive patch proposal. It may contain multiple hunks and is the unit
-    consumed by higher-level agents or humans for review and application.
+    A cohesive patch proposal.
+
+    This is the unit consumed by higher-level agents or humans for review
+    and application. It is intentionally immutable once created; any change
+    should be expressed as a new patch with its own identifier.
     """
 
     patch_id: str
     title: str
     description: str
     risk: PatchRisk
+    origin: PatchOrigin
     created_at: float
     hunks: List[PatchHunk]
     metadata: Dict[str, Any]
@@ -82,6 +135,7 @@ class PatchProposal:
             "title": self.title,
             "description": self.description,
             "risk": self.risk.value,
+            "origin": self.origin.value,
             "created_at": self.created_at,
             "hunks": [
                 {
@@ -138,6 +192,11 @@ class BugSignal:
         - "logger_name", "target_level"
         - "from_text", "to_text"
         - "llm_suggestion" – optional suggestion from an external model
+        - "policy_ref", "policyset_ref"
+        - "subject_hash" – hashed subject / tenant identifier
+        - "e_snapshot" – anytime-valid state snapshot driving this signal
+
+        Raw prompts, completions or secrets must not be placed here.
     """
 
     kind: str
@@ -161,11 +220,17 @@ class RewriteEngine:
     """
     Semi-automatic rewrite engine for TCD.
 
-    It is intentionally conservative:
+    Design principles:
+      - Only handles local, low-risk changes in non-sensitive areas.
+      - Never writes to disk or runs git operations.
+      - Always returns structured PatchProposal objects for review.
+      - Produces security metadata (origin, risk, auto-apply flag, patch_ref)
+        so that a higher-level security / control plane can make decisions.
 
-    * Only handles local, low-risk changes.
-    * Never writes to disk or runs git operations.
-    * Always returns structured PatchProposal objects for review.
+    This engine is deliberately content-agnostic at the control level:
+    it does not know about policies, receipts, or e-process semantics;
+    it just propagates structured metadata that upstream components
+    supply in BugSignal.metadata.
     """
 
     def __init__(self, repo_root: Path | str) -> None:
@@ -181,7 +246,17 @@ class RewriteEngine:
 
         Returns:
             PatchProposal on success, or None if no safe patch could be formed.
+
+        Safety notes:
+          - Sensitive paths are never patched automatically.
+          - Large or heavily modified segments are escalated to HIGH risk.
+          - Only STATIC_RULE + LOW risk patches can be marked as
+            auto_apply_allowed in their security metadata.
         """
+        # Guard: do not propose patches in sensitive core areas.
+        if self._is_sensitive_path(signal.file_path):
+            return None
+
         abs_path = (self.repo_root / signal.file_path).resolve()
         if not abs_path.is_file():
             return None
@@ -193,13 +268,22 @@ class RewriteEngine:
         start_idx, end_idx = self._context_window(signal.line, signal.context_lines, len(lines))
         old_segment = lines[start_idx:end_idx]
 
-        new_segment, risk = self._rewrite_segment(
+        new_segment, base_risk = self._rewrite_segment(
             signal=signal,
             original_lines=old_segment,
         )
 
+        # No rewrite rule fired.
         if new_segment is None or new_segment == old_segment:
             return None
+
+        # Enforce segment size / change limits by escalating risk if needed.
+        changed_lines = self._estimate_changed_lines(old_segment, new_segment)
+        risk = self._adjust_risk_for_size(base_risk, new_segment, changed_lines)
+
+        # Determine origin and apply origin-based risk gating.
+        origin = self._infer_origin(signal)
+        risk = self._adjust_risk_for_origin(risk, origin)
 
         hunk = PatchHunk(
             file_path=signal.file_path,
@@ -212,8 +296,9 @@ class RewriteEngine:
         )
 
         title = self._title_for_signal(signal)
-        description = self._description_for_signal(signal, risk)
+        description = self._description_for_signal(signal, risk, origin)
 
+        # Base metadata from the signal and engine.
         metadata: Dict[str, Any] = {
             "signal": {
                 "kind": signal.kind,
@@ -225,19 +310,42 @@ class RewriteEngine:
             },
             "engine": {
                 "name": "tcd.rewrite_engine",
-                "version": "0.1.0",
+                "version": "0.2.0",
             },
         }
 
-        return PatchProposal(
+        # Security / supply-chain block for higher-level control planes.
+        security_meta: Dict[str, Any] = {
+            "origin": origin.value,
+            "risk": risk.value,
+            # auto_apply_allowed is conservative and may be further constrained
+            # by external policy / control-plane logic.
+            "auto_apply_allowed": bool(
+                origin == PatchOrigin.STATIC_RULE and risk == PatchRisk.LOW
+            ),
+            # Pass-through hints used by control planes for auditing and routing.
+            "policy_ref": signal.metadata.get("policy_ref"),
+            "policyset_ref": signal.metadata.get("policyset_ref"),
+            "subject_hash": signal.metadata.get("subject_hash"),
+            "e_snapshot": signal.metadata.get("e_snapshot"),
+        }
+        metadata["security"] = security_meta
+
+        proposal = PatchProposal(
             patch_id=self._new_patch_id(),
             title=title,
             description=description,
             risk=risk,
+            origin=origin,
             created_at=time.time(),
             hunks=[hunk],
             metadata=metadata,
         )
+
+        # Attach a stable patch_ref derived from the proposal content.
+        self._attach_patch_ref(proposal)
+
+        return proposal
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -257,6 +365,119 @@ class RewriteEngine:
         start = max(0, line_idx - context)
         end = min(n_lines, line_idx + context + 1)
         return start, end
+
+    @staticmethod
+    def _is_sensitive_path(file_path: str) -> bool:
+        """
+        Return True if the given path should never be patched automatically.
+
+        This is a coarse guard rail against accidental modification of
+        security-critical primitives or control-plane logic. The caller
+        can still surface signals for these files, but the engine will
+        abstain from generating edits.
+        """
+        norm = Path(file_path).as_posix()
+        return any(norm.startswith(prefix) for prefix in _SENSITIVE_PATH_PREFIXES)
+
+    @staticmethod
+    def _estimate_changed_lines(old: List[str], new: List[str]) -> int:
+        """
+        Rough estimate of how many lines differ between old/new segments.
+
+        This is intentionally simple and bounded, as segments are small.
+        """
+        changed = 0
+        max_len = max(len(old), len(new))
+        for i in range(max_len):
+            o = old[i] if i < len(old) else None
+            n = new[i] if i < len(new) else None
+            if o != n:
+                changed += 1
+        return changed
+
+    @staticmethod
+    def _adjust_risk_for_size(
+        base_risk: PatchRisk,
+        new_segment: List[str],
+        changed_lines: int,
+    ) -> PatchRisk:
+        """
+        Escalate risk if the patch touches too many lines.
+
+        This keeps large / structural edits out of the auto-apply zone
+        while still allowing them to be proposed for human review.
+        """
+        if len(new_segment) > _MAX_SEGMENT_LINES or changed_lines > _MAX_CHANGED_LINES:
+            return PatchRisk.HIGH
+        return base_risk
+
+    @staticmethod
+    def _infer_origin(signal: BugSignal) -> PatchOrigin:
+        """
+        Infer patch origin from BugSignal.metadata.
+
+        Conventions:
+          - if metadata["origin"] is present and valid, use it;
+          - else if "llm_suggestion" is present, treat as LLM_ASSISTED;
+          - else if "external_tool" or "tool_name" is present, treat as EXTERNAL_TOOL;
+          - otherwise assume STATIC_RULE.
+        """
+        meta = signal.metadata or {}
+
+        explicit = str(meta.get("origin", "")).strip().lower()
+        for o in PatchOrigin:
+            if o.value == explicit:
+                return o
+
+        if "llm_suggestion" in meta:
+            return PatchOrigin.LLM_ASSISTED
+        if "external_tool" in meta or "tool_name" in meta:
+            return PatchOrigin.EXTERNAL_TOOL
+        return PatchOrigin.STATIC_RULE
+
+    @staticmethod
+    def _adjust_risk_for_origin(risk: PatchRisk, origin: PatchOrigin) -> PatchRisk:
+        """
+        Enforce origin-based risk floor.
+
+        For example, any LLM_ASSISTED patch is at least MEDIUM risk, even
+        if the syntactic edit is small.
+        """
+        if origin == PatchOrigin.LLM_ASSISTED and risk == PatchRisk.LOW:
+            return PatchRisk.MEDIUM
+        return risk
+
+    def _attach_patch_ref(self, proposal: PatchProposal) -> None:
+        """
+        Compute and attach a stable patch_ref under metadata["security"]["patch_ref"].
+
+        The ref is derived from the proposal content (excluding any existing
+        patch_ref) and can be used as a supply-chain identifier and as a
+        signing target for attestation / receipts.
+        """
+        if Blake3Hash is None:
+            return
+        try:
+            payload = proposal.to_dict()
+            # Remove any pre-existing patch_ref to avoid self-dependence.
+            sec = payload.get("metadata", {}).get("security", {})
+            if isinstance(sec, dict):
+                sec.pop("patch_ref", None)
+
+            data = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+            hasher = Blake3Hash()
+            ref = hasher.hex(data, ctx="tcd:patch")[:32]
+
+            proposal.metadata.setdefault("security", {})["patch_ref"] = ref
+        except Exception:
+            # Patch identification must not block patch proposal.
+            return
 
     # ------------------------------------------------------------------
     # Rewrite rules
@@ -281,7 +502,7 @@ class RewriteEngine:
         if kind == "typo":
             return self._fix_typo(signal, original_lines)
 
-        # Unknown kind: only surface metadata; no patch.
+        # Unknown kind: no patch; treat as diagnostic-only.
         return None, PatchRisk.HIGH
 
     # ------------------------------------------------------------------
@@ -312,6 +533,7 @@ class RewriteEngine:
         if not replaced:
             return None, PatchRisk.MEDIUM
 
+        # Small config-key rename is usually low risk.
         return new_lines, PatchRisk.LOW
 
     def _fix_log_level(
@@ -351,7 +573,7 @@ class RewriteEngine:
         original_lines: List[str],
     ) -> Tuple[Optional[List[str]], PatchRisk]:
         """
-        Simple string replacement based on metadata["from_text"] -> ["to_text"].
+        Simple string replacement based on metadata["from_text"] -> metadata["to_text"].
         """
         src = str(signal.metadata.get("from_text", "")).strip()
         dst = str(signal.metadata.get("to_text", "")).strip()
@@ -372,6 +594,7 @@ class RewriteEngine:
         if not replaced:
             return None, PatchRisk.MEDIUM
 
+        # Small typo fixes are low risk by default.
         return new_lines, PatchRisk.LOW
 
     # ------------------------------------------------------------------
@@ -384,7 +607,11 @@ class RewriteEngine:
         return f"Auto-suggested fix: {base}"
 
     @staticmethod
-    def _description_for_signal(signal: BugSignal, risk: PatchRisk) -> str:
+    def _description_for_signal(
+        signal: BugSignal,
+        risk: PatchRisk,
+        origin: PatchOrigin,
+    ) -> str:
         meta_preview = json.dumps(signal.metadata, ensure_ascii=False, sort_keys=True)
         body = textwrap.dedent(
             f"""
@@ -395,6 +622,7 @@ class RewriteEngine:
               line: {signal.line}
               message: {signal.message}
               risk: {risk.value}
+              origin: {origin.value}
 
             Metadata:
               {meta_preview}

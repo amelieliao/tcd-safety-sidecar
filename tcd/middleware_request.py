@@ -4,11 +4,12 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, Mapping
 
 from blake3 import blake3
 from fastapi import Request, Response
@@ -24,6 +25,9 @@ try:
     _HAS_AUTH = True
 except Exception:  # pragma: no cover
     _HAS_AUTH = False
+
+
+_logger = logging.getLogger(__name__)
 
 
 # -------------------------
@@ -101,6 +105,34 @@ class MetricsConfig:
     path_normalizer: Callable[[str], str] = None  # injected later
 
 
+@dataclass
+class SecurityConfig:
+    """
+    High-level security profile configuration.
+
+    This does not implement cryptography itself; it only controls how the
+    middleware behaves in higher-security deployments.
+
+    - profile:
+        "DEV", "PROD", "HIGH_SEC" or other caller-defined profile names.
+    - require_authenticator:
+        If True, the unified Authenticator must be present; otherwise
+        fallback auth logic is treated as a failure.
+    - forbid_legacy_auth:
+        If True, legacy Bearer/HMAC flows are not allowed even if configured.
+    - idempotency_disallowed_classes:
+        Classifications for which idempotency cache must not be used.
+    - high_cost_classes:
+        Classifications that apply a higher cost factor in rate limiting.
+    """
+
+    profile: str = "DEV"
+    require_authenticator: bool = False
+    forbid_legacy_auth: bool = False
+    idempotency_disallowed_classes: Tuple[str, ...] = ("sensitive", "secret")
+    high_cost_classes: Tuple[str, ...] = ("sensitive", "secret")
+
+
 def _default_normalizer(path: str) -> str:
     # Replace UUIDs and long numeric IDs to reduce cardinality.
     p = re.sub(
@@ -167,6 +199,7 @@ class _Metrics:
             self.req_ctr = self.req_reject = self.req_bytes = self.resp_bytes = None
             self.latency = self.idem_ctr = self.rate_block = self.auth_sig = None
             self.auth_sig_fail_reason = None
+            self.req_sec = None
             return
         from prometheus_client import Counter, Histogram, Gauge, REGISTRY
 
@@ -199,6 +232,12 @@ class _Metrics:
         self.auth_sig_fail_reason = Counter(
             "tcd_http_signature_fail_total", "Signature failures", ["reason", "path"], registry=self._reg
         )
+        self.req_sec = Counter(
+            "tcd_http_requests_security_total",
+            "HTTP requests by coarse security level",
+            ["sec_level", "path"],
+            registry=self._reg,
+        )
 
 
 # -------------------------
@@ -212,6 +251,7 @@ class TCDRequestMiddlewareConfig:
     idempotency: IdempotencyConfig = field(default_factory=IdempotencyConfig)
     policies: PolicyBindConfig = field(default_factory=PolicyBindConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
     # Paths that fully bypass this middleware (early return).
     bypass_paths: Tuple[str, ...] = (r"^/metrics$",)
     # Response header to propagate a request id.
@@ -228,6 +268,7 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
       - Per-tenant rate limiting
       - Prometheus metrics with path normalization
       - Request-id propagation
+      - Light-weight security context propagation for downstream logic
     """
 
     def __init__(
@@ -253,6 +294,11 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
         self._authenticator: Optional[Authenticator] = None
         if self._cfg.auth.use_authenticator and _HAS_AUTH:
             self._authenticator = authenticator or build_authenticator_from_env()
+        if self._cfg.security.require_authenticator and self._authenticator is None:
+            _logger.warning(
+                "Security profile requires authenticator, but no Authenticator is available. "
+                "All requests will be treated as unauthenticated."
+            )
 
         self._idem = _IdemCache(self._cfg.idempotency.ttl_seconds, self._cfg.idempotency.max_entries)
 
@@ -268,28 +314,151 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
     def _path_match(self, path: str, pats: Iterable[re.Pattern]) -> bool:
         return any(p.search(path) for p in pats)
 
+    def _derive_classification(self, req: Request) -> str:
+        """
+        Derive a coarse classification label from security context or headers.
+
+        This is intentionally simple and non-binding; it is used only for
+        routing decisions inside this middleware (e.g. idempotency eligibility).
+        """
+        # Prefer security_ctx.classification if available.
+        try:
+            sec_ctx = getattr(req.state, "security_ctx", None)
+        except Exception:
+            sec_ctx = None
+        if isinstance(sec_ctx, Mapping):
+            val = sec_ctx.get("classification") or sec_ctx.get("class") or sec_ctx.get("level")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        # Fallback: header, if caller wants to hint classification.
+        h_val = (req.headers.get("X-Classification") or "").strip()
+        if h_val:
+            return h_val
+
+        return "unclassified"
+
+    def _coarse_security_level(self, classification: str) -> str:
+        """
+        Map fine-grained classification strings to a coarse security level.
+
+        Used only for metrics labeling and local decisions; it is not a
+        formal access-control mechanism.
+        """
+        if not classification:
+            return "public"
+        v = classification.lower()
+        if v in ("sensitive", "secret", "high", "critical", "restricted"):
+            return "restricted"
+        if v in ("internal", "confidential", "medium"):
+            return "internal"
+        return "public"
+
+    def _should_use_idempotency(self, classification: str) -> bool:
+        """
+        Decide whether idempotency caching is allowed under the given classification.
+        """
+        deny = tuple(x.lower() for x in self._cfg.security.idempotency_disallowed_classes)
+        if not classification:
+            return True
+        return classification.lower() not in deny
+
+    def _filter_idem_headers(self, headers: List[Tuple[bytes, bytes]]) -> Dict[str, str]:
+        """
+        Filter response headers before storing in idempotency cache.
+
+        This removes headers that may carry credentials or other sensitive
+        values, keeping only a minimal, safe subset.
+        """
+        deny = {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-internal-token",
+            "x-internal-auth",
+        }
+        try:
+            deny.add(self._cfg.auth.signature_header.lower())
+        except Exception:
+            pass
+
+        safe: Dict[str, str] = {}
+        for k_b, v_b in headers:
+            try:
+                k = k_b.decode().lower()
+                v = v_b.decode()
+            except Exception:
+                continue
+            if k in deny:
+                continue
+            safe[k] = v
+        return safe
+
     async def _auth_ok(self, req: Request, raw_body: bytes, norm_path: str) -> bool:
         # Skip auth if path matches allowlist.
         if self._path_match(req.url.path, self._skip_auth):
+            # Ensure there is at least a default security context object for downstream.
+            try:
+                if not hasattr(req.state, "security_ctx"):
+                    req.state.security_ctx = {}
+            except Exception:
+                pass
             return True
+
+        # If security profile requires authenticator but none is available, fail early.
+        if self._cfg.security.require_authenticator and self._authenticator is None:
+            if self._metrics.enabled:
+                self._metrics.auth_sig.labels("fail", norm_path).inc()
+                if self._metrics.auth_sig_fail_reason:
+                    self._metrics.auth_sig_fail_reason.labels("authenticator_missing", norm_path).inc()
+            _logger.error("Authenticator required by security profile, but not configured.")
+            return False
 
         # Preferred: unified authenticator
         if self._authenticator is not None:
             res: AuthResult = await self._authenticator.verify(req)
             ok = bool(res.ok and res.ctx)
+            sec_ctx: Dict[str, Any] = {}
+            raw_ctx = getattr(res, "ctx", None)
+            if isinstance(raw_ctx, Mapping):
+                sec_ctx = dict(raw_ctx)
+            elif raw_ctx is not None:
+                sec_ctx = {"raw": raw_ctx}
+            try:
+                req.state.security_ctx = sec_ctx
+            except Exception:
+                _logger.debug("Failed to attach security_ctx to request.state", exc_info=True)
+
             if self._metrics.enabled:
                 self._metrics.auth_sig.labels("ok" if ok else "fail", norm_path).inc()
                 if not ok and self._metrics.auth_sig_fail_reason:
-                    reason = (res.reason or "denied").lower()
+                    reason = (getattr(res, "reason", None) or "denied").lower()
                     self._metrics.auth_sig_fail_reason.labels(reason, norm_path).inc()
             return ok
 
+        # If legacy auth is forbidden under current security profile, deny.
+        if self._cfg.security.forbid_legacy_auth:
+            if self._metrics.enabled:
+                self._metrics.auth_sig.labels("fail", norm_path).inc()
+                if self._metrics.auth_sig_fail_reason:
+                    self._metrics.auth_sig_fail_reason.labels("legacy_auth_forbidden", norm_path).inc()
+            _logger.warning("Legacy auth is forbidden by security profile, but no Authenticator is configured.")
+            return False
+
         # Fallback: Bearer/HMAC (basic)
         if not (self._cfg.auth.enable_bearer or self._cfg.auth.enable_hmac):
+            # No auth configured: treat as anonymous / public.
+            try:
+                if not hasattr(req.state, "security_ctx"):
+                    req.state.security_ctx = {"authn_method": "none", "classification": "unclassified"}
+            except Exception:
+                pass
             return True
 
         ok = True
         reason = None
+        authn_method = "legacy"
 
         if self._cfg.auth.enable_bearer:
             want = (os.getenv(self._cfg.auth.bearer_token_env) or "").strip()
@@ -303,6 +472,7 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                     if not hmac.compare_digest(token, want):
                         ok = False
                         reason = "bearer_mismatch"
+                authn_method = "bearer"
             # If want is empty, bearer is effectively disabled.
 
         if ok and self._cfg.auth.enable_hmac:
@@ -314,6 +484,14 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 if not hmac.compare_digest(calc, sig_hex):
                     ok = False
                     reason = "hmac_mismatch"
+                authn_method = "hmac"
+
+        if ok:
+            # Attach a minimal security context for downstream usage.
+            try:
+                req.state.security_ctx = {"authn_method": authn_method, "classification": "unclassified"}
+            except Exception:
+                _logger.debug("Failed to attach security_ctx for legacy auth", exc_info=True)
 
         if self._metrics.enabled:
             self._metrics.auth_sig.labels("ok" if ok else "fail", norm_path).inc()
@@ -362,7 +540,12 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
         }
         return {k: (str(v) if v is not None else "*") for k, v in ctx.items()}
 
-    def _rate_check(self, ctx: Dict[str, str], body_json: Optional[Dict[str, Any]], norm_path: str) -> Tuple[bool, Optional[float], Optional[float]]:
+    def _rate_check(
+        self,
+        ctx: Dict[str, str],
+        body_json: Optional[Dict[str, Any]],
+        norm_path: str,
+    ) -> Tuple[bool, Optional[float], Optional[float]]:
         if self._path_match(ctx.get("_path", ""), self._skip_rate):
             return True, None, None
         # Token cost from tokens_delta if present; else 1.
@@ -374,6 +557,16 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 tokens_delta = 1.0
         divisor = float(ctx.get("_token_cost_divisor", self._cfg.limits.token_cost_divisor_default))
         cost = max(1.0, tokens_delta / max(1.0, divisor))
+
+        # Optional: adjust cost based on classification for stricter environments.
+        cls_name = (ctx.get("_classification") or "").lower()
+        try:
+            high_cost = tuple(x.lower() for x in self._cfg.security.high_cost_classes)
+        except Exception:
+            high_cost = ()
+        if cls_name and cls_name in high_cost:
+            cost = max(1.0, cost * 2.0)
+
         key = (ctx.get("tenant", "*"), ctx.get("user", "*"), ctx.get("session", "*"))
 
         # Best-effort introspection of remaining tokens (optional).
@@ -428,6 +621,8 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
         bound: Optional[BoundPolicy] = None
         req_id_header = self._cfg.request_id_header
         req_id = self._ensure_request_id(request, req_id_header)
+        classification = "unclassified"
+        sec_level = "public"
 
         try:
             # Body read with limits; then re-attach downstream.
@@ -444,9 +639,14 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
             if not await self._auth_ok(request, raw_body, norm_path):
                 raise _Reject(403, "forbidden")
 
+            # Derive classification & coarse security level from security context.
+            classification = self._derive_classification(request)
+            sec_level = self._coarse_security_level(classification)
+
             # Policy bind
             if self._store and not self._path_match(path, self._skip_bind):
                 ctx = self._extract_ctx(request, body_json)
+                ctx["_classification"] = classification
                 bound = self._store.bind(ctx)
                 # Derived values for rate limiting.
                 ctx["_token_cost_divisor"] = str(bound.token_cost_divisor)
@@ -462,6 +662,7 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 ctx_local = self._extract_ctx(request, body_json)
                 ctx_local["_path"] = path
                 ctx_local["_token_cost_divisor"] = str(self._cfg.limits.token_cost_divisor_default)
+                ctx_local["_classification"] = classification
             ok, remaining_before, capacity = self._rate_check(ctx_local, body_json, norm_path)
             if not ok:
                 raise _Reject(429, "rate limited")
@@ -473,6 +674,7 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 and idem_header
                 and not self._path_match(path, self._skip_idem)
                 and request.method.upper() in ("POST", "PUT", "PATCH")
+                and self._should_use_idempotency(classification)
             )
             cache_key = None
             if use_idem:
@@ -482,6 +684,11 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                     code, hdrs, body = hit
                     if self._metrics.enabled:
                         self._metrics.idem_ctr.labels("hit", norm_path).inc()
+                        if self._metrics.req_sec is not None:
+                            try:
+                                self._metrics.req_sec.labels(sec_level, norm_path).inc()
+                            except Exception:
+                                pass
                     headers = {k: v for k, v in hdrs.items() if k.lower() not in ("content-length",)}
                     # Ensure we propagate a request id in the response.
                     headers.setdefault(req_id_header, req_id)
@@ -518,8 +725,8 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 st = captured.status_code
                 if (not self._cfg.idempotency.store_only_2xx) or (200 <= st < 300):
                     if len(captured.body) <= self._cfg.idempotency.max_store_bytes:
-                        headers = {k.decode().lower(): v.decode() for k, v in captured.headers}
-                        self._idem.set(cache_key, st, headers, captured.body)
+                        filtered_headers = self._filter_idem_headers(captured.headers)
+                        self._idem.set(cache_key, st, filtered_headers, captured.body)
                         if self._metrics.enabled:
                             self._metrics.idem_ctr.labels("store", norm_path).inc()
                     else:
@@ -532,6 +739,11 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 self._metrics.resp_bytes.labels(request.method, norm_path, str(resp2.status_code)).inc(len(captured.body))
                 self._metrics.req_ctr.labels(request.method, norm_path, str(resp2.status_code)).inc()
                 self._metrics.latency.observe(max(0.0, time.perf_counter() - t0))
+                if self._metrics.req_sec is not None:
+                    try:
+                        self._metrics.req_sec.labels(sec_level, norm_path).inc()
+                    except Exception:
+                        pass
 
             return resp2
 
@@ -540,6 +752,11 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 self._metrics.req_reject.labels(rj.reason, norm_path).inc()
                 self._metrics.req_ctr.labels(request.method, norm_path, str(rj.code)).inc()
                 self._metrics.latency.observe(max(0.0, time.perf_counter() - t0))
+                if self._metrics.req_sec is not None:
+                    try:
+                        self._metrics.req_sec.labels(sec_level, norm_path).inc()
+                    except Exception:
+                        pass
             return Response(
                 content=json.dumps({"error": rj.reason}),
                 status_code=rj.code,
@@ -547,10 +764,16 @@ class TCDRequestMiddleware(BaseHTTPMiddleware):
                 headers={req_id_header: req_id},
             )
         except Exception:
+            _logger.exception("Unhandled exception in TCDRequestMiddleware.dispatch")
             if self._metrics.enabled:
                 self._metrics.req_reject.labels("exception", norm_path).inc()
                 self._metrics.req_ctr.labels(request.method, norm_path, "500").inc()
                 self._metrics.latency.observe(max(0.0, time.perf_counter() - t0))
+                if self._metrics.req_sec is not None:
+                    try:
+                        self._metrics.req_sec.labels(sec_level, norm_path).inc()
+                    except Exception:
+                        pass
             return Response(
                 content=json.dumps({"error": "internal"}),
                 status_code=500,

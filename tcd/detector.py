@@ -11,21 +11,31 @@ Design goals (aligned with the rest of TCD):
 - Tight input guards (max bytes/tokens), time-budget watchdog, and structured evidence
 - Optional Prometheus metrics (auto-disabled if prometheus_client not installed)
 - Canonical JSON dumps (orjson when available) and Blake3-based evidence hashing
+- Content-agnostic evidence: no raw text in detector outputs, bounded metadata
 
 Environment knobs:
-- TCD_DETECTOR_TIME_BUDGET_MS   (default: 3.0)
-- TCD_DETECTOR_MAX_TOKENS       (default: 2048)
-- TCD_DETECTOR_MAX_BYTES        (default: 100_000)
-- TCD_DETECTOR_THRESH_LOW       (default: 0.20)  → decision "allow" if p ≥ 1 - THRESH_LOW
-- TCD_DETECTOR_THRESH_HIGH      (default: 0.80)  → decision "block" if p ≤ (1 - THRESH_HIGH)
-- TCD_DETECTOR_CALIB_MODE       (default: "isotonic"; options: "isotonic", "conformal", "identity")
-- TCD_DETECTOR_CALIB_KNOTS      (JSON: [[score, p], ...] sorted by score) for isotonic mode
-- TCD_DETECTOR_CONFORMAL_WINDOW (default: 1024)
-- TCD_DETECTOR_CONFORMAL_ALPHA  (default: 0.05)
-- TCD_DETECTOR_RANDOM_SEED      (optional int; per-process seed for deterministic heuristics)
+- TCD_DETECTOR_TIME_BUDGET_MS        (default: 3.0, clamped into [0.5, 50.0])
+- TCD_DETECTOR_MAX_TOKENS            (default: 2048, clamped into [64, 8192])
+- TCD_DETECTOR_MAX_BYTES             (default: 100_000, clamped into [1024, 2_000_000])
+- TCD_DETECTOR_THRESH_LOW            (default: 0.20)
+- TCD_DETECTOR_THRESH_HIGH           (default: 0.80)
+- TCD_DETECTOR_CALIB_MODE            (default: "isotonic"; options: "isotonic", "conformal", "identity")
+- TCD_DETECTOR_CALIB_KNOTS           (JSON: [[score, p], ...] sorted by score) for isotonic mode
+- TCD_DETECTOR_CONFORMAL_WINDOW      (default: 1024, clamped into [32, 16384])
+- TCD_DETECTOR_CONFORMAL_ALPHA       (default: 0.05, clamped into [0,1])
+- TCD_DETECTOR_CONFORMAL_BOOTSTRAP   (default: "identity"; options: "identity", "mid")
+- TCD_DETECTOR_RANDOM_SEED           (optional int; per-process seed for deterministic heuristics)
+
+Evidence hardening knobs:
+- TCD_DETECTOR_SANITIZE_EVIDENCE     (default: "1")
+- TCD_DETECTOR_STRIP_PII             (default: "1")
+- TCD_DETECTOR_HASH_PII_TAGS         (default: "1")
+- TCD_DETECTOR_PII_MODE              (default: "light"; options: "light", "strict")
+- TCD_DETECTOR_MAX_EVIDENCE_KEYS     (default: "64")
+- TCD_DETECTOR_MAX_EVIDENCE_STRING   (default: "512")
 
 Notes on decisions:
-- We map raw model scores (higher = riskier) to p-values in [0,1] with a *monotone* calibrator.
+- We map raw model scores (higher = riskier) to p-values in [0,1] with a monotone calibrator.
 - A small p means "unlikely under safe behavior" → stronger evidence of risk.
 - Routing example:
     if p <= (1 - THRESH_HIGH):  "block"
@@ -43,9 +53,12 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Mapping, Set
 
 from pydantic import BaseModel, Field, field_validator
+
+from .utils import SanitizeConfig, sanitize_metadata_for_receipt  # type: ignore
+from .kv import canonical_kv_hash  # type: ignore
 
 # Optional fast JSON
 try:  # pragma: no cover (perf sugar)
@@ -97,24 +110,141 @@ __all__ = [
     "HeuristicKeywordModel",
 ]
 
+
+# ---------------------------------------------------------------------------
+# Core helpers for settings
+# ---------------------------------------------------------------------------
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+def _bounded_int(env_name: str, default: int, min_v: int, max_v: int) -> int:
+    try:
+        v = int(os.getenv(env_name, str(default)))
+    except Exception:
+        return default
+    return max(min_v, min(max_v, v))
+
+
+def _validate_thresholds(low: float, high: float) -> Tuple[float, float]:
+    low = _clamp01(low)
+    high = _clamp01(high)
+    if not (0.0 < low <= high <= 1.0):
+        logger.warning(
+            "Invalid detector thresholds (low=%s, high=%s); falling back to defaults 0.20/0.80",
+            low,
+            high,
+        )
+        low, high = 0.20, 0.80
+    # Optionally ensure the cool band has a minimum width.
+    if (high - low) < 0.1:
+        logger.warning(
+            "Detector cool band too narrow (low=%s, high=%s); widening to maintain 0.1 span",
+            low,
+            high,
+        )
+        mid = (low + high) / 2.0
+        low = max(0.0, mid - 0.05)
+        high = min(1.0, mid + 0.05)
+    return low, high
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
-_TIME_BUDGET_MS = float(os.getenv("TCD_DETECTOR_TIME_BUDGET_MS", "3.0"))
-_MAX_TOKENS = int(os.getenv("TCD_DETECTOR_MAX_TOKENS", "2048"))
-_MAX_BYTES = int(os.getenv("TCD_DETECTOR_MAX_BYTES", "100000"))
-_THRESH_LOW = float(os.getenv("TCD_DETECTOR_THRESH_LOW", "0.20"))
-_THRESH_HIGH = float(os.getenv("TCD_DETECTOR_THRESH_HIGH", "0.80"))
+# Raw env values
+_RAW_THRESH_LOW = float(os.getenv("TCD_DETECTOR_THRESH_LOW", "0.20"))
+_RAW_THRESH_HIGH = float(os.getenv("TCD_DETECTOR_THRESH_HIGH", "0.80"))
+
+_THRESH_LOW, _THRESH_HIGH = _validate_thresholds(_RAW_THRESH_LOW, _RAW_THRESH_HIGH)
+
+# Time budget in ms; bounded to avoid accidental DoS-level settings.
+try:
+    _TIME_BUDGET_MS = float(os.getenv("TCD_DETECTOR_TIME_BUDGET_MS", "3.0"))
+except Exception:
+    _TIME_BUDGET_MS = 3.0
+_TIME_BUDGET_MS = max(0.5, min(_TIME_BUDGET_MS, 50.0))
+
+# Input size bounds
+_MAX_TOKENS = _bounded_int("TCD_DETECTOR_MAX_TOKENS", 2048, 64, 8192)
+_MAX_BYTES = _bounded_int("TCD_DETECTOR_MAX_BYTES", 100000, 1024, 2_000_000)
+
+# Calibration mode/config
 _CALIB_MODE = os.getenv("TCD_DETECTOR_CALIB_MODE", "isotonic").strip().lower()
-_CONFORMAL_WINDOW = int(os.getenv("TCD_DETECTOR_CONFORMAL_WINDOW", "1024"))
-_CONFORMAL_ALPHA = float(os.getenv("TCD_DETECTOR_CONFORMAL_ALPHA", "0.05"))
+_CONFORMAL_WINDOW = _bounded_int("TCD_DETECTOR_CONFORMAL_WINDOW", 1024, 32, 16384)
+
+try:
+    _CONFORMAL_ALPHA_RAW = float(os.getenv("TCD_DETECTOR_CONFORMAL_ALPHA", "0.05"))
+except Exception:
+    _CONFORMAL_ALPHA_RAW = 0.05
+_CONFORMAL_ALPHA = _clamp01(_CONFORMAL_ALPHA_RAW)
+
+_CONFORMAL_BOOTSTRAP_MODE = os.getenv("TCD_DETECTOR_CONFORMAL_BOOTSTRAP", "identity").strip().lower()
+
 _seed = os.getenv("TCD_DETECTOR_RANDOM_SEED")
 if _seed is not None:
     try:
         random.seed(int(_seed))
     except Exception:
         pass
+
+# Evidence hardening settings
+_DETECTOR_SANITIZE_EVIDENCE = os.getenv("TCD_DETECTOR_SANITIZE_EVIDENCE", "1") == "1"
+_DETECTOR_STRIP_PII = os.getenv("TCD_DETECTOR_STRIP_PII", "1") == "1"
+_DETECTOR_HASH_PII_TAGS = os.getenv("TCD_DETECTOR_HASH_PII_TAGS", "1") == "1"
+_DETECTOR_PII_MODE = os.getenv("TCD_DETECTOR_PII_MODE", "light").strip().lower()
+_MAX_EVIDENCE_KEYS = int(os.getenv("TCD_DETECTOR_MAX_EVIDENCE_KEYS", "64"))
+_MAX_EVIDENCE_STRING = int(os.getenv("TCD_DETECTOR_MAX_EVIDENCE_STRING", "512"))
+
+# Keys that must not appear in detector evidence (to avoid content leakage)
+_FORBIDDEN_EVIDENCE_KEYS: Set[str] = {
+    "prompt",
+    "completion",
+    "input_text",
+    "output_text",
+    "messages",
+    "content",
+    "body",
+    "raw",
+}
+
+# Tag vocab for trust/route/override/PQ-related fields (aligned with logging/ledger)
+_ALLOWED_TRUST_ZONES: Set[str] = {
+    "internet",
+    "internal",
+    "partner",
+    "admin",
+    "ops",
+}
+
+_ALLOWED_ROUTE_PROFILES: Set[str] = {
+    "inference",
+    "admin",
+    "control",
+    "metrics",
+    "health",
+}
+
+_ALLOWED_OVERRIDE_LEVELS: Set[str] = {
+    "none",
+    "break_glass",
+    "maintenance",
+}
+
+_ALLOWED_PQ_SCHEMES: Set[str] = {
+    "",
+    "dilithium2",
+    "dilithium3",
+    "falcon",
+    "sphincs+",
+}
+
+# Allowed request kinds
+_ALLOWED_KINDS: Set[str] = {"prompt", "completion", "system", "tool"}
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -171,12 +301,179 @@ class _TimeBudget:
         return max(0.0, (self.deadline - time.perf_counter()) * 1000.0)
 
 
-def _clamp01(x: float) -> float:
-    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
-
-
 def _hash_canon(obj: Any, ctx: str) -> str:
     return Blake3Hash().hex(_dumps(obj), ctx=ctx)
+
+
+def _looks_like_pii(value: str) -> bool:
+    """
+    Lightweight PII heuristic: only used on tag-like fields such as tenant/user/session.
+    """
+    v = value.strip()
+    if not v:
+        return False
+    if "@" in v:
+        return True
+    if " " in v or "\u3000" in v:
+        return True
+    if len(v) > 96:
+        return False
+    return False
+
+
+def _hash_if_pii_tag(key: str, value: Any) -> Any:
+    """
+    If key is a tag field and value looks like PII (or PII strict mode is active),
+    replace it with a stable hash.
+    """
+    if not _DETECTOR_HASH_PII_TAGS:
+        return value
+    if not isinstance(value, str):
+        return value
+    kl = key.lower()
+    if kl not in ("tenant", "user", "session", "override_actor"):
+        return value
+    if _DETECTOR_PII_MODE == "strict" or _looks_like_pii(value):
+        try:
+            digest = Blake3Hash().hex(value.encode("utf-8"), ctx="tcd:detector:pii")[:16]
+            return f"{kl}-h-{digest}"
+        except Exception:
+            return f"{kl}-h-anon"
+    return value
+
+
+def _normalize_evidence_shape(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply structural constraints to evidence:
+      - Hash tag-like PII (tenant/user/session/override_actor).
+      - Enforce vocab for trust_zone / route_profile / override_level / pq_scheme.
+      - Clamp numeric fields like score_raw / p_value / e_value / a_alloc.
+      - Coerce override_applied / pq_required / pq_ok to bool.
+      - Truncate overly long strings at top level.
+      - Limit top-level key count.
+    """
+    out = dict(evidence)
+
+    # Tag PII hashing
+    for fld in ("tenant", "user", "session", "override_actor"):
+        if fld in out:
+            out[fld] = _hash_if_pii_tag(fld, out[fld])
+
+    # Vocab constraints for routing / PQ tags
+    tz = out.get("trust_zone")
+    if isinstance(tz, str) and tz not in _ALLOWED_TRUST_ZONES:
+        out.pop("trust_zone", None)
+
+    rp = out.get("route_profile")
+    if isinstance(rp, str) and rp not in _ALLOWED_ROUTE_PROFILES:
+        out.pop("route_profile", None)
+
+    ovl = out.get("override_level")
+    if isinstance(ovl, str) and ovl not in _ALLOWED_OVERRIDE_LEVELS:
+        out.pop("override_level", None)
+
+    pqs = out.get("pq_scheme")
+    if isinstance(pqs, str) and pqs not in _ALLOWED_PQ_SCHEMES:
+        out.pop("pq_scheme", None)
+
+    # Numeric clamps for score-like fields
+    for fld in ("score_raw", "p_value", "e_value", "a_alloc", "score"):
+        if fld not in out:
+            continue
+        try:
+            v_f = float(out[fld])
+        except Exception:
+            out.pop(fld, None)
+            continue
+        if not math.isfinite(v_f):
+            out.pop(fld, None)
+            continue
+        if fld == "p_value":
+            out[fld] = _clamp01(v_f)
+        elif fld == "a_alloc":
+            out[fld] = max(0.0, min(1.0, v_f))
+        elif fld in ("score_raw", "score", "e_value"):
+            if fld == "e_value" and v_f < 0.0:
+                out.pop(fld, None)
+            else:
+                out[fld] = _clamp01(v_f)
+
+    # Boolean normalization for override / PQ flags
+    for fld in ("override_applied", "pq_required", "pq_ok"):
+        if fld in out:
+            out[fld] = bool(out[fld])
+
+    # Top-level string truncation
+    for k, v in list(out.items()):
+        if isinstance(v, str) and len(v) > _MAX_EVIDENCE_STRING:
+            out[k] = v[:_MAX_EVIDENCE_STRING]
+
+    # Top-level key count guard (deterministic subset)
+    if len(out) > _MAX_EVIDENCE_KEYS:
+        trimmed: Dict[str, Any] = {}
+        for k in sorted(out.keys())[:_MAX_EVIDENCE_KEYS]:
+            trimmed[k] = out[k]
+        out = trimmed
+
+    return out
+
+
+def _sanitize_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run evidence through a metadata sanitizer and structural normalizer.
+
+    This ensures:
+      - Forbidden keys such as "prompt" or "completion" do not appear.
+      - NaN/inf and oversized values are pruned.
+      - PII can be stripped and/or hashed for tag fields.
+      - Trust / PQ / override tags respect the global vocab.
+    """
+    ev = dict(evidence)
+
+    # Remove obviously forbidden keys upfront
+    for k in list(ev.keys()):
+        if str(k).lower() in _FORBIDDEN_EVIDENCE_KEYS:
+            ev.pop(k, None)
+
+    if not _DETECTOR_SANITIZE_EVIDENCE:
+        return _normalize_evidence_shape(ev)
+
+    try:
+        cfg = SanitizeConfig(
+            sanitize_nan=True,
+            prune_large=True,
+            strip_pii=_DETECTOR_STRIP_PII,
+            forbid_keys=tuple(_FORBIDDEN_EVIDENCE_KEYS),
+        )
+        sanitized = sanitize_metadata_for_receipt(ev, config=cfg)
+        if isinstance(sanitized, Mapping):
+            ev = dict(sanitized)
+    except Exception:
+        # In case of sanitizer failure, fall back to the original evidence.
+        pass
+
+    return _normalize_evidence_shape(ev)
+
+
+def _normalize_model_evidence(model_evidence: Any) -> Dict[str, Any]:
+    """
+    Normalize model_evidence into a bounded, content-agnostic mapping:
+      - Non-mapping evidence is wrapped with a type tag.
+      - Key count is bounded.
+      - Forbidden keys are removed.
+    """
+    if not isinstance(model_evidence, Mapping):
+        return {"_model_evidence_type": str(type(model_evidence).__name__)}
+    ev = dict(model_evidence)
+    if len(ev) > 32:
+        trimmed: Dict[str, Any] = {}
+        for k in sorted(ev.keys())[:32]:
+            trimmed[k] = ev[k]
+        ev = trimmed
+    for k in list(ev.keys()):
+        if str(k).lower() in _FORBIDDEN_EVIDENCE_KEYS:
+            ev.pop(k, None)
+    return ev
 
 
 # ---------------------------------------------------------------------------
@@ -202,16 +499,21 @@ class ScoreModel(Protocol):
     def score(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[float, Dict[str, Any]]:
         """
         Returns (raw_score, model_evidence).
-        Should be deterministic given inputs and not exceed the time budget.
-        raw_score should lie in [0,1] if possible; out-of-range will be clamped.
+
+        Requirements:
+          - Deterministic given inputs.
+          - Must respect the provided time budget.
+          - raw_score should lie in [0,1] if possible; out-of-range values will be clamped.
+          - model_evidence must remain content-agnostic; any raw text should be omitted
+            or heavily truncated upstream, and will be sanitized again before storage.
         """
 
 
 class HeuristicKeywordModel:
     """
     Tiny, deterministic heuristic:
-    - Normalizes score by simple features and keyword hits
-    - CPU-bounded; no external deps; great as a bootstrap fallback
+    - Normalizes score by simple features and keyword hits.
+    - CPU-bounded; no external dependencies; usable as a bootstrap fallback.
     """
 
     name = "heuristic-keywords"
@@ -346,7 +648,10 @@ class ConformalBuffer:
         with self._lock:
             n = len(self._buf)
             if n == 0:
-                # no calibration data; return conservative p from raw
+                # Cold start; configurable bootstrap behavior.
+                if _CONFORMAL_BOOTSTRAP_MODE == "mid":
+                    return 0.5
+                # Default: identity-style mapping in p-space.
                 return 1.0 - _clamp01(float(s))
             ge = 1 + sum(1 for x in self._buf if x >= s)
             return _clamp01(ge / (n + 1))
@@ -381,13 +686,13 @@ class _Calibrator:
             return 1.0 - s
         if self._cfg.mode == "isotonic":
             if not self._iso:
-                # identity fallback if knots missing
+                # Identity fallback if knots missing.
                 return 1.0 - s
             return _clamp01(float(self._iso.map(s)))
         if self._cfg.mode == "conformal":
             assert self._conf is not None
             return self._conf.p_value(s)
-        # default conservative
+        # Default conservative
         return 1.0 - s
 
     def update_reference(self, ref_score: float) -> None:
@@ -402,19 +707,32 @@ class _Calibrator:
 
 _MAX_TEXT_BYTES = _MAX_BYTES
 _MAX_META_KEYS = 64
+_MAX_ISO_KNOTS = 512
+
 
 class DetectRequest(BaseModel):
     """
     Work unit for the detector. Text is truncated (bytes/tokens) before scoring.
+
+    Text content itself never leaves the detector; only bounded features and
+    content-agnostic evidence are exported.
     """
     tenant: str = Field(default="*", max_length=64)
     user: str = Field(default="*", max_length=128)
     session: str = Field(default="*", max_length=128)
     model_id: str = Field(default="*", max_length=128)
     lang: str = Field(default="*", max_length=16)
-    kind: str = Field(default="completion", pattern="^(prompt|completion)$")
+    kind: str = Field(default="completion", max_length=16)
     text: str = Field(..., min_length=0, max_length=_MAX_TEXT_BYTES)
     meta: Optional[Dict[str, Any]] = Field(default=None)
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_ok(cls, v: str) -> str:
+        v_norm = (v or "completion").strip().lower()
+        if v_norm not in _ALLOWED_KINDS:
+            return "completion"
+        return v_norm
 
     @field_validator("meta")
     @classmethod
@@ -423,6 +741,10 @@ class DetectRequest(BaseModel):
             return None
         if len(v) > _MAX_META_KEYS:
             raise ValueError("meta too large")
+        # Prevent content keys from being smuggled through meta.
+        for k in v.keys():
+            if str(k).lower() in _FORBIDDEN_EVIDENCE_KEYS:
+                raise ValueError(f"meta contains forbidden key: {k!r}")
         return v
 
 
@@ -481,12 +803,39 @@ class Detector:
     """
     End-to-end safety detector:
         DetectRequest → (truncate) → model.score → p-value → decision + evidence
+
+    This component is strictly content-agnostic at its boundary:
+      - The text itself never appears in DetectOut.
+      - Evidence is sanitized to remove forbidden keys and PII-like tags.
+      - All numeric fields are clamped to safe ranges.
     """
 
     def __init__(self, model: ScoreModel, cfg: DetectorConfig):
         self._model = model
         self._cfg = cfg
         self._cal = _Calibrator(cfg.calibrator)
+
+        # Log configuration and a stable configuration hash for later audits.
+        cfg_payload = {
+            "t_low": self._cfg.t_low,
+            "t_high": self._cfg.t_high,
+            "mode": self._cfg.calibrator.mode,
+            "cal_version": self._cfg.calibrator.version,
+            "conformal_window": self._cfg.calibrator.conformal_window,
+        }
+        cfg_hash = canonical_kv_hash(
+            cfg_payload,
+            ctx="tcd:detector",
+            label="detector_cfg",
+        )
+        logger.info(
+            "Detector initialized: t_low=%s, t_high=%s, mode=%s, cal_version=%s, cfg_hash=%s",
+            self._cfg.t_low,
+            self._cfg.t_high,
+            self._cal.mode,
+            self._cal.version,
+            cfg_hash,
+        )
 
     @property
     def config(self) -> DetectorConfig:
@@ -520,15 +869,24 @@ class Detector:
         # Score
         try:
             raw, model_evidence = self._model.score(text, req.meta, budget=budget)
+            model_evidence = _normalize_model_evidence(model_evidence)
         except TimeoutError:
             if _METRICS_ENABLED:  # pragma: no cover
                 _DET_TIMEOUT.inc()
+            logger.warning(
+                "Detector time budget exceeded for tenant=%s, model_id=%s",
+                req.tenant,
+                req.model_id,
+            )
+            # Surface timeout to caller; calling layer decides routing (typically block).
             raise
         except Exception as e:
             logger.exception("model.score failed: %s", e)
-            # Conservative output: treat as risky
+            # Conservative output: treat as risky and annotate error.
             raw = 1.0
-            model_evidence = {"error": "model.score failed"}
+            model_evidence = _normalize_model_evidence(
+                {"error": "model.score failed", "exc_type": type(e).__name__}
+            )
 
         raw = _clamp01(float(raw))
         budget.check()
@@ -541,8 +899,8 @@ class Detector:
         # Decision
         decision = self._decide(p)
 
-        # Evidence (bounded, no raw text)
-        ev: Dict[str, Any] = {
+        # Evidence (bounded, no raw text). Only tags and structured metrics.
+        base_ev: Dict[str, Any] = {
             "tenant": req.tenant,
             "user": req.user,
             "session": req.session,
@@ -564,7 +922,9 @@ class Detector:
             },
             "model_evidence": model_evidence,
         }
-        ev_hash = _hash_canon(ev, ctx="tcd:detector:evidence")
+
+        evidence = _sanitize_evidence(base_ev)
+        ev_hash = _hash_canon(evidence, ctx="tcd:detector:evidence")
 
         dt = (time.perf_counter() - t0)
         if _METRICS_ENABLED:  # pragma: no cover
@@ -582,7 +942,7 @@ class Detector:
             calibrator={"mode": self._cal.mode, "version": self._cal.version},
             model={"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
             evidence_hash=ev_hash,
-            evidence=ev,
+            evidence=evidence,
         )
         return out
 
@@ -601,8 +961,27 @@ def _load_isotonic_knots_from_env() -> Optional[IsotonicKnots]:
         return None
     try:
         pairs = json.loads(raw)
-        pairs = [(float(x), float(y)) for x, y in pairs]
-        return IsotonicKnots(pairs=pairs)
+        if not isinstance(pairs, list):
+            raise ValueError("knots must be a list")
+        if len(pairs) > _MAX_ISO_KNOTS:
+            raise ValueError(f"too many isotonic knots: {len(pairs)}")
+        processed: List[Tuple[float, float]] = []
+        for item in pairs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("each knot must be a [score, p] pair")
+            x, y = item
+            xf = float(x)
+            yf = float(y)
+            if not (math.isfinite(xf) and math.isfinite(yf)):
+                raise ValueError("non-finite knot")
+            processed.append((xf, yf))
+        iso = IsotonicKnots(pairs=processed)
+        ys = [p[1] for p in iso.pairs]
+        for i in range(1, len(ys)):
+            if ys[i] > ys[i - 1] + 1e-6:
+                logger.warning("isotonic knots not monotone in p; continuing with provided order")
+                break
+        return iso
     except Exception as e:  # pragma: no cover
         logger.warning("failed to parse TCD_DETECTOR_CALIB_KNOTS: %s", e)
         return None
@@ -629,12 +1008,22 @@ def build_default_detector() -> Detector:
     model = HeuristicKeywordModel()
     return Detector(model=model, cfg=det_cfg)
 
+
 # --- Temporary shim for HTTP service ---
+
 class TCDConfig:
     def __init__(self):
         pass
 
+
 class TraceCollapseDetector:
+    """
+    TEMPORARY NON-PRODUCTION SHIM.
+
+    This exists only to keep compatibility with older HTTP code paths.
+    It must not be used for safety decisions or receipts in production.
+    """
+
     def __init__(self, config=None):
         self.config = config
 

@@ -1,4 +1,3 @@
-# FILE: tcd/receipts.py
 from __future__ import annotations
 
 """
@@ -10,17 +9,15 @@ Goals
   - Offer multiple backends with the same API: in-memory, JSONL (append-only), SQLite.
   - Be SRE-friendly: safe appends (fsync), rotation hooks, Prom/OTel metric surfaces.
 
-Design notes
-  - Interface: ReceiptStore (append/get/tail/last_head/count/verify_chain_window/stats).
-  - JSONL backend is the default for simplicity and portability; SQLite is optional.
-  - All backends are thread-safe (RLock). These stores are process-local; for
-    cross-process deployments, mount a shared volume or use the SQLite backend.
-  - We do not index by tenant by default (to avoid accidental deanonymization).
-    If multi-tenant partitioning is required, run separate store instances per tenant
-    or put a tenant-hash prefix in the JSONL/SQLite path.
-
-Security & privacy
-  - We persist only the attested canonical body and the head (and optional signature + key).
+Security / compliance
+  - This module acts as an append-only, verifiable ledger for higher-level security
+    decisions (routing, safety, patch management, audit events, etc.).
+  - The issuer (attestor / security router / control plane) is responsible for:
+      * enforcing that receipt_body contains only redacted / hashed metadata,
+      * embedding anytime-valid e-process state (e_value, alpha_wealth, trigger, ...),
+      * choosing signature scheme(s), including classical / PQ / hybrid variants.
+  - The store itself is signature-scheme agnostic: it keeps head/body/sig/vk and
+    provides chain verification and aggregate SRE stats without touching raw content.
   - No raw prompts/outputs should be present in `receipt_body_json` (by design of issuer);
     operators are responsible for keeping that contract.
 """
@@ -111,12 +108,22 @@ class ReceiptRow:
     """
     A single persisted receipt entry.
 
-    id: monotonically increasing integer (per backend instance).
-    head_hex: the computed receipt head (domain-separated BLAKE3 or equivalent).
-    body_json: canonical JSON string (the "receipt_body" from issuer).
-    sig_hex: optional signature hex string (may be empty).
-    verify_key_hex: optional verify key hex string (may be empty).
-    ts: storage timestamp (seconds since epoch, float).
+    id:
+        Monotonically increasing integer (per backend instance).
+    head_hex:
+        The computed receipt head (domain-separated BLAKE3 or equivalent).
+    body_json:
+        Canonical JSON string (the "receipt_body" from the issuer). It should only
+        contain redacted / hashed metadata and e-process state; no raw prompts or
+        model outputs should appear here.
+    sig_hex:
+        Opaque signature material. Higher-level components may choose any signature
+        scheme (classical, PQ, or hybrid); the store does not interpret this field.
+    verify_key_hex:
+        Opaque verification key material (if applicable). Scheme and key identifiers
+        should be present inside the receipt body for audits.
+    ts:
+        Storage timestamp (seconds since epoch, float).
     """
     id: int
     head_hex: str
@@ -159,6 +166,27 @@ class ReceiptStore(Protocol):
     def stats(self) -> Dict[str, float]:
         """Basic SRE stats: count, size_bytes (if applicable), last_ts, append_qps_ema."""
         ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ReceiptSummary:
+    """
+    Aggregate view over a sliding window of receipts.
+
+    This does not inspect raw prompts/outputs – it only looks at the
+    canonical receipt_body JSON, which is expected to contain:
+      - a coarse 'kind' (e.g. "safety_decision", "patch_runtime", "audit");
+      - a 'risk_label' or 'risk_level' (e.g. "low", "high", "apt_suspect");
+      - an e-process snapshot under 'e' or 'e_obj' with a boolean 'trigger' flag.
+
+    Higher-level components (security router / attestor / control plane) are
+    responsible for defining these fields and their semantics.
+    """
+
+    total: int
+    triggered_e: int
+    by_kind: Dict[str, int]
+    by_risk: Dict[str, int]
 
 
 # =============================================================================
@@ -624,9 +652,72 @@ def build_store_from_env() -> ReceiptStore:
 def verify_recent_chain(store: ReceiptStore, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
     """
     Convenience wrapper for periodic SRE audits. Intended to be called by a background job
-    (e.g., cron, k8s CronJob, or an /admin/health endpoint). Returns True if chain is valid.
+    (e.g., cron, a scheduled worker, or an admin health endpoint). Returns True if the chain
+    is valid over the given window.
     """
     try:
         return store.verify_chain_window(window, label_salt_hex=label_salt_hex)
     except Exception:
         return False
+
+
+def summarize_recent_receipts(store: ReceiptStore, window: int) -> ReceiptSummary:
+    """
+    Aggregate metadata over the last `window` receipts.
+
+    This helper is intended for security / compliance monitoring:
+      - anomaly / abuse signals should drive the e-process trigger bit;
+      - classifications (e.g. APT-like, insider-like, supply-chain-like) should be
+        encoded as coarse labels in the receipt body (risk_label, kind, ...).
+
+    The function is deliberately conservative:
+      - it never returns raw bodies;
+      - it only extracts a small set of agreed-upon fields.
+
+    Expected body layout (conventions, not hard requirements):
+      {
+        "kind": "security_router" | "patch_runtime" | "audit" | ...,
+        "risk_label": "low" | "high" | "apt_suspect" | ...,
+        "e": {
+          "e_value": ...,
+          "alpha_wealth": ...,
+          "trigger": true/false,
+          ...
+        },
+        ...
+      }
+    """
+    rows = store.tail(max(0, int(window)))
+    total = len(rows)
+    triggered_e = 0
+    by_kind: Dict[str, int] = {}
+    by_risk: Dict[str, int] = {}
+
+    for r in rows:
+        try:
+            body = json.loads(r.body_json)
+        except Exception:
+            # Malformed bodies are skipped but still contribute to total.
+            continue
+
+        # kind: high-level category of the receipt
+        kind_val = body.get("kind") or "unknown"
+        kind = str(kind_val)
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+
+        # risk: either risk_label or risk_level (for backward compatibility)
+        risk_val = body.get("risk_label") or body.get("risk_level") or "unknown"
+        risk = str(risk_val)
+        by_risk[risk] = by_risk.get(risk, 0) + 1
+
+        # e-process trigger: look under 'e' or 'e_obj' for a 'trigger' flag
+        e_obj = body.get("e") or body.get("e_obj") or {}
+        if isinstance(e_obj, dict) and bool(e_obj.get("trigger")):
+            triggered_e += 1
+
+    return ReceiptSummary(
+        total=total,
+        triggered_e=triggered_e,
+        by_kind=by_kind,
+        by_risk=by_risk,
+    )
