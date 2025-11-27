@@ -63,6 +63,93 @@ At a high level, TCD is designed to answer three questions that most AI stacks c
 - An **admin/control plane** for ledgers, audits, calibration, and policy management.
 
 TCD is meant to be **deployed as infrastructure**: a small, testable component you can run as a sidecar or shared service in front of one model server or a whole fleet, without changing product-level SDKs or user-facing flows.
+
+---
+
+## Why this matters
+
+Most AI stacks today are built to **serve tokens**, not to **prove what happened**.
+
+Tracing and safety are usually bolted on as:
+- ad-hoc logs,
+- heuristic guardrails inside the application,
+- or one-shot red-teaming reports.
+
+That’s fine for prototypes, but it breaks down as soon as you have:
+- multiple models and tools in a single request,
+- real users and real money on the line,
+- regulators or enterprise customers asking, *“Show me exactly what happened here.”*
+
+TCD assumes that **inference is a governed, auditable surface**, not just “something behind an API”. It focuses on three gaps that existing infra does not handle well.
+
+### 1. Logs are not enough for safety or audit
+
+Conventional logs answer “what we think we logged”, not “what provably happened”:
+
+- Logs can be **partial, mutable, or misconfigured** (sampling, dropped events, format changes).
+- They rarely encode the **full decision context**: model ID, sampler settings, policies, per-subject state, and internal scores are often scattered across services.
+- There is usually **no cryptographic binding** between request, response, and decision – nothing that can be safely re-checked in another trust domain.
+
+TCD flips this around:
+
+- Every decision can emit a **deterministic receipt** tying together:
+  - inputs (prompts, key signals, subject metadata),
+  - outputs (model decisions, routes),
+  - and **policy + e-process state** at the time.
+- Receipts are signed and hash-chained, so they can be **verified offline**, against an independently compiled verifier, without trusting the model server, app logs, or even the original cluster.
+
+For enterprises, this turns “we think we did X” into **cryptographic evidence** that X happened under a specific configuration.
+
+### 2. “One-off guardrails” don’t scale to many requests and many users
+
+Most guardrail systems treat each request in isolation:
+
+- A bad request is either blocked or allowed based on a **single threshold**.
+- There is little notion of **per-subject history**: a user can “probe” the system thousands of times, and the system reacts the same way each time.
+- Safety limits are typically heuristics rather than **budgeted, statistically controlled** processes.
+
+TCD’s controller is built around **always-valid e-process / alpha-investing** ideas:
+
+- Every subject (tenant, user, session) carries a **safety budget** over time.
+- Each risky step **spends from that budget**; conservative steps can “earn back” budget.
+- Decisions are **anytime-valid**: you can stop at any time and your false-positive/false-negative guarantees still hold, even under adaptivity and probing.
+
+This makes it possible to talk about safety in the same way SRE teams talk about SLIs/SLOs:
+
+- “Did we stay within our allocated risk budget for this tenant?”  
+- “Which subjects are approaching exhaustion?”  
+- “Which models/routes are consuming the most budget?”
+
+### 3. Regulation and large customers are moving toward verifiable inference
+
+Regulators, internal risk teams, and large customers are converging on a few clear expectations:
+
+- **Provenance & traceability** – not just “we log everything”, but **provable lineage** for important decisions.
+- **Explainable enforcement** – the ability to explain *why* a request was degraded/blocked and **reproduce that decision** from preserved state.
+- **Independent verification** – the ability for a separate system (or third party) to **check receipts** without full access to production infra.
+
+TCD is engineered to meet that bar:
+
+- The **service plane** makes safety decisions in real time, but it is thin and testable.
+- The **admin/control plane** exposes ledgers, audits, and calibration as first-class APIs.
+- Receipts are built to be **externally verifiable primitives**, not proprietary logs:
+  - a downstream “proof-of-inference” pipeline, customer audit service, or zk/IR circuit can consume them directly.
+
+### 4. A new primitive: the inference receipt
+
+The core thesis is simple:
+
+> In modern AI infra, the **unit of truth** should not be “a log line” or “a response”, but an **inference receipt**: a compact, signed object that binds together what the model saw, how it behaved, how much risk it consumed, and which policies were in force.
+
+Once you have that primitive, a lot of otherwise hard problems become straightforward:
+
+- **Post-hoc policy changes** – re-score old traffic against new policies without losing auditability.
+- **Cross-vendor portability** – compare behavior across different model providers using a single receipt schema.
+- **Incident and failure analysis** – replay exact decision state during incidents, not just approximate logs.
+- **Future-proofing for zk / PoI** – receipts can be wired into proof systems without changing product-side code.
+
+TCD is built to make this primitive **cheap enough and infra-native enough** that it can sit in front of real, high-volume workloads – not just as a research demo.
+
 ---
 
 ## Features
