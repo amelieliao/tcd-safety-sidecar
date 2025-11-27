@@ -8,6 +8,10 @@ Primary interfaces: HTTP service plane (`/diagnose`, `/verify`, `/state/*`) and 
 
 ## Table of Contents
 
+- [What is TCD?](#what-is-tcd)
+- [Why this matters](#why-this-matters)
+- [Quickstart (1-minute demo)](#quickstart-1-minute-demo)
+- [Minimal examples](#minimal-examples)
 - [Features](#features)
 - [Architecture](#architecture)
   - [Service plane (HTTP / gRPC)](#service-plane-http--grpc)
@@ -26,6 +30,39 @@ Primary interfaces: HTTP service plane (`/diagnose`, `/verify`, `/state/*`) and 
 - [Repository layout](#repository-layout)
 - [Development](#development)
 
+---
+
+## What is TCD?
+
+TCD is an **infra-native safety & audit sidecar** for LLM inference.
+
+Instead of being another guardrail model or red-teaming toolkit, TCD runs **next to your model server** and turns every request into a **scored decision + verifiable receipt**. It behaves like a safety control plane for inference: online checks, per-subject budgets, routing decisions, and cryptographic receipts that can be re-checked later in a different trust domain (another cluster, another team, or a regulator).
+
+At a high level, TCD is designed to answer three questions that most AI stacks can’t answer cleanly today:
+
+1. **“What actually happened on this request?”**  
+   – Which model, which sampler, which policies, which signals, which route.
+
+2. **“Did we enforce the safety / rate limits we think we enforced?”**  
+   – Per-tenant / per-user budgets, e-process–based controls, and explicit decisions.
+
+3. **“Can we prove this to someone who doesn’t trust our logs?”**  
+   – Deterministic receipts with signatures and hash chains, verifiable offline.
+
+### In one sentence
+
+> **TCD is a small sidecar that scores every inference step, enforces always-valid safety budgets, and emits receipts you can later verify independently.**
+
+### Concretely, TCD gives you
+
+- A **service plane** (`/diagnose`, `/verify`, `/state/*`) that model servers or gateways call at inference time.
+- An **always-valid controller** that treats safety like a budgeted statistical process, not a one-off heuristic.
+- A **routing layer** that can “allow / degrade / block” by adjusting sampler settings or decoder tags.
+- **Verifiable receipts** that bind inputs, outputs, policies, and scores into a hash chain you can audit later.
+- **SRE-grade observability** (Prometheus, OTEL) so safety sits next to latency and errors on real dashboards.
+- An **admin/control plane** for ledgers, audits, calibration, and policy management.
+
+TCD is meant to be **deployed as infrastructure**: a small, testable component you can run as a sidecar or shared service in front of one model server or a whole fleet, without changing product-level SDKs or user-facing flows.
 ---
 
 ## Features
