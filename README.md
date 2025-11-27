@@ -152,6 +152,131 @@ TCD is built to make this primitive **cheap enough and infra-native enough** tha
 
 ---
 
+## Quickstart (1-minute demo)
+
+This is the smallest end-to-end slice: run the sidecar, send one request, get back a **verdict + routing + verifiable receipt**.
+
+> Goal: show that TCD can sit next to any model server as an independent safety / receipt plane.
+
+---
+
+### **1. Run the HTTP sidecar locally**
+
+```bash
+git clone https://github.com/amelieliao/tcd-safety-sidecar.git
+cd tcd-safety-sidecar
+
+pip install -r requirements.txt
+
+# Enable receipts and start the tenant-facing HTTP plane
+export TCD_RECEIPTS_ENABLE=1
+
+uvicorn tcd.service_http:create_app \
+  --factory \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+You now have:
+
+- `POST /diagnose` – online decision + optional receipt  
+- `POST /verify` – receipt / chain verification  
+- `GET /healthz`, `GET /readyz`, `GET /version` – liveness + config
+
+---
+
+### **2. Send a single diagnose request**
+
+Run this in a separate shell (Python 3.10+):
+
+```bash
+python demo_diagnose.py
+```
+
+#### **demo_diagnose.py**
+
+```python
+import json
+import uuid
+import requests
+
+BASE = "http://127.0.0.1:8000"
+
+req = {
+    "request_id": f"demo-{uuid.uuid4()}",
+    "tenant": "demo-tenant",
+    "user": "user-1234",
+    "session": "sess-1",
+    "model_id": "demo-llm",
+    "task": "chat",
+    "lang": "en",
+    "tokens_delta": 128,
+    "entropy": 2.7,
+    "trace_vector": [0.12, 0.08, 0.04, 0.01],
+    "spectrum": [0.6, 0.25, 0.15],
+    "features": [0.01, -0.03, 0.12],
+    "context": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "decoder": "default"
+    },
+}
+
+resp = requests.post(f"{BASE}/diagnose", json=req, timeout=3)
+resp.raise_for_status()
+
+risk = resp.json()
+print("== RiskResponse ==")
+print(json.dumps(risk, indent=2))
+
+if risk.get("receipt_head_hex") and risk.get("receipt_body_json"):
+    print("\n== Minimal verify request ==")
+    verify_payload = {
+        "mode": "single",
+        "receipt_head_hex": risk["receipt_head_hex"],
+        "receipt_body_json": risk["receipt_body_json"],
+        "receipt_sig_hex": risk.get("receipt_sig_hex"),
+        "verify_key_hex": risk.get("verify_key_hex"),
+    }
+
+    v = requests.post(f"{BASE}/verify", json=verify_payload, timeout=3)
+    v.raise_for_status()
+    print(json.dumps(v.json(), indent=2))
+else:
+    print("\nReceipts are not enabled or not returned in this response.")
+```
+
+---
+
+### **This will print:**
+
+A `RiskResponse` containing:
+
+- `verdict`, `score`, `threshold`
+- `action` (`"allow"` | `"degrade"` | `"block"`)
+- `budget_remaining`, `e_value`, `alpha_spent` (always-valid controller)
+- optional receipt fields (`receipt_head_hex`, `receipt_body_json`, `receipt_sig_hex`, `verify_key_hex`)
+- a `{"ok": true}` result from `/verify` if receipts are enabled and consistent
+
+---
+
+### **3. What you have proven in 1 minute**
+
+With this flow you have:
+
+- a **standalone safety plane** running as its own process, not embedded in the model server  
+- **online decisions** driven by trace / entropy / feature signals + an always-valid controller  
+- a **verifiable receipt** for the decision  
+- an independent **/verify** path usable for audits, CI, or proof systems  
+
+From here you can:
+
+- mirror real model traffic into `/diagnose`  
+- persist receipts via the admin/ledger plane  
+- integrate verification into observability, trust, or proof-of-inference infrastructure  
+
+---
+
 ## Features
 
 **Service plane**
