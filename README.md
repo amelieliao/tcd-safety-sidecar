@@ -277,6 +277,215 @@ From here you can:
 
 ---
 
+## Minimal examples
+
+The goal of these snippets is to show how little surface area you need to:
+
+1. **Call `/diagnose`** with real signals  
+2. **Use the returned decision in your model server**  
+3. **Verify receipts independently**  
+
+All examples assume the HTTP plane is running at `http://127.0.0.1:8000` with receipts enabled.
+
+---
+
+### 1. Minimal `curl` request to `/diagnose`
+
+This is the smallest practical JSON body that still exercises:
+
+- subject scoping (`tenant`, `user`, `session`)  
+- trace / entropy / feature inputs  
+- the always-valid controller (via `tokens_delta`)  
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/diagnose" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "request_id": "demo-curl-1",
+    "tenant": "tenant-demo",
+    "user": "user-1",
+    "session": "sess-1",
+    "model_id": "demo-llm",
+    "task": "chat",
+    "lang": "en",
+    "tokens_delta": 64,
+    "entropy": 2.4,
+    "trace_vector": [0.14, 0.09, 0.03],
+    "spectrum": [0.6, 0.25, 0.15],
+    "features": [0.01, -0.02, 0.07],
+    "context": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "decoder": "default"
+    }
+  }'
+```
+
+Typical response (truncated):
+
+```json
+{
+  "verdict": false,
+  "score": 0.18,
+  "threshold": 0.65,
+  "action": "allow",
+  "budget_remaining": 0.91,
+  "e_value": 0.73,
+  "alpha_spent": 0.02,
+  "receipt_head_hex": "…",
+  "receipt_body_json": "{…}",
+  "receipt_sig_hex": "…",
+  "verify_key_hex": "…"
+}
+```
+
+You can already:
+
+- gate the request with `verdict` / `action`  
+- log or persist the receipt fields for later verification  
+
+---
+
+### 2. Minimal Python integration inside a model server
+
+This example shows how a model server can:
+
+- send signals to `/diagnose`  
+- adjust its decoding based on the returned route  
+- attach receipt metadata to its own logs or traces  
+
+```python
+import os
+import json
+import uuid
+import requests
+
+TCD_BASE = os.getenv("TCD_BASE_URL", "http://127.0.0.1:8000")
+
+def tcd_decide(subject, signals, context):
+    req = {
+        "request_id": f"req-{uuid.uuid4()}",
+        "tenant": subject["tenant"],
+        "user": subject["user"],
+        "session": subject["session"],
+        "model_id": context["model_id"],
+        "task": context.get("task", "chat"),
+        "lang": context.get("lang", "en"),
+        "tokens_delta": signals["tokens_delta"],
+        "entropy": signals["entropy"],
+        "trace_vector": signals["trace_vector"],
+        "spectrum": signals["spectrum"],
+        "features": signals.get("features", []),
+        "context": {
+            "temperature": context["temperature"],
+            "top_p": context["top_p"],
+            "decoder": context.get("decoder", "default"),
+        },
+    }
+
+    resp = requests.post(f"{TCD_BASE}/diagnose", json=req, timeout=2.0)
+    resp.raise_for_status()
+    risk = resp.json()
+
+    # core decision surface for the caller
+    route = {
+        "temperature": context["temperature"],
+        "top_p": context["top_p"],
+        "decoder": context.get("decoder", "default"),
+        "action": risk["action"],
+    }
+
+    # optional: degrade if TCD asks for it
+    if risk["action"] == "degrade":
+        route["temperature"] = min(route["temperature"], 0.4)
+        route["top_p"] = min(route["top_p"], 0.8)
+
+    return route, risk
+```
+
+Usage inside your generation loop:
+
+```python
+subject = {"tenant": "tenant-demo", "user": "user-123", "session": "sess-42"}
+context = {"model_id": "demo-llm", "task": "chat", "lang": "en",
+           "temperature": 0.8, "top_p": 0.95}
+
+signals = {
+    "tokens_delta": 128,
+    "entropy": 2.3,
+    "trace_vector": [0.11, 0.09, 0.05, 0.02],
+    "spectrum": [0.58, 0.27, 0.15],
+    "features": [0.02, -0.01, 0.04],
+}
+
+route, risk = tcd_decide(subject, signals, context)
+
+print("Route from TCD:", route)
+print("Risk snapshot:", json.dumps({
+    "verdict": risk["verdict"],
+    "score": risk["score"],
+    "action": risk["action"],
+    "budget_remaining": risk["budget_remaining"],
+}, indent=2))
+```
+
+This is enough to prove that:
+
+- the **safety plane runs out-of-process**; you just call `/diagnose`  
+- **routing is explicit and reversible** (`route` is a plain dict)  
+- you can wire risk and receipt fields into your own logging / tracing system  
+
+---
+
+### 3. Minimal receipt verification client
+
+This example assumes you have already stored the four receipt fields from a previous `RiskResponse`.
+
+```python
+import json
+import requests
+
+TCD_BASE = "http://127.0.0.1:8000"
+
+def verify_receipt(head_hex, body_json, sig_hex, verify_key_hex):
+    payload = {
+        "mode": "single",
+        "receipt_head_hex": head_hex,
+        "receipt_body_json": body_json,
+        "receipt_sig_hex": sig_hex,
+        "verify_key_hex": verify_key_hex,
+    }
+
+    resp = requests.post(f"{TCD_BASE}/verify", json=payload, timeout=2.0)
+    resp.raise_for_status()
+    result = resp.json()
+    print("Verify result:", json.dumps(result, indent=2))
+    return result["ok"]
+```
+
+You can call it with values taken from storage or logs:
+
+```python
+ok = verify_receipt(
+    head_hex=stored_head,
+    body_json=stored_body,
+    sig_hex=stored_sig,
+    verify_key_hex=stored_key,
+)
+
+if not ok:
+    # escalate to your audit / incident pipeline
+    raise RuntimeError("TCD receipt verification failed")
+```
+
+This proves that:
+
+- verification can be done by a **separate process or trust domain**  
+- TCD exposes a **narrow, auditable surface** (`/verify`) that fits into CI, audits, or proof-of-inference flows  
+- you can enforce invariants such as “no receipt, no deploy” or “no receipt, no compliance attestation” without modifying model code  
+
+---
+
 ## Features
 
 **Service plane**
