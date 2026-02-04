@@ -1,7 +1,0 @@
-# FILE: deploy/helm/values.yaml
-monitoring:
-  enabled: true
-hpa:
-  enabled: false
-  min: 2
-  max: 6
