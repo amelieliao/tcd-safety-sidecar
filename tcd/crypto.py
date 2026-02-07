@@ -4,7 +4,7 @@
 
 
 
-    "receipt",
+
     "ledger",
     "telemetry",
     "pubkey",
