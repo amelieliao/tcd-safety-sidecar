@@ -23,9 +23,6 @@ try:
 except Exception:  # pragma: no cover
     blake3 = None  # type: ignore[assignment]
 
-# ---------------------------------------------------------------------------
-# Type definitions
-# ---------------------------------------------------------------------------
 
 CryptoProfile = Literal[
     "DEV",
@@ -123,9 +120,8 @@ _ALLOWED_KEY_ROLE = {"root_ca", "intermediate_ca", "online_signing", "audit_only
 _ALLOWED_CLASSIFICATION = {"public", "internal", "confidential", "restricted"}
 _ALLOWED_BACKEND = {"software_dev", "hsm", "kms"}
 
-# ---------------------------------------------------------------------------
-# Optional cryptography dependency (do NOT hard-crash module import)
-# ---------------------------------------------------------------------------
+d-crash module import)
+# 
 
 _HAS_CRYPTOGRAPHY = False
 try:
@@ -202,9 +198,6 @@ def _domain_tag(label: str) -> bytes:
     return _get_domain_prefix() + label.encode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Hex helpers (safe parsing)
-# ---------------------------------------------------------------------------
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
 
@@ -248,9 +241,6 @@ def _bytes_to_hex(b: bytes) -> str:
     return binascii.hexlify(b).decode("ascii")
 
 
-# ---------------------------------------------------------------------------
-# Hashing / MAC policy and engine
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class HashPolicy:
@@ -441,9 +431,7 @@ class HashEngine:
         return _bytes_to_hex(out)
 
 
-# ---------------------------------------------------------------------------
-# RNG and KDF
-# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class RngPolicy:
@@ -606,9 +594,6 @@ class AttestationContext:
         return mh
 
 
-# ---------------------------------------------------------------------------
-# Audit sink
-# ---------------------------------------------------------------------------
 
 class CryptoAuditSink:
     """Hook for structured audit events emitted by the crypto control plane."""
@@ -638,9 +623,6 @@ def _emit_audit_event(event_type: str, metadata: Dict[str, Any]) -> None:
         logger.exception("CryptoAuditSink.emit failed")
 
 
-# ---------------------------------------------------------------------------
-# Signing backends and key handles
-# ---------------------------------------------------------------------------
 
 def _ensure_cryptography() -> None:
     if not _HAS_CRYPTOGRAPHY or serialization is None:
