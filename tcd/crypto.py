@@ -4,8 +4,6 @@
 
 
 
-
-    "HMAC_SHA2_512",
     "BLAKE2B_MAC",  # keyed blake2b (NOT HMAC(blake2b))
 ]
 
