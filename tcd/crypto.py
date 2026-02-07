@@ -7,9 +7,7 @@
 
  
 
-    "SHA2_512",
-    "SHA3_256",
-]
+
 
 MacAlgo = Literal[
     "HMAC_SHA2_256",
