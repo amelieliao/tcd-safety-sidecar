@@ -3,7 +3,7 @@
 
 
 
-    "generic",
+
     "receipt",
     "ledger",
     "telemetry",
