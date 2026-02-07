@@ -2,18 +2,6 @@
 
 
 
-
-
-
-
-
-    "config",
-    "attestation",
-    "kdf",
-    "chain",
-    "hmac",
-]
-
 _ALLOWED_HASH_LABELS = {
     "generic",
     "receipt",
