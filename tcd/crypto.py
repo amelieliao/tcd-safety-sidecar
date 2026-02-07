@@ -1,7 +1,6 @@
 
 
 
-ftware_dev", "hsm", "kms"]
 
 
     "generic",
