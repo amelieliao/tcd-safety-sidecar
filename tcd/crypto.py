@@ -1,31 +1,6 @@
 
 # ---------------------------------------------------------------------------
 
-_CRYPTO_ENGINE_VERSION = "crypto_v3"
-
-_DEFAULT_DOMAIN_PREFIX = "tcd:v1:"
-_MAX_DOMAIN_PREFIX_LEN = 64
-
-# hex parsing bounds
-_MAX_HEX_INPUT_CHARS = 4096  # prevents giant prev_hex strings DoS
-_MAX_CHAIN_CHUNK_BYTES = 8_000_000  # defensive; adjust via env if needed
-
-# env size bounds
-_MAX_ENV_JSON_BYTES = 2_000_000
-_MAX_ENV_PEM_BYTES = 200_000
-
-# keyset file bounds
-_MAX_KEY_FILE_BYTES = 2_000_000
-
-# RNG bounds
-_MAX_RNG_BYTES_PER_CALL = 4_000_000
-
-# signing message constraints
-_MAX_MEASUREMENT_BYTES = 256  # measurement_hash is expected to be small digest
-
-# operation/key_id hygiene
-_OP_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_KEY_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 _ALLOWED_KEY_STATUS = {"active", "retiring", "expired"}
 _ALLOWED_KEY_ROLE = {"root_ca", "intermediate_ca", "online_signing", "audit_only"}
