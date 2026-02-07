@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Tuple, Union, cast
 
-logger = logging.getLogger(__name__)
+
 
 try:
     import blake3  
