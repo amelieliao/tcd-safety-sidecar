@@ -4,8 +4,7 @@
 
 
 
-HashAlgo = Literal[
-    "BLAKE3_256",
+
     "BLAKE2B_256",
     "SHA2_256",
     "SHA2_512",
