@@ -19,9 +19,9 @@ from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Tuple, Unio
 logger = logging.getLogger(__name__)
 
 try:
-    import blake3  # type: ignore[import]
-except Exception:  # pragma: no cover
-    blake3 = None  # type: ignore[assignment]
+    import blake3  
+except Exception:  
+    blake3 = None  
 
 
 
