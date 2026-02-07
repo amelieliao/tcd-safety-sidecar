@@ -1,10 +1,7 @@
 
 
 
-ed"]
-KeyRole = Literal["root_ca", "intermediate_ca", "online_signing", "audit_only"]
-ClassificationLevel = Literal["public", "internal", "confidential", "restricted"]
-KeyBackendType = Literal["software_dev", "hsm", "kms"]
+ftware_dev", "hsm", "kms"]
 
 
     "generic",
