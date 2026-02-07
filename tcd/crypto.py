@@ -1,11 +1,5 @@
 
 
-SignAlgo = Literal[
-    "ED25519",
-    "ECDSA_P256",
-    "RSA_3072",
-    "DILITHIUM2",
-]
 
 KeyStatus = Literal["active", "retiring", "expired"]
 KeyRole = Literal["root_ca", "intermediate_ca", "online_signing", "audit_only"]
