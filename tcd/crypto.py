@@ -1,12 +1,5 @@
 
 
-
-
-
-
-    "BLAKE2B_MAC",  # keyed blake2b (NOT HMAC(blake2b))
-]
-
 SignAlgo = Literal[
     "ED25519",
     "ECDSA_P256",
