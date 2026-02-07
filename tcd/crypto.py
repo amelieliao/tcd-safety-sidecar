@@ -6,7 +6,7 @@
 
 
 
-    "telemetry",
+
     "pubkey",
     "config",
     "attestation",
