@@ -7,7 +7,6 @@
 
 
 
-    "pubkey",
     "config",
     "attestation",
     "kdf",
