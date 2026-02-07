@@ -2,7 +2,7 @@
 
 
 
-_ALLOWED_HASH_LABELS = {
+
     "generic",
     "receipt",
     "ledger",
