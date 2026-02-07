@@ -24,14 +24,6 @@ except Exception:  # pragma: no cover
     blake3 = None  # type: ignore[assignment]
 
 
-CryptoProfile = Literal[
-    "DEV",
-    "FIPS",
-    "SECURE_DEV",
-    "SECURE_PREP",
-    "SECURE_PROD_TIER1",
-    "SECURE_PROD_TIER2",
-]
 
 HashAlgo = Literal[
     "BLAKE3_256",
