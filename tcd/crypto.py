@@ -5,7 +5,7 @@
 
 
 
-    "ledger",
+
     "telemetry",
     "pubkey",
     "config",
