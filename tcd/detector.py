@@ -910,3 +910,437 @@ def _sanitize_evidence(evidence: Dict[str, Any], *, policy: EvidencePolicy, budg
         out = trimmed
 
     return out
+
+def _sanitize_meta_for_model(meta: Any, *, budget: _TimeBudget) -> Optional[Dict[str, Any]]:
+    """
+    Defensive meta sanitizer before handing to model.score.
+    Keeps a deterministic subset (bounded scan), forbids content keys, bounds values.
+
+    Important: do not materialize or sort *all* keys of an attacker-controlled dict.
+    """
+    if meta is None:
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    # Bounded scan to avoid DoS on huge meta dicts; sort only scanned subset for determinism.
+    scanned: List[Tuple[str, int, Any]] = []
+    for idx, k in enumerate(meta.keys()):
+        if idx >= 256:
+            break
+        if (idx & 0x3F) == 0x3F:
+            budget.check(where="meta:scan_keys")
+        ks = _safe_key_str(k, max_len=64)
+        if not ks or _is_forbidden_key(ks):
+            continue
+        scanned.append((ks, idx, k))
+
+    scanned.sort(key=lambda t: (t[0], t[1]))
+    selected = scanned[:64]
+
+    out: Dict[str, Any] = {}
+    for i, (ks, _idx, k) in enumerate(selected):
+        if (i & 0x1F) == 0x1F:
+            budget.check(where="meta:sanitize")
+        v = meta.get(k)
+        if isinstance(v, str):
+            out[ks] = _safe_text(v, max_len=256)
+        elif isinstance(v, (int, bool)) or v is None:
+            out[ks] = v
+        elif isinstance(v, float):
+            out[ks] = float(v) if math.isfinite(v) else None
+        elif isinstance(v, (list, tuple)) and ks == "extra_keywords":
+            # Only allow bounded, sanitized keywords.
+            arr: List[str] = []
+            seq = v[:64]  # type: ignore[index]
+            for j, item in enumerate(seq):
+                if (j & 0x1F) == 0x1F:
+                    budget.check(where="meta:extra_keywords")
+                s = _safe_text(item, max_len=64).lower()
+                if s:
+                    arr.append(s)
+            out[ks] = arr
+        else:
+            out[ks] = f"<{type(v).__name__}>"
+    return out
+
+
+def _meta_summary(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Content-agnostic meta summary for receipts (keeps schema stable).
+    """
+    if not meta:
+        return {}
+    out: Dict[str, Any] = {}
+    ek = meta.get("extra_keywords")
+    if isinstance(ek, list):
+        out["extra_keywords_count"] = min(64, len(ek))
+    return out
+
+
+def _normalize_model_evidence(model_evidence: Any, *, policy: EvidencePolicy, budget: _TimeBudget) -> Dict[str, Any]:
+    """
+    Normalize model_evidence into a bounded, content-agnostic mapping.
+    """
+    if not isinstance(model_evidence, Mapping):
+        return {"_model_evidence_type": f"<{type(model_evidence).__name__}>"}
+
+    # Tight bounds (model evidence should be small)
+    tight_policy = EvidencePolicy(
+        sanitize_evidence=False,
+        strip_pii=policy.strip_pii,
+        hash_pii_tags=policy.hash_pii_tags,
+        pii_mode=policy.pii_mode,
+        allow_raw_tenant=policy.allow_raw_tenant,
+        max_evidence_keys=min(32, policy.max_evidence_keys),
+        max_evidence_string=min(256, policy.max_evidence_string),
+        max_depth=min(3, policy.max_depth),
+        max_keys_per_dict=min(32, policy.max_keys_per_dict),
+        max_list_items=min(32, policy.max_list_items),
+        max_total_nodes=min(256, policy.max_total_nodes),
+        max_scan_per_dict=min(128, policy.max_scan_per_dict),
+        pii_hmac_key=policy.pii_hmac_key,
+        pii_hmac_key_id=policy.pii_hmac_key_id,
+        evidence_hmac_key=policy.evidence_hmac_key,
+        evidence_hmac_key_id=policy.evidence_hmac_key_id,
+    ).normalized()
+
+    nodes = [0]
+    ev_any = _deep_sanitize(model_evidence, policy=tight_policy, budget=budget, depth=0, nodes=nodes)
+    ev = dict(ev_any) if isinstance(ev_any, Mapping) else {"_model_evidence_type": "<nonmapping>"}
+
+    for k in list(ev.keys()):
+        if _is_forbidden_key(str(k)):
+            ev.pop(k, None)
+    return ev
+
+
+# ---------------------------------------------------------------------------
+# Models / Features
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class Features:
+    len_bytes: int
+    len_tokens: int
+    has_url: bool
+    upper_ratio: float
+    digit_ratio: float
+    keywords_hit: int
+
+
+class ScoreModel(Protocol):
+    """Pluggable scoring model: higher score â higher risk."""
+    name: str
+    version: str
+
+    def score(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[float, Dict[str, Any]]:
+        ...
+
+
+class HeuristicKeywordModel:
+    """
+    Deterministic heuristic baseline model (CPU-bounded, budget-aware).
+    """
+    name = "heuristic-keywords"
+    version = "0.4.0"
+
+    _KW = tuple(
+        kw.lower()
+        for kw in (
+            "weapon",
+            "bomb",
+            "suicide",
+            "kill",
+            "credit card",
+            "ssn",
+            "exploit",
+            "harm",
+            "hate",
+            "nsfw",
+            "jailbreak",
+            "prompt injection",
+        )
+    )
+
+    def score(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[float, Dict[str, Any]]:
+        budget.check(where="model:enter")
+
+        s = text or ""
+        low = s.lower()
+
+        # Build a token set for faster membership checks on single-word keywords.
+        # Bound work: stop after 10k tokens.
+        toks: Set[str] = set()
+        if s:
+            for i, m in enumerate(_TOK_RE.finditer(low)):
+                toks.add(m.group(0))
+                if i >= 10_000:
+                    break
+                if (i & 0xFF) == 0xFF:
+                    budget.check(where="model:tokenize")
+        budget.check(where="model:tokenize_done")
+
+        hits = 0
+        kws: List[str] = list(self._KW)
+
+        # Meta-provided extra keywords are bounded by meta sanitizer upstream.
+        if meta and isinstance(meta.get("extra_keywords"), list):
+            kws = kws + [str(x).lower() for x in meta["extra_keywords"][:64]]
+
+        # Keyword hit count: token membership for single tokens; substring match for phrases.
+        for i, kw in enumerate(kws[:128]):
+            if not kw:
+                continue
+            if " " in kw:
+                if kw in low:
+                    hits += 1
+            else:
+                if kw in toks:
+                    hits += 1
+            if (i & 0x1F) == 0x1F:
+                budget.check(where="model:keywords")
+
+        # Lightweight structural features with O(n) scans (budget-aware).
+        n_chars = len(s)
+        n_bytes = len(s.encode("utf-8", "ignore"))
+        # Approx token count (bounded)
+        n_tokens = min(10_000, _count_tokens_budgeted(s, stop_at=10_000, budget=budget, where="model:count_tokens"))
+
+        has_url = ("http://" in low) or ("https://" in low) or ("www." in low)
+
+        upper = 0
+        digit = 0
+        # Bound loop by char cap already applied upstream; still budget-check.
+        for j, ch in enumerate(s):
+            o = ord(ch)
+            if 65 <= o <= 90:
+                upper += 1
+            # digits
+            if 48 <= o <= 57:
+                digit += 1
+            if (j & 0x3FF) == 0x3FF:
+                budget.check(where="model:char_scan")
+
+        upper_ratio = _clamp01(upper / max(1, n_chars))
+        digit_ratio = _clamp01(digit / max(1, n_chars))
+
+        feats = Features(
+            len_bytes=int(n_bytes),
+            len_tokens=int(n_tokens),
+            has_url=bool(has_url),
+            upper_ratio=float(upper_ratio),
+            digit_ratio=float(digit_ratio),
+            keywords_hit=int(hits),
+        )
+
+        # Bounded scoring
+        base = hits + (0.6 if has_url else 0.0) + 0.4 * upper_ratio + 0.3 * digit_ratio
+        base = base / (3.0 + 0.25 * math.log1p(max(1, n_tokens)))
+        raw = 1.0 / (1.0 + math.exp(-3.0 * (base - 0.5)))
+        raw = _clamp01(float(raw))
+
+        evidence = {
+            "features": dataclasses.asdict(feats),
+            "hits": int(hits),
+            # DO NOT expose caller-provided keywords; keep only a stable sample of built-in vocab.
+            "kw_sample": list(self._KW[:8]),
+        }
+        budget.check(where="model:exit")
+        return raw, evidence
+
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+def _pav_non_decreasing(values: List[float]) -> List[float]:
+    """
+    Pool Adjacent Violators (PAV) for non-decreasing sequence.
+    """
+    n = len(values)
+    if n <= 1:
+        return values[:]
+    # blocks: (start, end, avg)
+    blocks: List[Tuple[int, int, float]] = []
+    for i, v in enumerate(values):
+        blocks.append((i, i, float(v)))
+        while len(blocks) >= 2 and blocks[-2][2] > blocks[-1][2]:
+            s1, e1, a1 = blocks[-2]
+            s2, e2, a2 = blocks[-1]
+            w1 = e1 - s1 + 1
+            w2 = e2 - s2 + 1
+            avg = (a1 * w1 + a2 * w2) / (w1 + w2)
+            blocks.pop()
+            blocks.pop()
+            blocks.append((s1, e2, avg))
+    out = [0.0] * n
+    for s, e, a in blocks:
+        for i in range(s, e + 1):
+            out[i] = a
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class IsotonicKnots:
+    """
+    Monotone mapping (score -> p). We enforce monotone non-increasing p with PAV.
+    """
+    pairs: Tuple[Tuple[float, float], ...]
+
+    xs: Tuple[float, ...] = field(init=False, repr=False)
+    ys: Tuple[float, ...] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.pairs:
+            raise ValueError("IsotonicKnots requires at least one pair")
+
+        pairs = sorted([(float(x), float(y)) for x, y in self.pairs], key=lambda t: t[0])
+
+        # clamp and dedupe by x (average y)
+        grouped: List[Tuple[float, List[float]]] = []
+        for x, y in pairs:
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            x = _clamp01(x)
+            y = _clamp01(y)
+            if grouped and abs(grouped[-1][0] - x) <= 1e-12:
+                grouped[-1][1].append(y)
+            else:
+                grouped.append((x, [y]))
+
+        if not grouped:
+            raise ValueError("IsotonicKnots has no finite pairs after filtering")
+
+        xs = [g[0] for g in grouped]
+        ys = [sum(g[1]) / max(1, len(g[1])) for g in grouped]
+
+        # enforce non-increasing y via PAV on -y
+        ys_neg = [-v for v in ys]
+        ys_neg_hat = _pav_non_decreasing(ys_neg)
+        ys_hat = [-v for v in ys_neg_hat]
+        ys_hat = [_clamp01(v) for v in ys_hat]
+
+        object.__setattr__(self, "xs", tuple(xs))
+        object.__setattr__(self, "ys", tuple(ys_hat))
+
+    def map(self, s: float) -> float:
+        s = _clamp01(float(s))
+        xs = self.xs
+        ys = self.ys
+        if len(xs) == 1:
+            return float(ys[0])
+        if s <= xs[0]:
+            return float(ys[0])
+        if s >= xs[-1]:
+            return float(ys[-1])
+        i = bisect_left(xs, s)
+        if i <= 0:
+            return float(ys[0])
+        if i >= len(xs):
+            return float(ys[-1])
+        x0, y0 = xs[i - 1], ys[i - 1]
+        x1, y1 = xs[i], ys[i]
+        if x1 <= x0:
+            return float(y0)
+        t = (s - x0) / (x1 - x0)
+        return _clamp01(float(y0 + t * (y1 - y0)))
+
+
+def _qscore_to_u16(s: float) -> int:
+    # quantize score in [0,1] to 0..65535
+    s01 = _clamp01(float(s))
+    return int(round(s01 * 65535.0))
+
+
+def _u16_to_score(q: int) -> float:
+    return float(max(0, min(65535, int(q))) / 65535.0)
+
+
+class ConformalBuffer:
+    """
+    Sliding-window split-conformal p-value mapping with *quantized* scores.
+
+    We store quantized uint16 scores to:
+      - eliminate float equality/removal issues
+      - preserve determinism
+      - keep state digest stable
+
+    p(s) = (count{Si >= s} + 1) / (N + 1)
+    """
+
+    def __init__(self, capacity: int = 1024):
+        cap = int(capacity)
+        cap = max(32, min(16384, cap))
+        self._cap = cap
+        self._q: deque[int] = deque()  # O(1) popleft; protected by lock
+        self._sorted: List[int] = []
+        self._lock = threading.RLock()
+
+    @property
+    def capacity(self) -> int:
+        return self._cap
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._sorted)
+
+    def update(self, ref_score: float) -> None:
+        q = _qscore_to_u16(ref_score)
+        with self._lock:
+            if len(self._q) >= self._cap:
+                old = self._q.popleft()
+                j = bisect_left(self._sorted, old)
+                if 0 <= j < len(self._sorted) and self._sorted[j] == old:
+                    self._sorted.pop(j)
+                else:
+                    # This should not happen with quantized ints; keep fail-safe.
+                    if self._sorted:
+                        self._sorted.pop(0)
+            self._q.append(q)
+            insort(self._sorted, q)
+
+    def p_value(self, s: float) -> float:
+        q = _qscore_to_u16(s)
+        with self._lock:
+            n = len(self._sorted)
+            if n == 0:
+                return 0.5 if _CONFORMAL_BOOTSTRAP_DEFAULT == "mid" else (1.0 - _clamp01(float(s)))
+            idx = bisect_left(self._sorted, q)
+            ge = n - idx
+            return _clamp01((ge + 1.0) / (n + 1.0))
+
+    def summary(self) -> Dict[str, Any]:
+        """
+        Non-sensitive distribution summary for drift awareness.
+        """
+        with self._lock:
+            n = len(self._sorted)
+            if n == 0:
+                return {"n": 0, "cap": self._cap, "min": None, "q10": None, "q50": None, "q90": None, "max": None}
+            def at(p: float) -> float:
+                # p in [0,1]
+                i = int(round(p * (n - 1)))
+                i = max(0, min(n - 1, i))
+                return _u16_to_score(self._sorted[i])
+
+            return {
+                "n": n,
+                "cap": self._cap,
+                "min": _u16_to_score(self._sorted[0]),
+                "q10": at(0.10),
+                "q50": at(0.50),
+                "q90": at(0.90),
+                "max": _u16_to_score(self._sorted[-1]),
+            }
+
+    def state_digest(self) -> str:
+        """
+        Stable digest of dynamic state (summary only; no raw samples).
+        """
+        return _canonical_hash(
+            {"summary": self.summary()},
+            ctx="tcd:detector",
+            label="conformal_state",
+        )
+
