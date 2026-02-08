@@ -2150,3 +2150,115 @@ class Detector:
         except Exception:
             _inc("error", "EXC")
             return False
+            
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def _load_isotonic_knots_from_env() -> Optional[IsotonicKnots]:
+    raw = os.getenv("TCD_DETECTOR_CALIB_KNOTS")
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+        if not isinstance(obj, list):
+            raise ValueError("knots must be a list")
+        if len(obj) > _MAX_ISO_KNOTS:
+            raise ValueError(f"too many isotonic knots: {len(obj)}")
+        pairs: List[Tuple[float, float]] = []
+        for item in obj:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("each knot must be [score, p]")
+            x, y = item
+            xf = float(x)
+            yf = float(y)
+            if not (math.isfinite(xf) and math.isfinite(yf)):
+                continue
+            pairs.append((xf, yf))
+        if not pairs:
+            return None
+        return IsotonicKnots(pairs=tuple(pairs))
+    except Exception as e:  # pragma: no cover
+        logger.warning("failed to parse TCD_DETECTOR_CALIB_KNOTS: %s", e)
+        return None
+
+
+def build_default_detector() -> Detector:
+    cal_cfg = CalibratorConfig(
+        mode=_CALIB_MODE_DEFAULT,
+        isotonic_knots=_load_isotonic_knots_from_env(),
+        conformal_window=_CONFORMAL_WINDOW_DEFAULT,
+        alpha=_CONFORMAL_ALPHA_DEFAULT,
+        version="3.0.0",
+    )
+    cfg = DetectorConfig(
+        t_low=_THRESH_LOW_DEFAULT,
+        t_high=_THRESH_HIGH_DEFAULT,
+        time_budget_ms=_TIME_BUDGET_MS_DEFAULT,
+        max_tokens=_MAX_TOKENS_DEFAULT,
+        max_bytes=_MAX_BYTES_DEFAULT,
+        calibrator=cal_cfg,
+        conformal_ref_max=_CONFORMAL_REF_MAX_DEFAULT,
+        conformal_min_p_update=_CONFORMAL_MIN_P_UPDATE_DEFAULT,
+        conformal_allowed_sources=tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT)),
+        evidence_policy=EvidencePolicy(
+            sanitize_evidence=_SANITIZE_EVIDENCE_DEFAULT,
+            strip_pii=_STRIP_PII_DEFAULT,
+            hash_pii_tags=_HASH_PII_TAGS_DEFAULT,
+            pii_mode=_PII_MODE_DEFAULT if _PII_MODE_DEFAULT in ("light", "strict") else "light",
+            allow_raw_tenant=_ALLOW_RAW_TENANT_DEFAULT,
+            max_evidence_keys=_MAX_EVIDENCE_KEYS_DEFAULT,
+            max_evidence_string=_MAX_EVIDENCE_STRING_DEFAULT,
+            pii_hmac_key=_PII_HMAC_KEY,
+            pii_hmac_key_id=_PII_HMAC_KEY_ID,
+            evidence_hmac_key=_EVIDENCE_HMAC_KEY,
+            evidence_hmac_key_id=_EVIDENCE_HMAC_KEY_ID,
+        ),
+        engine_version=_DETECTOR_ENGINE_VERSION,
+        name="tcd-detector",
+        version="0.5.0",
+    )
+    model = HeuristicKeywordModel()
+    return Detector(model=model, cfg=cfg)
+
+
+# ---------------------------------------------------------------------------
+# Legacy shim (fail-closed, warn-once)
+# ---------------------------------------------------------------------------
+
+class TCDConfig:
+    def __init__(self) -> None:
+        pass
+
+
+class TraceCollapseDetector:
+    """
+    TEMPORARY NON-PRODUCTION SHIM (HARDENED).
+
+    If accidentally wired into production routing, it fails closed:
+      - verdict=True indicates "unsafe" in the legacy schema
+      - score=1.0 to align with fail-closed risk
+
+    This exists only for older HTTP code paths that import the symbol.
+    """
+
+    _warned = False
+    _lock = threading.Lock()
+
+    def __init__(self, config=None):
+        self.config = config
+
+    def diagnose(self, trace_vec, entropy, spectrum, step_id=None):
+        with TraceCollapseDetector._lock:
+            if not TraceCollapseDetector._warned:
+                logger.error("TraceCollapseDetector legacy shim invoked; FAIL-CLOSED verdict emitted")
+                TraceCollapseDetector._warned = True
+        return {
+            "verdict": True,
+            "score": 1.0,
+            "step": int(step_id or 0),
+            "components": {"reason": "legacy_shim_fail_closed"},
+        }
+
+    def snapshot_state(self):
+        return {"status": "legacy_shim_fail_closed"}
