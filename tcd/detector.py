@@ -1344,3 +1344,809 @@ class ConformalBuffer:
             label="conformal_state",
         )
 
+@dataclass(frozen=True, slots=True)
+class CalibratorConfig:
+    mode: Literal["isotonic", "conformal", "identity"] = "isotonic"
+    isotonic_knots: Optional[IsotonicKnots] = None
+    conformal_window: int = 1024
+    alpha: float = 0.05  # informational
+    version: str = "3.0.0"
+
+
+class _Calibrator:
+    def __init__(self, cfg: CalibratorConfig):
+        mode = cfg.mode if cfg.mode in ("isotonic", "conformal", "identity") else "isotonic"
+        window = max(32, min(16384, int(cfg.conformal_window)))
+        self._cfg = CalibratorConfig(
+            mode=mode,
+            isotonic_knots=cfg.isotonic_knots,
+            conformal_window=window,
+            alpha=_clamp01(float(cfg.alpha)) if math.isfinite(float(cfg.alpha)) else 0.05,
+            version=cfg.version or "3.0.0",
+        )
+        self._iso = self._cfg.isotonic_knots
+        self._conf = ConformalBuffer(window) if self._cfg.mode == "conformal" else None
+
+    @property
+    def mode(self) -> str:
+        return self._cfg.mode
+
+    @property
+    def version(self) -> str:
+        return self._cfg.version
+
+    def p_value(self, raw_score: float) -> float:
+        s = _clamp01(float(raw_score))
+        if self._cfg.mode == "identity":
+            return _clamp01(1.0 - s)
+        if self._cfg.mode == "isotonic":
+            if self._iso is None:
+                return _clamp01(1.0 - s)
+            return _clamp01(float(self._iso.map(s)))
+        if self._cfg.mode == "conformal":
+            assert self._conf is not None
+            return self._conf.p_value(s)
+        return _clamp01(1.0 - s)
+
+    def update_reference(self, ref_score: float) -> None:
+        if self._conf is not None:
+            self._conf.update(ref_score)
+
+    def static_snapshot(self) -> Dict[str, Any]:
+        """
+        Static snapshot (for config_hash/policy_digest) - MUST NOT include dynamic state.
+        """
+        iso_hash = None
+        if self._iso is not None:
+            iso_hash = _canonical_hash(
+                {"pairs": list(self._iso.pairs)},
+                ctx="tcd:detector",
+                label="iso_knots",
+            )
+        return {
+            "mode": self._cfg.mode,
+            "version": self._cfg.version,
+            "alpha": float(self._cfg.alpha),
+            "isotonic_knots_hash": iso_hash,
+            "conformal_window": int(self._cfg.conformal_window) if self._cfg.mode == "conformal" else None,
+        }
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        """
+        Dynamic snapshot (for state_digest / receipts).
+        """
+        if self._conf is None:
+            return {"mode": self._cfg.mode, "state_digest": _canonical_hash(self.static_snapshot(), ctx="tcd:detector", label="cal_state_static")}
+        return {
+            "mode": self._cfg.mode,
+            "conformal": self._conf.summary(),
+            "state_digest": self._conf.state_digest(),
+        }
+
+    def state_digest(self) -> str:
+        return str(self.state_snapshot().get("state_digest"))
+
+
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+
+_MAX_META_KEYS = 64
+_MAX_ISO_KNOTS = 512
+
+DetectorDecision = Literal["allow", "throttle", "block"]
+DetectorActionHint = Literal["ALLOW", "THROTTLE", "BLOCK"]
+DetectorErrorCode = Literal[
+    "OK",
+    "TIME_BUDGET_EXCEEDED",
+    "MODEL_ERROR",
+    "CALIBRATOR_ERROR",
+    "SANITIZER_ERROR",
+    "INTERNAL_ERROR",
+]
+
+
+if _PYDANTIC_OK:
+
+    class DetectRequest(BaseModel):
+        tenant: str = Field(default="*", max_length=64)
+        user: str = Field(default="*", max_length=128)
+        session: str = Field(default="*", max_length=128)
+        model_id: str = Field(default="*", max_length=128)
+        lang: str = Field(default="*", max_length=16)
+        kind: str = Field(default="completion", max_length=16)
+        # Hard cap in chars; bytes are enforced by DetectorConfig.max_bytes during detect().
+        text: str = Field(..., min_length=0, max_length=_HARD_MAX_TEXT_CHARS)
+        meta: Optional[Dict[str, Any]] = Field(default=None)
+
+        @field_validator("kind")
+        @classmethod
+        def _kind_ok(cls, v: str) -> str:
+            v_norm = (v or "completion").strip().lower()
+            return v_norm if v_norm in _ALLOWED_KINDS else "completion"
+
+        @field_validator("meta")
+        @classmethod
+        def _meta_ok(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if v is None:
+                return None
+            if not isinstance(v, dict):
+                raise ValueError("meta must be an object")
+            if len(v) > _MAX_META_KEYS:
+                raise ValueError("meta too large")
+            for k in v.keys():
+                if _is_forbidden_key(str(k)):
+                    raise ValueError(f"meta contains forbidden key: {k!r}")
+            return v
+
+
+    class DetectOut(BaseModel):
+        ok: bool
+        decision: DetectorDecision
+        action_hint: DetectorActionHint
+        decision_legacy: Optional[str] = None
+        reason_code: str
+        error_code: DetectorErrorCode = "OK"
+
+        score_raw: float
+        p_value: float
+        risk: float
+
+        latency_ms: float
+        budget_left_ms: float
+
+        thresholds: Dict[str, float]  # risk thresholds
+        calibrator: Dict[str, Any]    # static
+        calibrator_state: Dict[str, Any]  # dynamic (bounded)
+        model: Dict[str, str]
+
+        engine_version: str
+        config_hash: str
+        policy_digest: str
+        state_digest: str
+        decision_id: str
+
+        evidence_hash: str
+        evidence: Dict[str, Any]
+
+else:
+    @dataclass(frozen=True, slots=True)
+    class DetectRequest:
+        tenant: str = "*"
+        user: str = "*"
+        session: str = "*"
+        model_id: str = "*"
+        lang: str = "*"
+        kind: str = "completion"
+        text: str = ""
+        meta: Optional[Dict[str, Any]] = None
+
+    @dataclass(frozen=True, slots=True)
+    class DetectOut:
+        ok: bool
+        decision: str
+        action_hint: str
+        decision_legacy: Optional[str]
+        reason_code: str
+        error_code: str
+        score_raw: float
+        p_value: float
+        risk: float
+        latency_ms: float
+        budget_left_ms: float
+        thresholds: Dict[str, float]
+        calibrator: Dict[str, Any]
+        calibrator_state: Dict[str, Any]
+        model: Dict[str, str]
+        engine_version: str
+        config_hash: str
+        policy_digest: str
+        state_digest: str
+        decision_id: str
+        evidence_hash: str
+        evidence: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# DetectorConfig
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class DetectorConfig:
+    # Routing thresholds in risk-space
+    t_low: float = _THRESH_LOW_DEFAULT
+    t_high: float = _THRESH_HIGH_DEFAULT
+
+    # Processing limits
+    time_budget_ms: float = _TIME_BUDGET_MS_DEFAULT
+    max_tokens: int = _MAX_TOKENS_DEFAULT
+    max_bytes: int = _MAX_BYTES_DEFAULT
+
+    # Calibration
+    calibrator: CalibratorConfig = dataclasses.field(
+        default_factory=lambda: CalibratorConfig(
+            mode=_CALIB_MODE_DEFAULT,
+            isotonic_knots=None,
+            conformal_window=_CONFORMAL_WINDOW_DEFAULT,
+            alpha=_CONFORMAL_ALPHA_DEFAULT,
+            version="3.0.0",
+        )
+    )
+
+    # Conformal update guards
+    conformal_ref_max: float = _CONFORMAL_REF_MAX_DEFAULT
+    conformal_min_p_update: float = _CONFORMAL_MIN_P_UPDATE_DEFAULT
+    conformal_allowed_sources: Tuple[str, ...] = tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT))
+
+    # Evidence policy
+    evidence_policy: EvidencePolicy = dataclasses.field(
+        default_factory=lambda: EvidencePolicy(
+            sanitize_evidence=_SANITIZE_EVIDENCE_DEFAULT,
+            strip_pii=_STRIP_PII_DEFAULT,
+            hash_pii_tags=_HASH_PII_TAGS_DEFAULT,
+            pii_mode=_PII_MODE_DEFAULT if _PII_MODE_DEFAULT in ("light", "strict") else "light",
+            allow_raw_tenant=_ALLOW_RAW_TENANT_DEFAULT,
+            max_evidence_keys=_MAX_EVIDENCE_KEYS_DEFAULT,
+            max_evidence_string=_MAX_EVIDENCE_STRING_DEFAULT,
+            pii_hmac_key=_PII_HMAC_KEY,
+            pii_hmac_key_id=_PII_HMAC_KEY_ID,
+            evidence_hmac_key=_EVIDENCE_HMAC_KEY,
+            evidence_hmac_key_id=_EVIDENCE_HMAC_KEY_ID,
+        )
+    )
+
+    # Governance
+    engine_version: str = _DETECTOR_ENGINE_VERSION
+    name: str = "tcd-detector"
+    version: str = "0.5.0"
+
+    def normalized(self) -> "DetectorConfig":
+        low, high = _validate_risk_thresholds(self.t_low, self.t_high)
+
+        tb = float(self.time_budget_ms)
+        if not math.isfinite(tb):
+            tb = 3.0
+        tb = max(0.5, min(50.0, tb))
+
+        mt = int(self.max_tokens)
+        mt = max(64, min(8192, mt))
+
+        mb = int(self.max_bytes)
+        mb = max(1024, min(2_000_000, mb))
+
+        ev = str(self.engine_version or _DETECTOR_ENGINE_VERSION).strip()
+        if ev not in _SUPPORTED_ENGINE_VERSIONS:
+            ev = _DETECTOR_ENGINE_VERSION
+
+        cal = self.calibrator
+        mode = cal.mode if cal.mode in ("isotonic", "conformal", "identity") else _CALIB_MODE_DEFAULT
+        cw = max(32, min(16384, int(cal.conformal_window)))
+        alpha = float(cal.alpha)
+        alpha = _clamp01(alpha) if math.isfinite(alpha) else _CONFORMAL_ALPHA_DEFAULT
+
+        cal_norm = CalibratorConfig(
+            mode=mode,
+            isotonic_knots=cal.isotonic_knots,
+            conformal_window=cw,
+            alpha=alpha,
+            version=cal.version or "3.0.0",
+        )
+
+        # Conformal guards
+        ref_max = _clamp01(float(self.conformal_ref_max)) if math.isfinite(float(self.conformal_ref_max)) else _CONFORMAL_REF_MAX_DEFAULT
+        min_p = _clamp01(float(self.conformal_min_p_update)) if math.isfinite(float(self.conformal_min_p_update)) else _CONFORMAL_MIN_P_UPDATE_DEFAULT
+        sources = tuple(sorted({s for s in self.conformal_allowed_sources if s})) or tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT))
+
+        return DetectorConfig(
+            t_low=low,
+            t_high=high,
+            time_budget_ms=tb,
+            max_tokens=mt,
+            max_bytes=mb,
+            calibrator=cal_norm,
+            conformal_ref_max=ref_max,
+            conformal_min_p_update=min_p,
+            conformal_allowed_sources=sources,
+            evidence_policy=self.evidence_policy.normalized(),
+            engine_version=ev,
+            name=self.name or "tcd-detector",
+            version=self.version or "0.5.0",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Metrics (optional)
+# ---------------------------------------------------------------------------
+
+if _METRICS_ENABLED:  # pragma: no cover
+    _DET_LAT = Histogram(
+        "tcd_detector_latency_seconds",
+        "Detector end-to-end latency",
+        buckets=(0.001, 0.003, 0.005, 0.010, 0.020, 0.050),
+    )
+    _DET_STAGE_LAT = Histogram(
+        "tcd_detector_stage_latency_seconds",
+        "Detector stage latency",
+        ["stage"],
+        buckets=(0.0002, 0.0005, 0.001, 0.002, 0.005, 0.010, 0.020),
+    )
+    _DET_DECISIONS = Counter("tcd_detector_decision_total", "Detector decisions", ["decision"])
+    _DET_ERRORS = Counter("tcd_detector_error_total", "Detector errors", ["code"])
+    _DET_STAGE_TIMEOUT = Counter("tcd_detector_stage_timeout_total", "Detector stage timeouts", ["stage"])
+    _DET_STAGE_ERROR = Counter("tcd_detector_stage_error_total", "Detector stage errors", ["stage", "code"])
+    _DET_CONFORMAL_REF_UPDATE = Counter("tcd_detector_conformal_ref_update_total", "Conformal reference updates", ["result", "reason"])
+else:  # pragma: no cover
+    _DET_LAT = _DET_STAGE_LAT = _DET_DECISIONS = _DET_ERRORS = _DET_STAGE_TIMEOUT = _DET_STAGE_ERROR = _DET_CONFORMAL_REF_UPDATE = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+
+class Detector:
+    """
+    End-to-end safety detector:
+      DetectRequest -> truncate -> model.score -> p_value -> decision -> evidence
+
+    Detector.detect() never throws; it fails closed (decision="block") on error/timeout.
+
+    NOTE on decisions:
+      - decision is canonical ("allow"|"throttle"|"block").
+      - decision_legacy is provided for older integrations ("cool" instead of "throttle").
+      - action_hint is uppercase ("ALLOW"|"THROTTLE"|"BLOCK").
+    """
+
+    def __init__(self, model: ScoreModel, cfg: DetectorConfig):
+        self._model = model
+        self._cfg = cfg.normalized()
+        self._cal = _Calibrator(self._cfg.calibrator)
+
+        # Static digests
+        static_payload = {
+            "engine_version": self._cfg.engine_version,
+            "name": self._cfg.name,
+            "version": self._cfg.version,
+            "thresholds_risk": {"risk_low": float(self._cfg.t_low), "risk_high": float(self._cfg.t_high)},
+            "limits": {"time_budget_ms": float(self._cfg.time_budget_ms), "max_tokens": int(self._cfg.max_tokens), "max_bytes": int(self._cfg.max_bytes)},
+            "calibrator": self._cal.static_snapshot(),
+            "conformal_guards": {
+                "ref_max": float(self._cfg.conformal_ref_max),
+                "min_p_update": float(self._cfg.conformal_min_p_update),
+                "allowed_sources": list(self._cfg.conformal_allowed_sources),
+            },
+            "evidence_policy": {
+                "sanitize_evidence": bool(self._cfg.evidence_policy.sanitize_evidence),
+                "strip_pii": bool(self._cfg.evidence_policy.strip_pii),
+                "hash_pii_tags": bool(self._cfg.evidence_policy.hash_pii_tags),
+                "pii_mode": self._cfg.evidence_policy.pii_mode,
+                "allow_raw_tenant": bool(self._cfg.evidence_policy.allow_raw_tenant),
+                "max_evidence_keys": int(self._cfg.evidence_policy.max_evidence_keys),
+                "max_evidence_string": int(self._cfg.evidence_policy.max_evidence_string),
+                "pii_hmac": bool(self._cfg.evidence_policy.pii_hmac_key is not None),
+                "pii_hmac_key_id": self._cfg.evidence_policy.pii_hmac_key_id or None,
+                "evidence_hmac": bool(self._cfg.evidence_policy.evidence_hmac_key is not None),
+                "evidence_hmac_key_id": self._cfg.evidence_policy.evidence_hmac_key_id or None,
+                "forbidden_key_substrings": list(_FORBIDDEN_KEY_SUBSTRINGS),
+            },
+            "model": {"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
+        }
+
+        self._config_hash = _canonical_hash(static_payload, ctx="tcd:detector", label="detector_cfg")
+        self._policy_digest = _canonical_hash(static_payload, ctx="tcd:detector", label="detector_policy")
+
+        logger.info(
+            "Detector initialized: engine=%s mode=%s cfg_hash=%s policy_digest=%s model=%s@%s",
+            self._cfg.engine_version,
+            self._cal.mode,
+            self._config_hash[:16],
+            self._policy_digest[:16],
+            getattr(self._model, "name", "?"),
+            getattr(self._model, "version", "?"),
+        )
+
+    @property
+    def config(self) -> DetectorConfig:
+        return self._cfg
+
+    @property
+    def config_hash(self) -> str:
+        return self._config_hash
+
+    @property
+    def policy_digest(self) -> str:
+        return self._policy_digest
+
+    def _route(self, *, risk: float) -> Tuple[DetectorDecision, DetectorActionHint, str]:
+        """
+        Route in calibrated risk space.
+        Returns (decision, action_hint, reason_code).
+        """
+        r = _clamp01(float(risk))
+        if r >= float(self._cfg.t_high):
+            return "block", "BLOCK", "RISK_HIGH"
+        if r >= float(self._cfg.t_low):
+            return "throttle", "THROTTLE", "RISK_MED"
+        return "allow", "ALLOW", "RISK_LOW"
+
+    def detect(self, req: DetectRequest) -> DetectOut:
+        """
+        Never-throw. Fail-closed on internal failure.
+        """
+        t0 = time.perf_counter()
+        budget = _TimeBudget(self._cfg.time_budget_ms)
+
+        stage_t0 = time.perf_counter()
+        stage = "init"
+
+        ok = True
+        error_code: DetectorErrorCode = "OK"
+
+        # Safe request field extraction (never trust req type)
+        try:
+            tenant = _safe_text(getattr(req, "tenant", "*"), max_len=64) or "*"
+            user = _safe_text(getattr(req, "user", "*"), max_len=128) or "*"
+            session = _safe_text(getattr(req, "session", "*"), max_len=128) or "*"
+            model_id = _safe_text(getattr(req, "model_id", "*"), max_len=128) or "*"
+            kind_raw = _safe_text(getattr(req, "kind", "completion"), max_len=16).lower() or "completion"
+            kind = kind_raw if kind_raw in _ALLOWED_KINDS else "completion"
+            text_in = getattr(req, "text", "") or ""
+            meta_in = getattr(req, "meta", None)
+        except Exception:
+            tenant, user, session, model_id, kind, text_in, meta_in = "*", "*", "*", "*", "completion", "", None
+
+        # Ensure hard char cap regardless of schema
+        if isinstance(text_in, str) and len(text_in) > _HARD_MAX_TEXT_CHARS:
+            text_in = text_in[:_HARD_MAX_TEXT_CHARS]
+        elif not isinstance(text_in, str):
+            text_in = _safe_text(text_in, max_len=0)  # non-string => empty
+
+        # Stage: truncate
+        stage = "truncate"
+        try:
+            budget.check(where="detect:truncate")
+            text, n_bytes, n_tokens, trunc_flags = _truncate_text_budgeted(
+                str(text_in),
+                max_bytes=int(self._cfg.max_bytes),
+                max_tokens=int(self._cfg.max_tokens),
+                budget=budget,
+            )
+        except TimeoutError:
+            ok = False
+            error_code = "TIME_BUDGET_EXCEEDED"
+            text, n_bytes, n_tokens, trunc_flags = "", 0, 0, {"truncated_chars": True, "truncated_bytes": True, "truncated_tokens": True}
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_TIMEOUT.labels(stage=stage).inc()
+                except Exception:
+                    pass
+        except Exception:
+            ok = False
+            error_code = "INTERNAL_ERROR"
+            text, n_bytes, n_tokens, trunc_flags = "", 0, 0, {"truncated_chars": True, "truncated_bytes": True, "truncated_tokens": True}
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
+                except Exception:
+                    pass
+        finally:
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+                except Exception:
+                    pass
+            stage_t0 = time.perf_counter()
+
+        # Stage: meta sanitize
+        stage = "meta"
+        try:
+            meta = _sanitize_meta_for_model(meta_in, budget=budget)
+        except Exception:
+            meta = None
+        finally:
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+                except Exception:
+                    pass
+            stage_t0 = time.perf_counter()
+
+        # Stage: score
+        stage = "score"
+        raw = 1.0  # fail-closed default
+        model_evidence: Dict[str, Any] = {"_model_evidence_type": "<none>"}
+
+        if ok:
+            try:
+                budget.check(where="detect:before_score")
+                raw, me = self._model.score(text, meta, budget=budget)
+                model_evidence = _normalize_model_evidence(me, policy=self._cfg.evidence_policy, budget=budget)
+                budget.check(where="detect:after_score")
+            except TimeoutError:
+                ok = False
+                error_code = "TIME_BUDGET_EXCEEDED"
+                raw = 1.0
+                model_evidence = {"error": "timeout", "where": "model.score"}
+                if _METRICS_ENABLED:  # pragma: no cover
+                    try:
+                        _DET_STAGE_TIMEOUT.labels(stage=stage).inc()
+                    except Exception:
+                        pass
+            except Exception as e:
+                ok = False
+                error_code = "MODEL_ERROR"
+                raw = 1.0
+                model_evidence = {"error": "model_error", "exc_type": type(e).__name__}
+                if _METRICS_ENABLED:  # pragma: no cover
+                    try:
+                        _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
+                    except Exception:
+                        pass
+        if _METRICS_ENABLED:  # pragma: no cover
+            try:
+                _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+            except Exception:
+                pass
+        stage_t0 = time.perf_counter()
+
+        # Clamp raw conservatively
+        try:
+            raw_f = float(raw)
+            if not math.isfinite(raw_f):
+                raw_f = 1.0
+            raw = _clamp01(raw_f)
+        except Exception:
+            raw = 1.0
+
+        # Stage: calibrate
+        stage = "calibrate"
+        p = 0.0  # fail-closed default (risk=1)
+        if ok:
+            try:
+                budget.check(where="detect:before_calib")
+                p = _clamp01(float(self._cal.p_value(raw)))
+                budget.check(where="detect:after_calib")
+            except TimeoutError:
+                ok = False
+                error_code = "TIME_BUDGET_EXCEEDED"
+                p = 0.0
+                if _METRICS_ENABLED:  # pragma: no cover
+                    try:
+                        _DET_STAGE_TIMEOUT.labels(stage=stage).inc()
+                    except Exception:
+                        pass
+            except Exception:
+                ok = False
+                error_code = "CALIBRATOR_ERROR"
+                p = 0.0
+                if _METRICS_ENABLED:  # pragma: no cover
+                    try:
+                        _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
+                    except Exception:
+                        pass
+        if _METRICS_ENABLED:  # pragma: no cover
+            try:
+                _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+            except Exception:
+                pass
+        stage_t0 = time.perf_counter()
+
+        risk = _clamp01(1.0 - p)
+
+        # Stage: route
+        stage = "route"
+        decision, action_hint, reason_code = self._route(risk=risk) if ok else ("block", "BLOCK", "FAIL_CLOSED")
+        if _METRICS_ENABLED:  # pragma: no cover
+            try:
+                _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+            except Exception:
+                pass
+        stage_t0 = time.perf_counter()
+
+        # Stage: evidence
+        stage = "evidence"
+        policy = self._cfg.evidence_policy
+        evidence: Dict[str, Any] = {}
+        evidence_hash = ""
+        state = self._cal.state_snapshot()
+        state_digest = str(state.get("state_digest") or "")
+        try:
+            budget.check(where="detect:before_evidence")
+
+            # Stable evidence core (schema-first)
+            base_ev: Dict[str, Any] = {
+                "tenant": tenant,
+                "user": user,
+                "session": session,
+                "model_id": model_id,
+                "kind": kind,
+                "len_bytes": int(n_bytes),
+                "len_tokens": int(n_tokens),
+                "truncated_chars": bool(trunc_flags.get("truncated_chars", False)),
+                "truncated_bytes": bool(trunc_flags.get("truncated_bytes", False)),
+                "truncated_tokens": bool(trunc_flags.get("truncated_tokens", False)),
+                "score_raw": float(raw),
+                "p_value": float(p),
+                "risk": float(risk),
+                "decision": decision,
+                "decision_legacy": ("cool" if decision == "throttle" else decision),
+                "action_hint": action_hint,
+                "reason_code": reason_code,
+                "error_code": error_code,
+                "engine_version": self._cfg.engine_version,
+                "config_hash": self._config_hash,
+                "policy_digest": self._policy_digest,
+                "state_digest": state_digest,
+                "calibrator": self._cal.static_snapshot(),
+                "calibrator_state": state,
+                "model": {"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
+                "meta_summary": _meta_summary(meta),
+            }
+
+            # Model evidence: include only a bounded sanitized mapping + its hash
+            base_ev["model_evidence"] = model_evidence
+            budget.check(where="evidence:model_evidence_hash")
+            me_hash = _hash_bytes(
+                json.dumps(_canon_for_hash(model_evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+                domain=f"model_evidence|{self._config_hash[:16]}",
+                out_bytes=16,
+                key=policy.evidence_hmac_key,
+            )
+            budget.check(where="evidence:model_evidence_hash_done")
+            base_ev["model_evidence_hash"] = me_hash
+
+            evidence = _sanitize_evidence(base_ev, policy=policy, budget=budget)
+
+            # Evidence hash domain-separated by config_hash; keyed if configured
+            budget.check(where="evidence:evidence_hash")
+            evidence_hash = _hash_bytes(
+                json.dumps(_canon_for_hash(evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
+                domain=f"evidence|{self._config_hash[:16]}",
+                out_bytes=32,
+                key=policy.evidence_hmac_key,
+            )
+            budget.check(where="evidence:evidence_hash_done")
+            budget.check(where="detect:after_evidence")
+        except TimeoutError:
+            ok = False
+            error_code = "TIME_BUDGET_EXCEEDED"
+            decision, action_hint, reason_code = "block", "BLOCK", "FAIL_CLOSED_TIMEOUT"
+            evidence = {"error": "timeout", "stage": "evidence"}
+            evidence_hash = _hash_bytes(b"timeout", domain=f"evidence_timeout|{self._config_hash[:16]}", key=policy.evidence_hmac_key)
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_TIMEOUT.labels(stage=stage).inc()
+                except Exception:
+                    pass
+        except Exception:
+            ok = False
+            error_code = "SANITIZER_ERROR"
+            decision, action_hint, reason_code = "block", "BLOCK", "FAIL_CLOSED_SANITIZER"
+            evidence = {"error": "sanitizer_error"}
+            evidence_hash = _hash_bytes(b"sanitizer_error", domain=f"evidence_error|{self._config_hash[:16]}", key=policy.evidence_hmac_key)
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
+                except Exception:
+                    pass
+        finally:
+            if _METRICS_ENABLED:  # pragma: no cover
+                try:
+                    _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
+                except Exception:
+                    pass
+
+        # decision_id (stable for fixed state+evidence)
+        decision_id = _canonical_hash(
+            {
+                "engine_version": self._cfg.engine_version,
+                "config_hash": self._config_hash,
+                "state_digest": state_digest,
+                "evidence_hash": evidence_hash,
+                "decision": decision,
+                "error_code": error_code,
+            },
+            ctx="tcd:detector",
+            label="decision_id",
+        )
+
+        dt = max(0.0, time.perf_counter() - t0)
+
+        if _METRICS_ENABLED:  # pragma: no cover
+            try:
+                _DET_LAT.observe(dt)
+                _DET_DECISIONS.labels(decision=decision).inc()
+                if error_code != "OK":
+                    _DET_ERRORS.labels(code=error_code).inc()
+            except Exception:
+                pass
+
+        return DetectOut(
+            ok=bool(ok),
+            decision=decision,
+            decision_legacy=("cool" if decision == "throttle" else decision),
+            action_hint=action_hint,
+            reason_code=reason_code,
+            error_code=error_code,
+            score_raw=float(raw),
+            p_value=float(p),
+            risk=float(risk),
+            latency_ms=float(dt * 1000.0),
+            budget_left_ms=float(budget.remaining_ms()),
+            thresholds={"risk_low": float(self._cfg.t_low), "risk_high": float(self._cfg.t_high)},
+            calibrator=self._cal.static_snapshot(),
+            calibrator_state=state,
+            model={"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
+            engine_version=self._cfg.engine_version,
+            config_hash=self._config_hash,
+            policy_digest=self._policy_digest,
+            state_digest=state_digest,
+            decision_id=decision_id,
+            evidence_hash=evidence_hash,
+            evidence=evidence,
+        )
+
+    def update_reference(
+        self,
+        ref_score: float,
+        *,
+        source: str = "unknown",
+        decision: Optional[str] = None,
+        p_value: Optional[float] = None,
+        allow_override: bool = False,
+    ) -> bool:
+        """
+        Conformal reference update (poisoning-resistant). Returns True if accepted.
+
+        Guards:
+          - only applies in conformal mode
+          - source must be allowlisted unless allow_override=True
+          - if decision/p_value provided, requires decision=="allow" and p_value>=min_p_update
+          - winsorize ref_score to <= conformal_ref_max
+
+        This method never throws.
+        """
+
+        def _inc(result: str, reason: str) -> None:
+            if not _METRICS_ENABLED:  # pragma: no cover
+                return
+            try:  # pragma: no cover
+                if _DET_CONFORMAL_REF_UPDATE is not None:
+                    _DET_CONFORMAL_REF_UPDATE.labels(result=result, reason=reason).inc()
+            except Exception:
+                return
+
+        try:
+            if self._cal.mode != "conformal":
+                _inc("rejected", "MODE")
+                return False
+
+            src = _safe_text(source, max_len=32).lower() or "unknown"
+            allowed = set(self._cfg.conformal_allowed_sources)
+
+            if not allow_override and src not in allowed:
+                _inc("rejected", "SRC")
+                return False
+
+            if decision is not None and str(decision).lower() != "allow":
+                _inc("rejected", "DECISION")
+                return False
+
+            if p_value is not None:
+                try:
+                    pv = float(p_value)
+                except Exception:
+                    _inc("rejected", "P_PARSE")
+                    return False
+                if (not math.isfinite(pv)) or pv < float(self._cfg.conformal_min_p_update):
+                    _inc("rejected", "P_LOW")
+                    return False
+
+            s = _clamp01(float(ref_score))
+            # winsorize to reduce poisoning impact
+            s = min(s, float(self._cfg.conformal_ref_max))
+            self._cal.update_reference(s)
+            _inc("accepted", "OK")
+            return True
+        except Exception:
+            _inc("error", "EXC")
+            return False
