@@ -8,21 +8,7 @@
 
 
 
-    "trust_zone",
-    "route",
-    "data_class",
-    "workload",
-    "jurisdiction",
-    "regulation",
-    "client_app",
-    "access_channel",
-)
 
-
-def _strip_unsafe_text(s: str, *, max_len: int) -> str:
-    if not isinstance(s, str):
-        return ""
-    if len(s) > max_len:
         s = s[:max_len]
     if _ASCII_CTRL_RE.search(s):
         s = _ASCII_CTRL_RE.sub("", s)
