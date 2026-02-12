@@ -7,13 +7,7 @@
 
 
 
-_ASCII_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
-
-# Safe identifiers for labels used in refs/metrics (do NOT use for routes).
-_SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
-_SAFE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
-_SAFE_VER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,63}$")
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#]{0,255}$")
+_-9_.:\-@#]{0,255}$")
 
 # Keys allowed in ctx (MatchSpec fields)
 _CTX_KEYS: Tuple[str, ...] = (
