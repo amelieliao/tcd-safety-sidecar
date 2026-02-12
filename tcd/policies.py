@@ -5,7 +5,7 @@
 
 
 
-# ---- hardening primitives (local; do NOT depend on other modules) ----
+
 
 _ASCII_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
 
