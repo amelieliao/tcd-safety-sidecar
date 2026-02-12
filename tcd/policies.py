@@ -12,21 +12,7 @@
         
     
 
-def _is_regex(p: Optional[str]) -> bool:
-    # Syntax: "/.../" only. No flags here (flags can be added later via schema).
-    return isinstance(p, str) and len(p) >= 2 and p.startswith("/") and p.endswith("/")
 
-
-def _regex_inner(p: str) -> str:
-    return p[1:-1]
-
-
-_BAD_RE = object()  # sentinel: never matches
-_Pat = Union[str, re.Pattern, object, Any]  # Any: regex.Pattern if using `regex` module
-
-
-@dataclass(frozen=True)
-class RegexPolicy:
     """
     L7 regex safety policy.
 
