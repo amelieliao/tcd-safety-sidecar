@@ -10,26 +10,7 @@
 
 
         
-        return default
-    return x
-
-
-def _canon_json(obj: Any) -> str:
-    # L7: JSON closure + deterministic encoding (no NaN/Inf)
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def _dc_copy(dc: Any) -> Any:
-    """
-    Defensive copy for dataclasses. Always returns a distinct instance for
-    dataclass inputs; otherwise returns the original object.
-    """
-    try:
-        return replace(dc)
-    except Exception:
-        return dc
-
-
+    
 def _dc_update(dc: Any, override: Dict[str, Any]) -> Any:
     """
     Shallow, field-safe dataclass update (ignores unknown keys).
