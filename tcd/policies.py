@@ -7,18 +7,7 @@
 
 
 
-_-9_.:\-@#]{0,255}$")
 
-# Keys allowed in ctx (MatchSpec fields)
-_CTX_KEYS: Tuple[str, ...] = (
-    "tenant",
-    "user",
-    "session",
-    "model_id",
-    "gpu_id",
-    "task",
-    "lang",
-    "env",
     "trust_zone",
     "route",
     "data_class",
