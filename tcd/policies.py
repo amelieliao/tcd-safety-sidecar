@@ -11,23 +11,7 @@
 
         
     
-def _dc_update(dc: Any, override: Dict[str, Any]) -> Any:
-    """
-    Shallow, field-safe dataclass update (ignores unknown keys).
-    L7: never returns the same instance when dc is a dataclass; it returns a new copy.
-    """
-    try:
-        valid = {f.name for f in dc_fields(dc)}
-    except Exception:
-        return dc
-
-    if not override:
-        # still copy to avoid shared-mutable leakage into BoundPolicy
-        return _dc_copy(dc)
-
-    kwargs = {k: v for k, v in (override or {}).items() if k in valid}
-    if not kwargs:
-        return _dc_copy(dc)
+def
     try:
         return replace(dc, **kwargs)
     except Exception:
