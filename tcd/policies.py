@@ -2,11 +2,7 @@
 
 
 
-# Optional: safer regex engine with timeouts (if installed).
-try:  # pragma: no cover
-    import regex as _regex  # type: ignore
-except Exception:  # pragma: no cover
-    _regex = None  # type: ignore
+
 
 
 # ---- hardening primitives (local; do NOT depend on other modules) ----
