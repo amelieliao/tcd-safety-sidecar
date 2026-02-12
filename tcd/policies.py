@@ -11,20 +11,6 @@
 
         
     
-def
-    try:
-        return replace(dc, **kwargs)
-    except Exception:
-        # fail-closed to base copy
-        return _dc_copy(dc)
-
-
-# ---------------------------------------------------------------------------
-# Pattern grammar / compilation (L7 hardened)
-# ---------------------------------------------------------------------------
-
-PatEngine = Literal["re", "regex"]
-
 
 def _is_regex(p: Optional[str]) -> bool:
     # Syntax: "/.../" only. No flags here (flags can be added later via schema).
