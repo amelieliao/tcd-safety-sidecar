@@ -10,16 +10,7 @@
 
 
         s = s[:max_len]
-    if _ASCII_CTRL_RE.search(s):
-        s = _ASCII_CTRL_RE.sub("", s)
-    return s.strip()
-
-
-def _safe_label(s: Any, *, default: Optional[str] = None) -> Optional[str]:
-    if not isinstance(s, str):
-        return default
-    x = _strip_unsafe_text(s.lower(), max_len=64)
-    if not x:
+    if _
         return default
     if not _SAFE_LABEL_RE.fullmatch(x):
         return default
