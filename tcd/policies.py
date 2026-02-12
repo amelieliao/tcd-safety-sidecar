@@ -1,19 +1,6 @@
 
 
-l
-from .risk_av import AlwaysValidConfig
 
-__all__ = [
-    "MatchSpec",
-    "DetectorOverrides",
-    "AVOverrides",
-    "RoutingOverrides",
-    "ReceiptOptions",
-    "SREOptions",
-    "AuditOptions",
-    "PolicyRule",
-    "BoundPolicy",
-    "PolicyStore",
 ]
 
 # ---------------------------------------------------------------------------
