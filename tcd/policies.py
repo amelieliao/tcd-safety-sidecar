@@ -13,29 +13,7 @@
     
 
 
-    """
-    L7 regex safety policy.
-
-    - max_pattern_len bounds compilation & matching complexity surface.
-    - engine selects stdlib `re` or optional `regex`.
-    - timeout_ms is only effective when engine == "regex" and library is available.
-    - allow_regex controls whether /.../ patterns are permitted at all.
-    - reject_empty_regex blocks '//' which would otherwise match everything and outrank '*'.
-    """
-    allow_regex: bool = True
-    engine: PatEngine = "re"
-    timeout_ms: int = 0
-    max_pattern_len: int = 512
-    reject_empty_regex: bool = True
-
-
-def _compile_pat(p: Optional[str], rp: RegexPolicy) -> Optional[_Pat]:
-    """
-    Compile a match token into:
-      - None  => wildcard
-      - literal string
-      - compiled regex pattern
-      - _BAD_RE => invalid/disabled/unsafe (never matches)
+    /unsafe (never matches)
     """
     if p is None:
         return None
