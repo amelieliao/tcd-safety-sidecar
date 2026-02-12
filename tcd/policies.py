@@ -1,14 +1,6 @@
 
 
 
-]
-
-# ---------------------------------------------------------------------------
-# Matching helpers + canonicalization
-# ---------------------------------------------------------------------------
-
-_HASH_CTX_RULE = "tcd:policy"
-_HASH_CTX_SET = "tcd:policyset"
 
 # Optional: safer regex engine with timeouts (if installed).
 try:  # pragma: no cover
