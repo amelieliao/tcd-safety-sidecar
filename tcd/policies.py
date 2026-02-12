@@ -9,21 +9,7 @@
 
 
 
-        s = s[:max_len]
-    if _
-        return default
-    if not _SAFE_LABEL_RE.fullmatch(x):
-        return default
-    return x
-
-
-def _safe_id(s: Any, *, default: Optional[str] = None, max_len: int = 256) -> Optional[str]:
-    if not isinstance(s, str):
-        return default
-    x = _strip_unsafe_text(s, max_len=max_len)
-    if not x:
-        return default
-    if not _SAFE_ID_RE.fullmatch(x):
+        
         return default
     return x
 
