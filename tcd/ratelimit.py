@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 try:
     # Optional: integrate with the OTEL-like exporter if available.
-    from .otel_exporter import TCDOtelExporter
+    from .otel_exporter TCDOtelExporter
 except Exception:  # pragma: no cover
     TCDOtelExporter = None  # type: ignore[misc]
 
