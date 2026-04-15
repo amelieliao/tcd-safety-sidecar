@@ -1,17 +1,23 @@
-下面这版直接把 schemas.py 对齐到了新版 routing.py 的 Route 契约、risk_av.py 的 eprocess.v3 输出、api_v1.py 当前 DiagnoseOut 归一化路径，以及 attest.py 的 receipt 返回键。 ￼  ￼  ￼  ￼
-
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import unicodedata
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Literal
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 __all__ = [
+    "PolicyMatchContextView",
+    "ArtifactRefsView",
+    "EvidenceIdentityView",
+    "RouteContractView",
+    "ReceiptPublicView",
+    "ReceiptAuditView",
+    "ReceiptVerificationView",
     "ReceiptView",
     "EProcessControllerView",
     "EProcessStreamView",
@@ -25,19 +31,35 @@ __all__ = [
 ]
 
 # =============================================================================
-# Low-level hardening helpers
+# Surface / schema versions
+# =============================================================================
+
+_SCHEMA_EXECUTOR_VERSION = "schemas.v3"
+_PUBLIC_SURFACE_VERSION = "public.v2"
+_AUDIT_SURFACE_VERSION = "audit.v2"
+_RECEIPT_SURFACE_VERSION = "receipt.v2"
+_VERIFICATION_SURFACE_VERSION = "verification.v2"
+_CANONICALIZATION_VERSION = "canonjson_v1"
+
+# =============================================================================
+# Regex / constants
 # =============================================================================
 
 _ASCII_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
 _SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#/+=]{0,255}$")
-_SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}$")
-_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
-_ALGO_DIGEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:[A-Za-z0-9._:+/\-=]{8,1024}$")
-_BASE64ISH_RE = re.compile(r"^[A-Za-z0-9+/=_:\-.,]{1,8192}$")
+_SAFE_REASON_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+
+_DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{16,256}$")
+_DIGEST_HEX_0X_RE = re.compile(r"^0x[0-9a-f]{16,256}$")
+_DIGEST_ALG_HEX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:[0-9a-f]{16,256}$")
+_CFG_FP_RE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256}|[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256})$"
+)
+_RECEIPT_INTEGRITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{1,31}:[A-Za-z0-9][A-Za-z0-9_.:\-]{1,63}$")
+_BASE64ISH_RE = re.compile(r"^[A-Za-z0-9+/=_:\-.,]{1,16384}$")
 _TAGLIKE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,255}$")
-_PATHLIKE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-/#]{0,255}$")
 
 _ALLOWED_INPUT_KINDS = frozenset(
     {"prompt", "completion", "log", "meta", "request", "response", "other"}
@@ -52,7 +74,9 @@ _ALLOWED_ACTIONS = frozenset(
 _ALLOWED_REQUIRED_ACTIONS = frozenset({"allow", "degrade", "block"})
 _ALLOWED_ENFORCEMENT = frozenset({"advisory", "must_enforce", "fail_closed"})
 _ALLOWED_SIGNAL_TRUST = frozenset({"trusted", "advisory", "untrusted"})
-_ALLOWED_STATE_SCOPE = frozenset({"local_best_effort", "node_persistent", "cluster_eventual", "cluster_strong"})
+_ALLOWED_STATE_SCOPE = frozenset(
+    {"local_best_effort", "node_persistent", "cluster_eventual", "cluster_strong"}
+)
 _ALLOWED_TRUST_ZONES = frozenset(
     {"internet", "internal", "partner", "admin", "ops", "unknown", "__config_error__"}
 )
@@ -60,6 +84,11 @@ _ALLOWED_ROUTE_PROFILES = frozenset(
     {"inference", "batch", "admin", "control", "metrics", "health", "unknown"}
 )
 _ALLOWED_RISK_LABELS = frozenset({"low", "normal", "elevated", "high", "critical", "unknown"})
+_ALLOWED_BODY_KINDS = frozenset({"canonical_json", "blob_ref", "compact_receipt", "opaque"})
+_ALLOWED_ROUTE_ID_KINDS = frozenset({"plan"})
+_ALLOWED_LEDGER_STAGE = frozenset({"prepared", "committed", "outboxed", "skipped", "failed"})
+_ALLOWED_OUTBOX_STATUS = frozenset({"queued", "flushed", "dropped", "disabled", "none"})
+
 _ALLOWED_REASON_CODES = frozenset(
     {
         "ROUTER_DISABLED",
@@ -104,6 +133,25 @@ _ALLOWED_REASON_CODES = frozenset(
     }
 )
 
+_POLICY_CTX_KEYS: Tuple[str, ...] = (
+    "tenant",
+    "user",
+    "session",
+    "model_id",
+    "gpu_id",
+    "task",
+    "lang",
+    "env",
+    "trust_zone",
+    "route",
+    "data_class",
+    "workload",
+    "jurisdiction",
+    "regulation",
+    "client_app",
+    "access_channel",
+)
+
 _FORBIDDEN_META_KEY_TOKENS = {
     "prompt",
     "completion",
@@ -129,25 +177,6 @@ _FORBIDDEN_META_KEY_TOKENS = {
     "privatekey",
 }
 
-_DEFAULT_CONTEXT_KEYS = (
-    "tenant",
-    "user",
-    "session",
-    "model_id",
-    "gpu_id",
-    "task",
-    "lang",
-    "env",
-    "trust_zone",
-    "route",
-    "data_class",
-    "workload",
-    "jurisdiction",
-    "regulation",
-    "client_app",
-    "access_channel",
-)
-
 _MAX_INPUT_BYTES = 262_144
 _MAX_BODY_BYTES = 262_144
 _MAX_SIG_BYTES = 16_384
@@ -158,6 +187,14 @@ _MAX_JSON_ITEMS = 256
 _MAX_JSON_DEPTH = 8
 _MAX_JSON_STR_TOTAL = 64_000
 _MAX_JSON_STR_LEN = 2_048
+
+# =============================================================================
+# Primitive helpers
+# =============================================================================
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
 
 
 def _has_unsafe_unicode(s: str) -> bool:
@@ -173,7 +210,10 @@ def _has_unsafe_unicode(s: str) -> bool:
 def _strip_unsafe_text(v: Any, *, max_len: int) -> str:
     if not isinstance(v, str):
         return ""
-    s = v[:max_len]
+    s = _nfc(v)
+    if len(s) > max_len:
+        s = s[:max_len]
+
     if s.isascii():
         if _ASCII_CTRL_RE.search(s):
             s = _ASCII_CTRL_RE.sub("", s)
@@ -232,8 +272,8 @@ def _safe_blob_string(v: Any, *, max_len: int) -> Optional[str]:
 def _safe_reason_code(v: Any, *, default: Optional[str] = None) -> Optional[str]:
     if not isinstance(v, str):
         return default
-    s = _strip_unsafe_text(v, max_len=128).strip()
-    if not s or not _SAFE_REASON_RE.fullmatch(s):
+    s = _strip_unsafe_text(v, max_len=128).upper()
+    if not s or not _SAFE_REASON_CODE_RE.fullmatch(s):
         return default
     return s
 
@@ -241,13 +281,40 @@ def _safe_reason_code(v: Any, *, default: Optional[str] = None) -> Optional[str]
 def _looks_like_digestish(s: str) -> bool:
     if not s:
         return False
-    if _HEX_RE.fullmatch(s) and 16 <= len(s) <= 1024:
+    if _DIGEST_HEX_RE.fullmatch(s):
         return True
-    if _ALGO_DIGEST_RE.fullmatch(s):
+    if _DIGEST_HEX_0X_RE.fullmatch(s):
         return True
-    if s.startswith("0x") and _HEX_RE.fullmatch(s[2:]) and 16 <= len(s[2:]) <= 1024:
+    if _DIGEST_ALG_HEX_RE.fullmatch(s):
+        return True
+    if _CFG_FP_RE.fullmatch(s):
         return True
     return False
+
+
+def _normalize_digest_token(v: Any, *, kind: str) -> Optional[str]:
+    s = _safe_blob_string(v, max_len=1024)
+    if s is None:
+        return None
+    if kind == "cfg_fp":
+        if _CFG_FP_RE.fullmatch(s):
+            return s
+        raise ValueError("invalid config fingerprint")
+    if kind == "receipt_head":
+        if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) or _DIGEST_ALG_HEX_RE.fullmatch(s):
+            return s.lower() if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) else s
+        raise ValueError("invalid receipt head")
+    if kind == "policy_digest":
+        if _DIGEST_HEX_0X_RE.fullmatch(s) or _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_ALG_HEX_RE.fullmatch(s):
+            return s.lower() if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) else s
+        raise ValueError("invalid policy digest")
+    if kind == "integrity":
+        if _RECEIPT_INTEGRITY_RE.fullmatch(s):
+            return s
+        raise ValueError("invalid receipt_integrity")
+    if _looks_like_digestish(s):
+        return s
+    raise ValueError("invalid digest token")
 
 
 def _coerce_float(v: Any) -> Optional[float]:
@@ -301,7 +368,6 @@ def _coerce_bool(v: Any) -> Optional[bool]:
             return False
         if v == 1:
             return True
-        return None
     if type(v) is str:
         s = v.strip().lower()
         if s in {"1", "true", "yes", "y", "on"}:
@@ -343,8 +409,60 @@ def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
     return int(x)
 
 
+def _stable_jsonable(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (bool, int)):
+        return obj
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            return None
+        s = f"{float(obj):.12f}".rstrip("0").rstrip(".")
+        return s or "0"
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, Mapping):
+        out: Dict[str, Any] = {}
+        for k in sorted(obj.keys(), key=lambda x: str(x)):
+            out[str(k)] = _stable_jsonable(obj[k])
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_stable_jsonable(x) for x in obj]
+    if isinstance(obj, (set, frozenset)):
+        xs = [_stable_jsonable(x) for x in obj]
+        try:
+            return sorted(xs)
+        except Exception:
+            return xs
+    return _safe_name(type(obj).__name__, default="object")
+
+
+def _canonical_json_bytes(obj: Any) -> bytes:
+    return json.dumps(
+        _stable_jsonable(obj),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tagged_digest(obj: Any, *, ctx: str) -> str:
+    raw = ctx.encode("utf-8", errors="strict") + b"\x00" + _canonical_json_bytes(obj)
+    return _sha256_hex(raw)
+
+
 def _bounded_json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _json_loads_strict(s: str) -> Any:
+    def _bad_const(_: str) -> Any:
+        raise ValueError("non-finite json constant")
+
+    return json.loads(s, parse_constant=_bad_const)
 
 
 def _normalize_str_list(
@@ -353,7 +471,8 @@ def _normalize_str_list(
     max_items: int = _MAX_LIST_ITEMS,
     max_len: int = 128,
     label_mode: bool = False,
-    allow_reason_codes: bool = False,
+    reason_code_mode: bool = False,
+    allowed: Optional[Set[str]] = None,
 ) -> List[str]:
     if values is None:
         return []
@@ -369,7 +488,7 @@ def _normalize_str_list(
     for item in seq:
         if len(out) >= max_items:
             break
-        if allow_reason_codes:
+        if reason_code_mode:
             s = _safe_reason_code(item, default=None)
         elif label_mode:
             s = _safe_label(item, default="")
@@ -377,7 +496,9 @@ def _normalize_str_list(
             s = _strip_unsafe_text(item, max_len=max_len)
         if not s:
             continue
-        if allow_reason_codes and s not in _ALLOWED_REASON_CODES:
+        if reason_code_mode and s not in _ALLOWED_REASON_CODES:
+            continue
+        if allowed is not None and s not in allowed:
             continue
         if s in seen:
             continue
@@ -457,8 +578,6 @@ def _json_sanitize(
         return float(obj) if math.isfinite(obj) else None
     if t is str:
         s = _strip_unsafe_text(obj, max_len=_MAX_JSON_STR_LEN)
-        if len(s) > _MAX_JSON_STR_LEN:
-            s = s[:_MAX_JSON_STR_LEN]
         if not budget.take_str(len(s)):
             return "[truncated]"
         return s
@@ -500,7 +619,7 @@ def _json_sanitize(
 
 
 def _safe_json_mapping(v: Any) -> Dict[str, Any]:
-    if not isinstance(v, Mapping):
+    if type(v) is not dict:
         return {}
     budget = _JsonBudget(
         max_nodes=_MAX_JSON_NODES,
@@ -523,33 +642,109 @@ def _safe_json_any(v: Any) -> Any:
 
 
 def _coerce_canonical_json_string(v: Any, *, max_bytes: int) -> Optional[str]:
+    """
+    Strict boundary rule:
+      - never silently truncates
+      - returns None if over budget / not serializable
+    """
     if v is None:
         return None
     if isinstance(v, str):
-        s = _strip_unsafe_text(v, max_len=max_bytes)
+        s = _strip_unsafe_text(v, max_len=max_bytes * 2)
         if not s:
             return None
-        if len(s.encode("utf-8", errors="ignore")) > max_bytes:
-            s = s.encode("utf-8", errors="ignore")[:max_bytes].decode("utf-8", errors="ignore")
+        raw = s.encode("utf-8", errors="strict")
+        if len(raw) > max_bytes:
+            return None
         return s
-    if isinstance(v, (dict, list, tuple)):
+    if type(v) in (dict, list, tuple):
         safe = _safe_json_any(v)
         try:
             s = _bounded_json_dumps(safe)
         except Exception:
             return None
-        if len(s.encode("utf-8", errors="ignore")) > max_bytes:
+        if len(s.encode("utf-8", errors="strict")) > max_bytes:
             return None
         return s
     return None
 
 
+def _collect_distinct(values: Iterable[Tuple[str, Any]]) -> List[Tuple[str, Any]]:
+    out: List[Tuple[str, Any]] = []
+    seen: Set[str] = set()
+    for src, val in values:
+        if val is None:
+            continue
+        if val == "" or val == [] or val == {}:
+            continue
+        try:
+            key = _bounded_json_dumps(_stable_jsonable(val))
+        except Exception:
+            key = repr(type(val))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((src, val))
+    return out
+
+
+def _coalesce_identity(
+    current: Any,
+    *,
+    field_name: str,
+    candidates: Iterable[Tuple[str, Any]],
+    integrity_errors: List[str],
+) -> Any:
+    distinct = _collect_distinct(candidates)
+    if len(distinct) > 1:
+        integrity_errors.append(f"{field_name}_conflict")
+    if current not in (None, "", [], {}):
+        return current
+    if distinct:
+        return distinct[0][1]
+    return current
+
+
+def _iter_validation_aliases(field_info: Any) -> Set[str]:
+    out: Set[str] = set()
+    va = getattr(field_info, "validation_alias", None)
+    if va is None:
+        return out
+    if isinstance(va, str):
+        out.add(va)
+        return out
+    choices = getattr(va, "choices", None)
+    if choices is not None:
+        for c in choices:
+            if isinstance(c, str):
+                out.add(c)
+    return out
+
+
+def _known_input_keys_for_model(cls: type[BaseModel]) -> Set[str]:
+    out: Set[str] = set()
+    for name, finfo in cls.model_fields.items():
+        out.add(name)
+        out.update(_iter_validation_aliases(finfo))
+    return out
+
+
 # =============================================================================
-# Base model
+# Base models
 # =============================================================================
 
 
-class _SchemaModel(BaseModel):
+class _IngressModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        from_attributes=True,
+        populate_by_name=True,
+        validate_assignment=True,
+        str_strip_whitespace=True,
+    )
+
+
+class _CompatViewModel(BaseModel):
     model_config = ConfigDict(
         extra="ignore",
         from_attributes=True,
@@ -558,45 +753,440 @@ class _SchemaModel(BaseModel):
         str_strip_whitespace=True,
     )
 
+    compat_unknown_fields_count: int = 0
+    compat_unknown_fields_sample: List[str] = Field(default_factory=list)
+    compat_mode_used: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_unknown_fields(cls, data: Any) -> Any:
+        if type(data) is not dict:
+            return data
+        known = _known_input_keys_for_model(cls)
+        unknown: List[str] = []
+        for k in data.keys():
+            if not isinstance(k, str):
+                continue
+            if k not in known:
+                uk = _strip_unsafe_text(k, max_len=64)
+                if uk:
+                    unknown.append(uk)
+        if unknown:
+            d = dict(data)
+            d.setdefault("compat_unknown_fields_count", len(unknown))
+            d.setdefault("compat_unknown_fields_sample", unknown[:8])
+            d.setdefault("compat_mode_used", True)
+            return d
+        return data
+
 
 # =============================================================================
-# Receipt view
+# Shared structured views
 # =============================================================================
 
 
-class ReceiptView(_SchemaModel):
+class PolicyMatchContextView(_CompatViewModel):
+    tenant: Optional[str] = None
+    user: Optional[str] = None
+    session: Optional[str] = None
+    model_id: Optional[str] = None
+    gpu_id: Optional[str] = None
+    task: Optional[str] = None
+    lang: Optional[str] = None
+    env: Optional[str] = None
+    trust_zone: Optional[str] = None
+    route: Optional[str] = None
+    data_class: Optional[str] = None
+    workload: Optional[str] = None
+    jurisdiction: Optional[str] = None
+    regulation: Optional[str] = None
+    client_app: Optional[str] = None
+    access_channel: Optional[str] = None
+
+    @field_validator(*_POLICY_CTX_KEYS, mode="before")
+    @classmethod
+    def _v_fields(cls, v: Any, info) -> Optional[str]:
+        if v is None:
+            return None
+        name = info.field_name
+        if name in {"trust_zone"}:
+            s = _safe_label(v, default="")
+            return s if s in _ALLOWED_TRUST_ZONES else (s or None)
+        if name in {"route"}:
+            s = _safe_label(v, default="")
+            return s if s in _ALLOWED_ROUTE_PROFILES else (s or None)
+        if name in {"lang", "env", "data_class", "workload", "jurisdiction", "regulation", "client_app", "access_channel", "task"}:
+            return _safe_label(v, default="") or None
+        return _safe_id(v, default=None, max_len=128)
+
+    @classmethod
+    def from_context(cls, context: Mapping[str, Any]) -> "PolicyMatchContextView":
+        if type(context) is not dict:
+            return cls()
+        payload = {k: context.get(k) for k in _POLICY_CTX_KEYS if k in context}
+        return cls.model_validate(payload)
+
+
+class ArtifactRefsView(_CompatViewModel):
+    audit_ref: Optional[str] = None
+    receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    event_digest: Optional[str] = None
+    body_digest: Optional[str] = None
+    ledger_stage: Optional[str] = None
+    outbox_status: Optional[str] = None
+    produced_by: List[str] = Field(default_factory=list)
+    provenance_path_digest: Optional[str] = None
+
+    @field_validator(
+        "audit_ref", "receipt_ref", "ledger_ref", "attestation_ref", "provenance_path_digest", mode="before"
+    )
+    @classmethod
+    def _v_ids(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _safe_blob_string(v, max_len=256)
+
+    @field_validator("event_digest", "body_digest", mode="before")
+    @classmethod
+    def _v_digests(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="policy_digest")
+
+    @field_validator("ledger_stage", mode="before")
+    @classmethod
+    def _v_stage(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_LEDGER_STAGE else (s or None)
+
+    @field_validator("outbox_status", mode="before")
+    @classmethod
+    def _v_outbox(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_OUTBOX_STATUS else (s or None)
+
+    @field_validator("produced_by", mode="before")
+    @classmethod
+    def _v_produced_by(cls, v: Any) -> List[str]:
+        return _normalize_str_list(v, max_items=16, max_len=64, label_mode=False)
+
+
+class EvidenceIdentityView(_CompatViewModel):
+    event_id: Optional[str] = None
+    event_id_kind: Optional[str] = None
+    decision_id: Optional[str] = None
+    decision_id_kind: Optional[str] = None
+    route_plan_id: Optional[str] = None
+    route_id: Optional[str] = None
+    route_id_kind: Optional[str] = None
+
+    config_fingerprint: Optional[str] = None
+    bundle_version: Optional[int] = None
+    policy_ref: Optional[str] = None
+    policyset_ref: Optional[str] = None
+    state_domain_id: Optional[str] = None
+
+    activation_id: Optional[str] = None
+    patch_id: Optional[str] = None
+    change_ticket_id: Optional[str] = None
+
+    audit_ref: Optional[str] = None
+    receipt_ref: Optional[str] = None
+
+    @field_validator(
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "route_id",
+        "policy_ref",
+        "policyset_ref",
+        "state_domain_id",
+        "activation_id",
+        "patch_id",
+        "change_ticket_id",
+        "audit_ref",
+        "receipt_ref",
+        mode="before",
+    )
+    @classmethod
+    def _v_ids(cls, v: Any) -> Optional[str]:
+        return _safe_blob_string(v, max_len=256)
+
+    @field_validator("config_fingerprint", mode="before")
+    @classmethod
+    def _v_cfg_fp(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="cfg_fp")
+
+    @field_validator("bundle_version", mode="before")
+    @classmethod
+    def _v_bundle(cls, v: Any) -> Optional[int]:
+        x = _finite_int(v, default=None)
+        if x is None:
+            return None
+        return max(0, x)
+
+    @field_validator("route_id_kind", mode="before")
+    @classmethod
+    def _v_route_id_kind(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_ROUTE_ID_KINDS else (s or None)
+
+    @field_validator("event_id_kind", "decision_id_kind", mode="before")
+    @classmethod
+    def _v_kind(cls, v: Any) -> Optional[str]:
+        return _safe_label(v, default="") or None
+
+
+class RouteContractView(_CompatViewModel):
+    safety_tier: Optional[str] = None
+    required_action: Optional[str] = None
+    enforcement_mode: Optional[str] = None
+
+    decoder: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
+    latency_hint: Optional[str] = None
+
+    tool_calls_allowed: Optional[bool] = None
+    retrieval_allowed: Optional[bool] = None
+    streaming_allowed: Optional[bool] = None
+    external_calls_allowed: Optional[bool] = None
+    response_policy: Optional[str] = None
+
+    receipt_required: Optional[bool] = None
+    ledger_required: Optional[bool] = None
+    attestation_required: Optional[bool] = None
+
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+
+    @field_validator("safety_tier", mode="before")
+    @classmethod
+    def _v_tier(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        if s not in _ALLOWED_SAFETY_TIERS:
+            raise ValueError("invalid safety_tier")
+        return s
+
+    @field_validator("required_action", mode="before")
+    @classmethod
+    def _v_required_action(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        if s not in _ALLOWED_REQUIRED_ACTIONS:
+            raise ValueError("required_action must be allow|degrade|block")
+        return s
+
+    @field_validator("enforcement_mode", mode="before")
+    @classmethod
+    def _v_enforcement(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        if s not in _ALLOWED_ENFORCEMENT:
+            raise ValueError("invalid enforcement_mode")
+        return s
+
+    @field_validator("decoder", "response_policy", mode="before")
+    @classmethod
+    def _v_names(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _safe_name(v, default="") or None
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _v_temperature(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        return _clamp_float(v, default=1.0, lo=0.0, hi=10.0)
+
+    @field_validator("top_p", mode="before")
+    @classmethod
+    def _v_top_p(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        return _clamp_float(v, default=1.0, lo=0.0, hi=1.0)
+
+    @field_validator("max_tokens", mode="before")
+    @classmethod
+    def _v_max_tokens(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        x = _finite_int(v, default=None)
+        if x is None:
+            return None
+        return max(0, x)
+
+    @field_validator("latency_hint", mode="before")
+    @classmethod
+    def _v_latency(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        if s not in _ALLOWED_LATENCY_HINTS:
+            raise ValueError("invalid latency_hint")
+        return s
+
+    @field_validator(
+        "tool_calls_allowed",
+        "retrieval_allowed",
+        "streaming_allowed",
+        "external_calls_allowed",
+        "receipt_required",
+        "ledger_required",
+        "attestation_required",
+        mode="before",
+    )
+    @classmethod
+    def _v_boolish(cls, v: Any) -> Optional[bool]:
+        if v is None:
+            return None
+        b = _coerce_bool(v)
+        if b is None:
+            raise ValueError("expected bool")
+        return b
+
+    @model_validator(mode="after")
+    def _check_contract(self) -> "RouteContractView":
+        errs: List[str] = []
+        if self.enforcement_mode == "must_enforce" and self.required_action is None:
+            errs.append("required_action_missing")
+        if self.required_action == "block" and self.enforcement_mode == "advisory":
+            errs.append("block_cannot_be_advisory")
+        if self.required_action is not None and self.enforcement_mode is None:
+            errs.append("enforcement_mode_missing")
+        if self.safety_tier == "strict" and self.required_action == "allow":
+            errs.append("strict_cannot_allow")
+        self.integrity_errors = errs
+        self.integrity_ok = not errs
+        return self
+
+    def assert_integrity(self) -> None:
+        if not self.integrity_ok:
+            raise ValueError(f"route_contract integrity failed: {','.join(self.integrity_errors)}")
+
+
+# =============================================================================
+# Receipt views
+# =============================================================================
+
+
+class ReceiptPublicView(_CompatViewModel):
+    surface_version: str = _PUBLIC_SURFACE_VERSION
+    schema: Optional[str] = None
+    head: Optional[str] = None
+    receipt_ref: Optional[str] = None
+    audit_ref: Optional[str] = None
+    event_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    route_plan_id: Optional[str] = None
+    policy_ref: Optional[str] = None
+    policyset_ref: Optional[str] = None
+    cfg_fp: Optional[str] = None
+    verify_key_id: Optional[str] = None
+    verify_key_fp: Optional[str] = None
+    receipt_integrity: Optional[str] = None
+    pq_signature_required: Optional[bool] = None
+    pq_signature_ok: Optional[bool] = None
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+
+
+class ReceiptAuditView(_CompatViewModel):
+    surface_version: str = _AUDIT_SURFACE_VERSION
+    schema: Optional[str] = None
+    head: Optional[str] = None
+    body_digest: Optional[str] = None
+    receipt_ref: Optional[str] = None
+    audit_ref: Optional[str] = None
+    event_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    route_plan_id: Optional[str] = None
+    policy_ref: Optional[str] = None
+    policyset_ref: Optional[str] = None
+    policy_digest: Optional[str] = None
+    cfg_fp: Optional[str] = None
+    state_domain_id: Optional[str] = None
+    adapter_registry_fp: Optional[str] = None
+    verify_key_id: Optional[str] = None
+    verify_key_fp: Optional[str] = None
+    receipt_integrity: Optional[str] = None
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReceiptVerificationView(_CompatViewModel):
+    surface_version: str = _VERIFICATION_SURFACE_VERSION
+    schema: Optional[str] = None
+    head: Optional[str] = None
+    body: Optional[str] = None
+    sig: Optional[str] = None
+    verify_key: Optional[str] = None
+    verify_key_id: Optional[str] = None
+    verify_key_fp: Optional[str] = None
+    receipt_integrity: Optional[str] = None
+    body_kind: Optional[str] = None
+    body_digest: Optional[str] = None
+    head_verified: Optional[bool] = None
+    body_canonical_verified: Optional[bool] = None
+    integrity_hash_verified: Optional[bool] = None
+    signature_verified: Optional[bool] = None
+    verify_key_allowed: Optional[bool] = None
+    policy_binding_verified: Optional[bool] = None
+    cfg_binding_verified: Optional[bool] = None
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+
+
+class ReceiptView(_CompatViewModel):
     """
-    Receipt / attestation view aligned to:
-      - attestor.issue() output (`receipt`, `receipt_body`, `receipt_sig`, `verify_key`)
-      - receipt-first control-plane payloads
-      - ledger/admin receipt metadata
+    Receipt / attestation view.
+
+    Strong field split:
+      - digest fields are strong-typed
+      - text fields stay bounded
+      - public / audit / verification surfaces are exposed explicitly
     """
 
     schema: Optional[str] = None
     schema_version: Optional[int] = None
+    canonicalization_version: Optional[str] = None
+    public_surface_version: str = _PUBLIC_SURFACE_VERSION
+    audit_surface_version: str = _AUDIT_SURFACE_VERSION
+    receipt_surface_version: str = _RECEIPT_SURFACE_VERSION
+
     receipt_kind: Optional[str] = None
     event_type: Optional[str] = None
 
-    head: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("head", "receipt", "receipt_head"),
-    )
-    body: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("body", "receipt_body", "receiptBody"),
-    )
-    sig: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("sig", "receipt_sig", "receiptSig"),
-    )
-    verify_key: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("verify_key", "verifyKey"),
-    )
+    head: Optional[str] = Field(default=None, validation_alias=AliasChoices("head", "receipt", "receipt_head"))
+    body: Optional[str] = Field(default=None, validation_alias=AliasChoices("body", "receipt_body", "receiptBody"))
+    sig: Optional[str] = Field(default=None, validation_alias=AliasChoices("sig", "receipt_sig", "receiptSig"))
+    verify_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("verify_key", "verifyKey"))
 
     receipt_secondary: Optional[str] = None
     receipt_sig_secondary: Optional[str] = None
     receipt_integrity: Optional[str] = None
+
+    body_kind: Optional[str] = None
+    body_digest: Optional[str] = None
+    body_schema: Optional[str] = None
+    body_canonicalized: Optional[bool] = None
 
     sig_scheme: Optional[str] = None
     sig_alg: Optional[str] = None
@@ -607,6 +1197,8 @@ class ReceiptView(_SchemaModel):
 
     pq_required: Optional[bool] = None
     pq_ok: Optional[bool] = None
+    pq_signature_required: Optional[bool] = None
+    pq_signature_ok: Optional[bool] = None
 
     store_backend: Optional[str] = None
     store_id: Optional[int] = None
@@ -648,6 +1240,22 @@ class ReceiptView(_SchemaModel):
     statistical_guarantee_scope: Optional[str] = None
     trigger: Optional[bool] = None
 
+    produced_by: List[str] = Field(default_factory=list)
+    provenance_path_digest: Optional[str] = None
+
+    head_verified: Optional[bool] = None
+    body_canonical_verified: Optional[bool] = None
+    integrity_hash_verified: Optional[bool] = None
+    signature_verified: Optional[bool] = None
+    verify_key_allowed: Optional[bool] = None
+    policy_binding_verified: Optional[bool] = None
+    cfg_binding_verified: Optional[bool] = None
+
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+    normalization_warnings: List[str] = Field(default_factory=list)
+    compat_warnings: List[str] = Field(default_factory=list)
+
     meta: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator(
@@ -674,6 +1282,12 @@ class ReceiptView(_SchemaModel):
         "chain_id",
         "selected_source",
         "statistical_guarantee_scope",
+        "body_schema",
+        "build_id",
+        "image_digest",
+        "attestation_id",
+        "env_fingerprint",
+        "provenance_path_digest",
         mode="before",
     )
     @classmethod
@@ -685,15 +1299,33 @@ class ReceiptView(_SchemaModel):
             return s
         return _safe_blob_string(v, max_len=512)
 
-    @field_validator("head", "receipt_secondary", "policy_digest", "cfg_fp", "config_hash", "prev_head_hex", mode="before")
+    @field_validator(
+        "head",
+        "receipt_secondary",
+        "policy_digest",
+        "cfg_fp",
+        "config_hash",
+        "prev_head_hex",
+        "body_digest",
+        mode="before",
+    )
     @classmethod
-    def _v_digestish(cls, v: Any) -> Optional[str]:
-        s = _safe_blob_string(v, max_len=1024)
-        if s is None:
+    def _v_digestish(cls, v: Any, info) -> Optional[str]:
+        if v is None:
             return None
-        if _looks_like_digestish(s):
-            return s
-        return _safe_id(s, default=None, max_len=256) or s[:256]
+        name = info.field_name
+        if name == "cfg_fp":
+            return _normalize_digest_token(v, kind="cfg_fp")
+        if name in {"head", "receipt_secondary", "prev_head_hex"}:
+            return _normalize_digest_token(v, kind="receipt_head")
+        return _normalize_digest_token(v, kind="policy_digest")
+
+    @field_validator("receipt_integrity", mode="before")
+    @classmethod
+    def _v_integrity(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="integrity")
 
     @field_validator("body", mode="before")
     @classmethod
@@ -706,17 +1338,14 @@ class ReceiptView(_SchemaModel):
         s = _safe_blob_string(v, max_len=_MAX_SIG_BYTES)
         if s is None:
             return None
-        return s if _BASE64ISH_RE.fullmatch(s) or len(s) <= _MAX_SIG_BYTES else s[:_MAX_SIG_BYTES]
+        if not _BASE64ISH_RE.fullmatch(s):
+            return s
+        return s
 
     @field_validator("verify_key", mode="before")
     @classmethod
     def _v_verify_key(cls, v: Any) -> Optional[str]:
         return _safe_blob_string(v, max_len=_MAX_VERIFY_KEY_LEN)
-
-    @field_validator("build_id", "image_digest", "attestation_id", "env_fingerprint", mode="before")
-    @classmethod
-    def _v_artifactish(cls, v: Any) -> Optional[str]:
-        return _safe_blob_string(v, max_len=512)
 
     @field_validator("action", mode="before")
     @classmethod
@@ -731,21 +1360,26 @@ class ReceiptView(_SchemaModel):
     def _v_reason(cls, v: Any) -> Optional[str]:
         return _safe_blob_string(v, max_len=512)
 
-    @field_validator("pq_required", "pq_ok", "trigger", mode="before")
+    @field_validator("body_kind", mode="before")
+    @classmethod
+    def _v_body_kind(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        if s not in _ALLOWED_BODY_KINDS:
+            raise ValueError("invalid body_kind")
+        return s
+
+    @field_validator("pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", "trigger", "body_canonicalized", "head_verified", "body_canonical_verified", "integrity_hash_verified", "signature_verified", "verify_key_allowed", "policy_binding_verified", "cfg_binding_verified", mode="before")
     @classmethod
     def _v_boolish(cls, v: Any) -> Optional[bool]:
         if v is None:
             return None
         return _coerce_bool(v)
 
-    @field_validator("schema_version", "store_id", "chain_seq", mode="before")
+    @field_validator("schema_version", "store_id", "chain_seq", "ts_ns", "ts_unix_ns", mode="before")
     @classmethod
     def _v_intish(cls, v: Any) -> Optional[int]:
-        return _finite_int(v, default=None)
-
-    @field_validator("ts_ns", "ts_unix_ns", mode="before")
-    @classmethod
-    def _v_ns(cls, v: Any) -> Optional[int]:
         x = _finite_int(v, default=None)
         if x is None:
             return None
@@ -759,6 +1393,11 @@ class ReceiptView(_SchemaModel):
             return None
         return max(0.0, x)
 
+    @field_validator("produced_by", mode="before")
+    @classmethod
+    def _v_produced_by(cls, v: Any) -> List[str]:
+        return _normalize_str_list(v, max_items=16, max_len=64)
+
     @field_validator("meta", mode="before")
     @classmethod
     def _v_meta(cls, v: Any) -> Dict[str, Any]:
@@ -766,11 +1405,127 @@ class ReceiptView(_SchemaModel):
 
     @model_validator(mode="after")
     def _sync_fields(self) -> "ReceiptView":
+        errs: List[str] = list(self.integrity_errors)
+
         if self.ts is None and self.ts_unix_ns is not None:
             self.ts = float(self.ts_unix_ns) / 1_000_000_000.0
         if self.ts_unix_ns is None and self.ts is not None:
             self.ts_unix_ns = int(self.ts * 1_000_000_000.0)
+
+        if self.route_id is None and self.route_plan_id is not None:
+            self.route_id = self.route_plan_id
+
+        if self.pq_signature_required is None and self.pq_required is not None:
+            self.pq_signature_required = self.pq_required
+        if self.pq_signature_ok is None and self.pq_ok is not None:
+            self.pq_signature_ok = self.pq_ok
+
+        if self.body is not None:
+            try:
+                obj = _json_loads_strict(self.body)
+                if isinstance(obj, dict):
+                    self.body_kind = self.body_kind or "canonical_json"
+                    self.body_canonicalized = True if self.body_canonicalized is None else self.body_canonicalized
+                    if self.body_digest is None:
+                        self.body_digest = "sha256:" + _sha256_hex(self.body.encode("utf-8", errors="strict"))
+                else:
+                    self.body_kind = self.body_kind or "opaque"
+            except Exception:
+                self.body_kind = self.body_kind or "opaque"
+                self.body_canonicalized = False if self.body_canonicalized is None else self.body_canonicalized
+
+        self.integrity_errors = errs
+        self.integrity_ok = not errs
         return self
+
+    def assert_integrity(self) -> None:
+        if not self.integrity_ok:
+            raise ValueError(f"receipt integrity failed: {','.join(self.integrity_errors)}")
+
+    def to_public_view(self, *, strict: bool = True) -> ReceiptPublicView:
+        if strict:
+            self.assert_integrity()
+        return ReceiptPublicView(
+            schema=self.schema,
+            head=self.head,
+            receipt_ref=self.receipt_ref,
+            audit_ref=self.audit_ref,
+            event_id=self.event_id,
+            decision_id=self.decision_id,
+            route_plan_id=self.route_plan_id,
+            policy_ref=self.policy_ref,
+            policyset_ref=self.policyset_ref,
+            cfg_fp=self.cfg_fp,
+            verify_key_id=self.verify_key_id or self.sig_key_id,
+            verify_key_fp=self.verify_key_fp,
+            receipt_integrity=self.receipt_integrity,
+            pq_signature_required=self.pq_signature_required,
+            pq_signature_ok=self.pq_signature_ok,
+            integrity_ok=self.integrity_ok,
+            integrity_errors=list(self.integrity_errors),
+        )
+
+    def to_audit_view(self, *, strict: bool = True) -> ReceiptAuditView:
+        if strict:
+            self.assert_integrity()
+        return ReceiptAuditView(
+            schema=self.schema,
+            head=self.head,
+            body_digest=self.body_digest,
+            receipt_ref=self.receipt_ref,
+            audit_ref=self.audit_ref,
+            event_id=self.event_id,
+            decision_id=self.decision_id,
+            route_plan_id=self.route_plan_id,
+            policy_ref=self.policy_ref,
+            policyset_ref=self.policyset_ref,
+            policy_digest=self.policy_digest,
+            cfg_fp=self.cfg_fp,
+            state_domain_id=self.state_domain_id,
+            adapter_registry_fp=self.adapter_registry_fp,
+            verify_key_id=self.verify_key_id or self.sig_key_id,
+            verify_key_fp=self.verify_key_fp,
+            receipt_integrity=self.receipt_integrity,
+            integrity_ok=self.integrity_ok,
+            integrity_errors=list(self.integrity_errors),
+            meta=dict(self.meta),
+        )
+
+    def to_verification_view(self, *, strict: bool = True, include_verify_key: bool = True) -> ReceiptVerificationView:
+        if strict:
+            self.assert_integrity()
+        return ReceiptVerificationView(
+            schema=self.schema,
+            head=self.head,
+            body=self.body,
+            sig=self.sig,
+            verify_key=self.verify_key if include_verify_key else None,
+            verify_key_id=self.verify_key_id or self.sig_key_id,
+            verify_key_fp=self.verify_key_fp,
+            receipt_integrity=self.receipt_integrity,
+            body_kind=self.body_kind,
+            body_digest=self.body_digest,
+            head_verified=self.head_verified,
+            body_canonical_verified=self.body_canonical_verified,
+            integrity_hash_verified=self.integrity_hash_verified,
+            signature_verified=self.signature_verified,
+            verify_key_allowed=self.verify_key_allowed,
+            policy_binding_verified=self.policy_binding_verified,
+            cfg_binding_verified=self.cfg_binding_verified,
+            integrity_ok=self.integrity_ok,
+            integrity_errors=list(self.integrity_errors),
+        )
+
+    def to_public_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        return self.to_public_view(strict=strict).model_dump(exclude_none=True)
+
+    def to_audit_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        return self.to_audit_view(strict=strict).model_dump(exclude_none=True)
+
+    def to_verification_dict(self, *, strict: bool = True, include_verify_key: bool = True) -> Dict[str, Any]:
+        return self.to_verification_view(strict=strict, include_verify_key=include_verify_key).model_dump(
+            exclude_none=True
+        )
 
 
 # =============================================================================
@@ -778,7 +1533,7 @@ class ReceiptView(_SchemaModel):
 # =============================================================================
 
 
-class EProcessControllerView(_SchemaModel):
+class EProcessControllerView(_CompatViewModel):
     name: Optional[str] = None
     version: Optional[str] = None
     instance_id: Optional[str] = None
@@ -805,8 +1560,6 @@ class EProcessControllerView(_SchemaModel):
         "label",
         "policy_ref",
         "policyset_ref",
-        "cfg_fp",
-        "config_fingerprint",
         "state_domain_id",
         "adapter_registry_fp",
         "controller_mode",
@@ -815,6 +1568,13 @@ class EProcessControllerView(_SchemaModel):
     @classmethod
     def _v_text(cls, v: Any) -> Optional[str]:
         return _safe_blob_string(v, max_len=256)
+
+    @field_validator("cfg_fp", "config_fingerprint", mode="before")
+    @classmethod
+    def _v_cfg_fp(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="cfg_fp")
 
     @field_validator("bundle_version", "ts_monotonic_ns", "ts_unix_ns", mode="before")
     @classmethod
@@ -840,7 +1600,7 @@ class EProcessControllerView(_SchemaModel):
         return s if s in _ALLOWED_STATE_SCOPE else (s or None)
 
 
-class EProcessStreamView(_SchemaModel):
+class EProcessStreamView(_CompatViewModel):
     id: Optional[str] = None
     hash: Optional[str] = None
     identity_status: Optional[str] = None
@@ -877,7 +1637,7 @@ class EProcessStreamView(_SchemaModel):
         return _normalize_str_list(v, max_items=32, max_len=64, label_mode=True)
 
 
-class EProcessProcessView(_SchemaModel):
+class EProcessProcessView(_CompatViewModel):
     strict_e_value: Optional[float] = None
     controller_e_value: Optional[float] = None
     selected_source: Optional[str] = None
@@ -956,7 +1716,7 @@ class EProcessProcessView(_SchemaModel):
         return _safe_blob_string(v, max_len=128)
 
 
-class EProcessStatsView(_SchemaModel):
+class EProcessStatsView(_CompatViewModel):
     direct_p_steps: Optional[int] = None
     calibrated_p_steps: Optional[int] = None
     heuristic_p_steps: Optional[int] = None
@@ -1033,7 +1793,7 @@ class EProcessStatsView(_SchemaModel):
         return _safe_json_mapping(v)
 
 
-class EProcessValidityView(_SchemaModel):
+class EProcessValidityView(_CompatViewModel):
     strict_process_valid_if_direct_p_values_are_valid: Optional[bool] = None
     controller_process_is_statistical_controller_not_pure_e_process: Optional[bool] = None
     decision_source: Optional[str] = None
@@ -1064,7 +1824,7 @@ class EProcessValidityView(_SchemaModel):
         return _safe_blob_string(v, max_len=128)
 
 
-class EProcessStateView(_SchemaModel):
+class EProcessStateView(_CompatViewModel):
     schema: Optional[str] = None
     controller: EProcessControllerView = Field(default_factory=EProcessControllerView)
     stream: EProcessStreamView = Field(default_factory=EProcessStreamView)
@@ -1092,19 +1852,24 @@ class EProcessStateView(_SchemaModel):
 # =============================================================================
 
 
-class RouteView(_SchemaModel):
+class RouteView(_CompatViewModel):
     """
-    Public view of routing decisions.
+    Strong route contract view.
 
-    This model is forward-compatible with:
-      - legacy compact routing objects
-      - upgraded route contracts carrying plan/event IDs, enforcement mode,
-        signal provenance, and receipt/ledger requirements.
+    Keeps backward compatibility with compact route objects, but hardens:
+      - plan/event identity
+      - required_action vs enforcement_mode invariants
+      - cross-field contract consistency
+      - public / audit / receipt surface separation
     """
 
     schema: Optional[str] = None
     router: Optional[str] = None
     version: Optional[str] = None
+    canonicalization_version: str = _CANONICALIZATION_VERSION
+    public_surface_version: str = _PUBLIC_SURFACE_VERSION
+    audit_surface_version: str = _AUDIT_SURFACE_VERSION
+    receipt_surface_version: str = _RECEIPT_SURFACE_VERSION
 
     instance_id: Optional[str] = None
     activation_id: Optional[str] = None
@@ -1131,6 +1896,7 @@ class RouteView(_SchemaModel):
     required_action: Optional[str] = None
     action_hint: Optional[str] = None
     enforcement_mode: Optional[str] = None
+    contract: Optional[RouteContractView] = None
 
     temperature: float = 1.0
     top_p: float = 1.0
@@ -1177,10 +1943,16 @@ class RouteView(_SchemaModel):
     reason: str = ""
     tags: List[str] = Field(default_factory=list)
 
-    # backward-compatible extras kept explicit
+    # compat
     pq_required: Optional[bool] = None
     pq_ok: Optional[bool] = None
     override_flags: List[str] = Field(default_factory=list)
+
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+    normalization_warnings: List[str] = Field(default_factory=list)
+    compat_warnings: List[str] = Field(default_factory=list)
+    deprecated_fields_present: List[str] = Field(default_factory=list)
 
     @field_validator(
         "schema",
@@ -1188,13 +1960,11 @@ class RouteView(_SchemaModel):
         "version",
         "instance_id",
         "activation_id",
-        "config_fingerprint",
         "policy_ref",
         "policyset_ref",
         "patch_id",
         "change_ticket_id",
         "activated_by",
-        "route_id_kind",
         "route_plan_id",
         "route_id",
         "decision_id",
@@ -1204,15 +1974,26 @@ class RouteView(_SchemaModel):
         "guarantee_scope",
         "signal_source",
         "signal_signer_kid",
-        "signal_cfg_fp",
         "signal_policy_ref",
-        "signal_digest",
-        "context_digest",
         mode="before",
     )
     @classmethod
     def _v_text(cls, v: Any) -> Optional[str]:
         return _safe_blob_string(v, max_len=256)
+
+    @field_validator("config_fingerprint", "signal_cfg_fp", mode="before")
+    @classmethod
+    def _v_cfgfp(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="cfg_fp")
+
+    @field_validator("signal_digest", "context_digest", mode="before")
+    @classmethod
+    def _v_digests(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="policy_digest")
 
     @field_validator("router_mode", mode="before")
     @classmethod
@@ -1222,21 +2003,41 @@ class RouteView(_SchemaModel):
         s = _safe_label(v, default="")
         return s if s in _ALLOWED_ROUTER_MODES else (s or None)
 
+    @field_validator("route_id_kind", mode="before")
+    @classmethod
+    def _v_route_id_kind(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_ROUTE_ID_KINDS else (s or None)
+
     @field_validator("safety_tier", mode="before")
     @classmethod
     def _v_tier(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = _safe_label(v, default="")
-        return s if s in _ALLOWED_SAFETY_TIERS else (s or None)
+        if s not in _ALLOWED_SAFETY_TIERS:
+            raise ValueError("invalid safety_tier")
+        return s
 
-    @field_validator("required_action", "action_hint", mode="before")
+    @field_validator("required_action", mode="before")
     @classmethod
-    def _v_action(cls, v: Any) -> Optional[str]:
+    def _v_required_action(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = _safe_label(v, default="")
-        return s if s in _ALLOWED_REQUIRED_ACTIONS or s in _ALLOWED_ACTIONS else (s or None)
+        if s not in _ALLOWED_REQUIRED_ACTIONS:
+            raise ValueError("required_action must be allow|degrade|block")
+        return s
+
+    @field_validator("action_hint", mode="before")
+    @classmethod
+    def _v_action_hint(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_ACTIONS else (s or None)
 
     @field_validator("enforcement_mode", mode="before")
     @classmethod
@@ -1244,7 +2045,9 @@ class RouteView(_SchemaModel):
         if v is None:
             return None
         s = _safe_label(v, default="")
-        return s if s in _ALLOWED_ENFORCEMENT else (s or None)
+        if s not in _ALLOWED_ENFORCEMENT:
+            raise ValueError("invalid enforcement_mode")
+        return s
 
     @field_validator("latency_hint", mode="before")
     @classmethod
@@ -1262,7 +2065,16 @@ class RouteView(_SchemaModel):
     def _v_top_p(cls, v: Any) -> float:
         return _clamp_float(v, default=1.0, lo=0.0, hi=1.0)
 
-    @field_validator("max_tokens", "bundle_version", "decision_seq", "decision_ts_unix_ns", "decision_ts_mono_ns", "bundle_updated_at_unix_ns", "signal_freshness_ms", mode="before")
+    @field_validator(
+        "max_tokens",
+        "bundle_version",
+        "decision_seq",
+        "decision_ts_unix_ns",
+        "decision_ts_mono_ns",
+        "bundle_updated_at_unix_ns",
+        "signal_freshness_ms",
+        mode="before",
+    )
     @classmethod
     def _v_ints(cls, v: Any) -> Optional[int]:
         x = _finite_int(v, default=None)
@@ -1275,7 +2087,24 @@ class RouteView(_SchemaModel):
     def _v_score(cls, v: Any) -> float:
         return _clamp_float(v, default=0.0, lo=0.0, hi=1.0)
 
-    @field_validator("decision_fail", "e_triggered", "pq_unhealthy", "av_trigger", "tool_calls_allowed", "retrieval_allowed", "streaming_allowed", "external_calls_allowed", "receipt_required", "ledger_required", "attestation_required", "pq_required", "pq_ok", "signal_signed", "signal_replay_checked", mode="before")
+    @field_validator(
+        "decision_fail",
+        "e_triggered",
+        "pq_unhealthy",
+        "av_trigger",
+        "tool_calls_allowed",
+        "retrieval_allowed",
+        "streaming_allowed",
+        "external_calls_allowed",
+        "receipt_required",
+        "ledger_required",
+        "attestation_required",
+        "pq_required",
+        "pq_ok",
+        "signal_signed",
+        "signal_replay_checked",
+        mode="before",
+    )
     @classmethod
     def _v_boolish(cls, v: Any) -> Optional[bool]:
         if v is None:
@@ -1326,44 +2155,226 @@ class RouteView(_SchemaModel):
     @field_validator("reason_codes", "degraded_reason_codes", mode="before")
     @classmethod
     def _v_reason_codes(cls, v: Any) -> List[str]:
-        return _normalize_str_list(v, max_items=64, max_len=64, allow_reason_codes=True)
+        return _normalize_str_list(v, max_items=64, max_len=64, reason_code_mode=True)
 
     @field_validator("threat_tags", "tags", "override_flags", mode="before")
     @classmethod
     def _v_tag_lists(cls, v: Any) -> List[str]:
-        return _normalize_str_list(v, max_items=64, max_len=128, label_mode=False)
+        return _normalize_str_list(v, max_items=64, max_len=128)
 
     @field_validator("reason", mode="before")
     @classmethod
     def _v_reason_text(cls, v: Any) -> str:
-        return _safe_blob_string(v, max_len=1_024) or ""
+        return _safe_blob_string(v, max_len=1024) or ""
 
     @model_validator(mode="after")
     def _sync(self) -> "RouteView":
-        if self.route_id is None and self.route_plan_id is not None:
-            self.route_id = self.route_plan_id
+        errs: List[str] = list(self.integrity_errors)
+        deprecated: List[str] = list(self.deprecated_fields_present)
+
+        if self.route_id_kind == "plan":
+            if self.route_id is None and self.route_plan_id is not None:
+                self.route_id = self.route_plan_id
+            elif self.route_id is not None and self.route_plan_id is not None and self.route_id != self.route_plan_id:
+                errs.append("route_id_plan_mismatch")
+
+        if self.decision_id is not None and self.route_plan_id is not None and self.decision_id == self.route_plan_id:
+            errs.append("decision_id_equals_route_plan_id")
+
         if self.primary_reason_code is None and self.reason_codes:
             self.primary_reason_code = self.reason_codes[0]
+
+        if self.contract is None:
+            self.contract = RouteContractView(
+                safety_tier=self.safety_tier,
+                required_action=self.required_action,
+                enforcement_mode=self.enforcement_mode,
+                decoder=self.decoder,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_tokens=self.max_tokens,
+                latency_hint=self.latency_hint,
+                tool_calls_allowed=self.tool_calls_allowed,
+                retrieval_allowed=self.retrieval_allowed,
+                streaming_allowed=self.streaming_allowed,
+                external_calls_allowed=self.external_calls_allowed,
+                response_policy=self.response_policy,
+                receipt_required=self.receipt_required,
+                ledger_required=self.ledger_required,
+                attestation_required=self.attestation_required,
+            )
+        else:
+            if self.safety_tier is None:
+                self.safety_tier = self.contract.safety_tier
+            if self.required_action is None:
+                self.required_action = self.contract.required_action
+            if self.enforcement_mode is None:
+                self.enforcement_mode = self.contract.enforcement_mode
+
+        if self.contract is not None and not self.contract.integrity_ok:
+            errs.extend(self.contract.integrity_errors)
+
+        if self.enforcement_mode == "must_enforce" and self.required_action is None:
+            errs.append("required_action_missing")
+        if self.required_action == "block" and self.enforcement_mode == "advisory":
+            errs.append("block_cannot_be_advisory")
+        if self.signal_signed is True and not self.signal_signer_kid:
+            errs.append("signed_signal_missing_signer_kid")
+        if self.signal_trust_mode == "trusted" and not self.signal_source:
+            errs.append("trusted_signal_missing_source")
+        if self.route_id is not None:
+            deprecated.append("route_id")
+
         if not self.reason and self.reason_codes:
-            self.reason = ";".join(self.reason_codes + self.degraded_reason_codes)
+            joined = self.reason_codes + self.degraded_reason_codes
+            self.reason = ";".join(joined[:32])
+
+        self.deprecated_fields_present = sorted(set(deprecated))
+        self.integrity_errors = sorted(set(errs))
+        self.integrity_ok = not self.integrity_errors
         return self
 
+    def assert_integrity(self) -> None:
+        if not self.integrity_ok:
+            raise ValueError(f"route integrity failed: {','.join(self.integrity_errors)}")
+
+    def to_public_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        return {
+            "surface_version": self.public_surface_version,
+            "schema": self.schema,
+            "router": self.router,
+            "version": self.version,
+            "config_fingerprint": self.config_fingerprint,
+            "bundle_version": self.bundle_version,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "router_mode": self.router_mode,
+            "route_plan_id": self.route_plan_id,
+            "decision_id": self.decision_id,
+            "decision_seq": self.decision_seq,
+            "decision_ts_unix_ns": self.decision_ts_unix_ns,
+            "safety_tier": self.safety_tier,
+            "required_action": self.required_action,
+            "enforcement_mode": self.enforcement_mode,
+            "trust_zone": self.trust_zone,
+            "route_profile": self.route_profile,
+            "risk_label": self.risk_label,
+            "score": self.score,
+            "primary_reason_code": self.primary_reason_code,
+            "reason_codes": list(self.reason_codes),
+            "degraded_reason_codes": list(self.degraded_reason_codes),
+            "reason": self.reason,
+            "contract": self.contract.model_dump(exclude_none=True) if self.contract else None,
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+        }
+
+    def to_receipt_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        contract = self.contract.model_dump(exclude_none=True) if self.contract else {}
+        return {
+            "surface_version": self.receipt_surface_version,
+            "schema": self.schema,
+            "router": self.router,
+            "version": self.version,
+            "activation_id": self.activation_id,
+            "config_fingerprint": self.config_fingerprint,
+            "bundle_version": self.bundle_version,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "route_plan_id": self.route_plan_id,
+            "decision_id": self.decision_id,
+            "trust_zone": self.trust_zone,
+            "route_profile": self.route_profile,
+            "risk_label": self.risk_label,
+            "score": self.score,
+            "primary_reason_code": self.primary_reason_code,
+            "reason_codes": list(self.reason_codes),
+            "degraded_reason_codes": list(self.degraded_reason_codes),
+            "signal_digest": self.signal_digest,
+            "context_digest": self.context_digest,
+            "contract": contract,
+        }
+
+    def to_audit_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        contract = self.contract.model_dump(exclude_none=True) if self.contract else {}
+        return {
+            "surface_version": self.audit_surface_version,
+            "type": "tcd.route.decision",
+            "decision_id": self.decision_id,
+            "route_plan_id": self.route_plan_id,
+            "decision_seq": self.decision_seq,
+            "decision_ts_unix_ns": self.decision_ts_unix_ns,
+            "decision_ts_mono_ns": self.decision_ts_mono_ns,
+            "router_mode": self.router_mode,
+            "activation_id": self.activation_id,
+            "config_fingerprint": self.config_fingerprint,
+            "bundle_version": self.bundle_version,
+            "bundle_updated_at_unix_ns": self.bundle_updated_at_unix_ns,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "patch_id": self.patch_id,
+            "change_ticket_id": self.change_ticket_id,
+            "activated_by": self.activated_by,
+            "trust_zone": self.trust_zone,
+            "route_profile": self.route_profile,
+            "risk_label": self.risk_label,
+            "score": self.score,
+            "decision_fail": self.decision_fail,
+            "e_triggered": self.e_triggered,
+            "pq_unhealthy": self.pq_unhealthy,
+            "threat_tags": list(self.threat_tags),
+            "controller_mode": self.controller_mode,
+            "guarantee_scope": self.guarantee_scope,
+            "signal_source": self.signal_source,
+            "signal_trust_mode": self.signal_trust_mode,
+            "signal_signed": self.signal_signed,
+            "signal_signer_kid": self.signal_signer_kid,
+            "signal_cfg_fp": self.signal_cfg_fp,
+            "signal_policy_ref": self.signal_policy_ref,
+            "signal_freshness_ms": self.signal_freshness_ms,
+            "signal_replay_checked": self.signal_replay_checked,
+            "signal_digest": self.signal_digest,
+            "context_digest": self.context_digest,
+            "primary_reason_code": self.primary_reason_code,
+            "reason_codes": list(self.reason_codes),
+            "degraded_reason_codes": list(self.degraded_reason_codes),
+            "contract": contract,
+            "tags": list(self.tags),
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+        }
+
 
 # =============================================================================
-# Diagnose input / output
+# Diagnose input
 # =============================================================================
 
 
-class DiagnoseIn(_SchemaModel):
+class DiagnoseIn(_IngressModel):
     """
-    Input schema for /v1/diagnose and adjacent control-plane entrypoints.
+    Strict external ingress model.
 
-    This keeps the public contract compact, but makes all free-form surfaces
-    bounded and sanitized so it can safely sit at the API boundary.
+    Upgrades:
+      - extra=forbid
+      - text/json input identity split
+      - context allowlist split into policy_match_context + extensions
+      - canonical digest and original byte accounting
     """
 
-    input: str = Field(..., description="Text or payload to check")
+    input_text: Optional[str] = Field(default=None, validation_alias=AliasChoices("input_text", "input"))
+    input_json: Optional[Any] = None
     input_kind: str = Field("prompt", description="Coarse input kind")
+
+    input_identity_kind: Optional[str] = None
+    input_canonical_digest: Optional[str] = None
+    input_original_bytes: Optional[int] = None
+
     subject: Optional[str] = None
     subject_hash: Optional[str] = None
     tenant_id: Optional[str] = None
@@ -1375,6 +2386,10 @@ class DiagnoseIn(_SchemaModel):
 
     tags: List[str] = Field(default_factory=list)
     context: Dict[str, Any] = Field(default_factory=dict)
+    extensions: Dict[str, Any] = Field(default_factory=dict)
+    context_unknown_keys: List[str] = Field(default_factory=list)
+    context_drop_count: int = 0
+    policy_match_context: Optional[PolicyMatchContextView] = None
 
     threat_hint: Optional[str] = None
     threat_confidence: Optional[float] = None
@@ -1384,13 +2399,25 @@ class DiagnoseIn(_SchemaModel):
     image_digest: Optional[str] = None
     compliance_tags: List[str] = Field(default_factory=list)
 
-    @field_validator("input", mode="before")
+    @field_validator("input_text", mode="before")
     @classmethod
-    def _v_input(cls, v: Any) -> str:
-        s = _coerce_canonical_json_string(v, max_bytes=_MAX_INPUT_BYTES)
-        if s is None or not s:
-            return ""
-        return s
+    def _v_input_text(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _coerce_canonical_json_string(v, max_bytes=_MAX_INPUT_BYTES)
+
+    @field_validator("input_json", mode="before")
+    @classmethod
+    def _v_input_json(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if type(v) not in (dict, list):
+            raise ValueError("input_json must be a dict or list")
+        safe = _safe_json_any(v)
+        s = _bounded_json_dumps(safe)
+        if len(s.encode("utf-8", errors="strict")) > _MAX_INPUT_BYTES:
+            raise ValueError("input_json exceeds size limit")
+        return safe
 
     @field_validator("input_kind", mode="before")
     @classmethod
@@ -1398,7 +2425,9 @@ class DiagnoseIn(_SchemaModel):
         s = _safe_label(v, default="prompt")
         return s if s in _ALLOWED_INPUT_KINDS else "other"
 
-    @field_validator("subject", "subject_hash", "tenant_id", "request_id", "trace_id", "build_id", "image_digest", mode="before")
+    @field_validator(
+        "subject", "subject_hash", "tenant_id", "request_id", "trace_id", "build_id", "image_digest", mode="before"
+    )
     @classmethod
     def _v_ids(cls, v: Any) -> Optional[str]:
         s = _safe_id(v, default=None, max_len=256)
@@ -1455,18 +2484,51 @@ class DiagnoseIn(_SchemaModel):
 
     @model_validator(mode="after")
     def _validate_required(self) -> "DiagnoseIn":
-        if not self.input:
-            raise ValueError("input must be a non-empty bounded string")
+        if self.input_text is None and self.input_json is None:
+            raise ValueError("one of input_text/input_json is required")
+        if self.input_text is not None and self.input_json is not None:
+            raise ValueError("input_text and input_json are mutually exclusive")
+
+        if self.input_text is not None:
+            self.input_identity_kind = "text"
+            self.input_original_bytes = len(self.input_text.encode("utf-8", errors="strict"))
+            self.input_canonical_digest = "sha256:" + _tagged_digest(self.input_text, ctx="tcd:schemas:input_text")
+        else:
+            self.input_identity_kind = "json"
+            js = _bounded_json_dumps(self.input_json)
+            self.input_original_bytes = len(js.encode("utf-8", errors="strict"))
+            self.input_canonical_digest = "sha256:" + _tagged_digest(self.input_json, ctx="tcd:schemas:input_json")
+
+        known_context = {k: self.context.get(k) for k in _POLICY_CTX_KEYS if k in self.context}
+        unknown_keys = [k for k in self.context.keys() if k not in _POLICY_CTX_KEYS]
+        self.context_unknown_keys = sorted(unknown_keys[:16])
+        self.context_drop_count = len(unknown_keys)
+        self.extensions = {k: self.context[k] for k in unknown_keys}
+        self.context = known_context
+        self.policy_match_context = self.policy_match_context or PolicyMatchContextView.from_context(known_context)
+
+        if self.trust_zone and self.policy_match_context and self.policy_match_context.trust_zone is None:
+            self.policy_match_context.trust_zone = self.trust_zone
+        if self.route_profile and self.policy_match_context and self.policy_match_context.route is None:
+            self.policy_match_context.route = self.route_profile
+
         return self
 
 
-class DiagnoseOut(_SchemaModel):
-    """
-    Output schema for diagnostic / safety evaluation.
+# =============================================================================
+# Diagnose output
+# =============================================================================
 
-    This model stays backward-compatible with the current `api_v1` normalize path,
-    while also accepting richer receipt/route/eprocess objects from the upgraded
-    routing and always-valid controller layers.
+
+class DiagnoseOut(_CompatViewModel):
+    """
+    Strong output harmonizer.
+
+    Responsibilities:
+      - absorb route / e_state / receipt / security fragments
+      - build unified evidence identity + artifact refs + route contract
+      - detect cross-object conflicts instead of silently preferring one source
+      - offer public / audit / receipt surfaces with fail-closed integrity checks
     """
 
     verdict: bool = False
@@ -1487,30 +2549,51 @@ class DiagnoseOut(_SchemaModel):
 
     e_state: Optional[EProcessStateView] = None
     route: Optional[RouteView] = None
+    route_contract: Optional[RouteContractView] = None
 
     trust_zone: Optional[str] = None
     route_profile: Optional[str] = None
     threat_kind: Optional[str] = None
     threat_confidence: Optional[float] = None
+
     pq_required: bool = False
     pq_ok: Optional[bool] = None
+    pq_signature_required: Optional[bool] = None
+    pq_signature_ok: Optional[bool] = None
+
+    receipt_required: Optional[bool] = None
+    receipt_issued: Optional[bool] = None
+    ledger_required: Optional[bool] = None
+    ledger_committed: Optional[bool] = None
+    attestation_required: Optional[bool] = None
+    attestation_issued: Optional[bool] = None
+
     policy_ref: Optional[str] = None
     policyset_ref: Optional[str] = None
 
-    config_fingerprint: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("config_fingerprint", "cfg_fp"),
-    )
+    config_fingerprint: Optional[str] = Field(default=None, validation_alias=AliasChoices("config_fingerprint", "cfg_fp"))
     policy_digest: Optional[str] = None
     state_domain_id: Optional[str] = None
     bundle_version: Optional[int] = None
+
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
     event_id: Optional[str] = None
+    activation_id: Optional[str] = None
+    patch_id: Optional[str] = None
+    change_ticket_id: Optional[str] = None
+
     audit_ref: Optional[str] = None
     receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
     controller_mode: Optional[str] = None
     statistical_guarantee_scope: Optional[str] = None
+
+    body_digest: Optional[str] = None
+    event_digest: Optional[str] = None
+    ledger_stage: Optional[str] = None
+    outbox_status: Optional[str] = None
 
     security: Dict[str, Any] = Field(default_factory=dict)
 
@@ -1518,6 +2601,22 @@ class DiagnoseOut(_SchemaModel):
     receipt_body: Optional[str] = None
     receipt_sig: Optional[str] = None
     verify_key: Optional[str] = None
+
+    evidence_identity: Optional[EvidenceIdentityView] = None
+    artifacts: Optional[ArtifactRefsView] = None
+
+    integrity_ok: bool = True
+    integrity_errors: List[str] = Field(default_factory=list)
+    normalization_warnings: List[str] = Field(default_factory=list)
+    compat_warnings: List[str] = Field(default_factory=list)
+    deprecated_fields_present: List[str] = Field(default_factory=list)
+
+    @field_validator("verdict", "pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", "receipt_required", "receipt_issued", "ledger_required", "ledger_committed", "attestation_required", "attestation_issued", mode="before")
+    @classmethod
+    def _v_boolish(cls, v: Any):
+        if v is None:
+            return None
+        return _coerce_bool(v)
 
     @field_validator("decision", "action", mode="before")
     @classmethod
@@ -1535,18 +2634,9 @@ class DiagnoseOut(_SchemaModel):
     @field_validator("score", "threshold", "budget_remaining", "e_value", "alpha_alloc", "alpha_spent", mode="before")
     @classmethod
     def _v_floats(cls, v: Any, info) -> float:
-        default = 0.0
-        if info.field_name == "e_value":
-            default = 1.0
+        default = 1.0 if info.field_name == "e_value" else 0.0
         x = _finite_float(v, default=default)
         return float(x if x is not None else default)
-
-    @field_validator("threat_confidence", mode="before")
-    @classmethod
-    def _v_threat_conf(cls, v: Any) -> Optional[float]:
-        if v is None:
-            return None
-        return _clamp_float(v, default=0.0, lo=0.0, hi=1.0)
 
     @field_validator("step", "bundle_version", mode="before")
     @classmethod
@@ -1556,24 +2646,27 @@ class DiagnoseOut(_SchemaModel):
             return None
         return max(0, x)
 
-    @field_validator("verdict", "pq_required", "pq_ok", mode="before")
+    @field_validator("threat_confidence", mode="before")
     @classmethod
-    def _v_boolish(cls, v: Any):
+    def _v_threat_conf(cls, v: Any) -> Optional[float]:
         if v is None:
             return None
-        return _coerce_bool(v)
+        return _clamp_float(v, default=0.0, lo=0.0, hi=1.0)
 
     @field_validator(
         "policy_ref",
         "policyset_ref",
-        "config_fingerprint",
-        "policy_digest",
         "state_domain_id",
         "decision_id",
         "route_plan_id",
         "event_id",
+        "activation_id",
+        "patch_id",
+        "change_ticket_id",
         "audit_ref",
         "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
         "controller_mode",
         "statistical_guarantee_scope",
         mode="before",
@@ -1583,6 +2676,20 @@ class DiagnoseOut(_SchemaModel):
         if v is None:
             return None
         return _safe_blob_string(v, max_len=256)
+
+    @field_validator("config_fingerprint", mode="before")
+    @classmethod
+    def _v_cfg_fp(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="cfg_fp")
+
+    @field_validator("policy_digest", "body_digest", "event_digest", mode="before")
+    @classmethod
+    def _v_digestish(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        return _normalize_digest_token(v, kind="policy_digest")
 
     @field_validator("trust_zone", mode="before")
     @classmethod
@@ -1627,6 +2734,22 @@ class DiagnoseOut(_SchemaModel):
     def _v_verify_key(cls, v: Any) -> Optional[str]:
         return _safe_blob_string(v, max_len=_MAX_VERIFY_KEY_LEN)
 
+    @field_validator("ledger_stage", mode="before")
+    @classmethod
+    def _v_ledger_stage(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_LEDGER_STAGE else (s or None)
+
+    @field_validator("outbox_status", mode="before")
+    @classmethod
+    def _v_outbox_status(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_OUTBOX_STATUS else (s or None)
+
     @field_validator("receipt", mode="before")
     @classmethod
     def _v_receipt_obj(cls, v: Any) -> Any:
@@ -1636,8 +2759,48 @@ class DiagnoseOut(_SchemaModel):
             return {"head": v}
         return v
 
+    def _build_evidence_identity(self) -> EvidenceIdentityView:
+        return EvidenceIdentityView(
+            event_id=self.event_id,
+            event_id_kind="event",
+            decision_id=self.decision_id,
+            decision_id_kind="decision",
+            route_plan_id=self.route_plan_id,
+            route_id=self.route_plan_id,
+            route_id_kind="plan",
+            config_fingerprint=self.config_fingerprint,
+            bundle_version=self.bundle_version,
+            policy_ref=self.policy_ref,
+            policyset_ref=self.policyset_ref,
+            state_domain_id=self.state_domain_id,
+            activation_id=self.activation_id,
+            patch_id=self.patch_id,
+            change_ticket_id=self.change_ticket_id,
+            audit_ref=self.audit_ref,
+            receipt_ref=self.receipt_ref,
+        )
+
+    def _build_artifacts(self) -> ArtifactRefsView:
+        produced_by = ["schemas", "route", "e_state", "receipt"]
+        prov = "sha256:" + _tagged_digest(produced_by, ctx="tcd:schemas:produced_by")
+        return ArtifactRefsView(
+            audit_ref=self.audit_ref,
+            receipt_ref=self.receipt_ref,
+            ledger_ref=self.ledger_ref,
+            attestation_ref=self.attestation_ref,
+            event_digest=self.event_digest,
+            body_digest=self.body_digest,
+            ledger_stage=self.ledger_stage,
+            outbox_status=self.outbox_status,
+            produced_by=produced_by,
+            provenance_path_digest=prov,
+        )
+
     @model_validator(mode="after")
     def _harmonize(self) -> "DiagnoseOut":
+        errs: List[str] = list(self.integrity_errors)
+        deprecated: List[str] = list(self.deprecated_fields_present)
+
         # Build receipt from legacy raw fields if needed
         if self.receipt is None and any([self.receipt_body, self.receipt_sig, self.verify_key]):
             self.receipt = ReceiptView(
@@ -1655,8 +2818,9 @@ class DiagnoseOut(_SchemaModel):
                 receipt_ref=self.receipt_ref,
                 state_domain_id=self.state_domain_id,
             )
+            deprecated.extend(["receipt_body", "receipt_sig", "verify_key"])
 
-        # Backfill legacy raw fields from structured receipt
+        # Backfill from structured receipt
         if self.receipt is not None:
             if self.receipt_body is None:
                 self.receipt_body = self.receipt.body
@@ -1664,89 +2828,308 @@ class DiagnoseOut(_SchemaModel):
                 self.receipt_sig = self.receipt.sig
             if self.verify_key is None:
                 self.verify_key = self.receipt.verify_key
-            if self.policy_ref is None:
-                self.policy_ref = self.receipt.policy_ref
-            if self.policyset_ref is None:
-                self.policyset_ref = self.receipt.policyset_ref
-            if self.config_fingerprint is None:
-                self.config_fingerprint = self.receipt.cfg_fp
-            if self.state_domain_id is None:
-                self.state_domain_id = self.receipt.state_domain_id
-            if self.decision_id is None:
-                self.decision_id = self.receipt.decision_id
-            if self.route_plan_id is None:
-                self.route_plan_id = self.receipt.route_plan_id
-            if self.event_id is None:
-                self.event_id = self.receipt.event_id
-            if self.audit_ref is None:
-                self.audit_ref = self.receipt.audit_ref
-            if self.receipt_ref is None:
-                self.receipt_ref = self.receipt.receipt_ref
 
-        # Backfill route-derived top-level fields
-        if self.route is not None:
+        # Build/derive route contract
+        if self.route_contract is None and self.route is not None:
+            self.route_contract = self.route.contract
+        if self.route_contract is None and self.route is None:
+            self.route_contract = RouteContractView()
+
+        # Cross-source consistency
+        receipt = self.receipt
+        route = self.route
+        e_state = self.e_state
+        security = self.security or {}
+
+        self.policy_ref = _coalesce_identity(
+            self.policy_ref,
+            field_name="policy_ref",
+            candidates=[
+                ("route", route.policy_ref if route else None),
+                ("receipt", receipt.policy_ref if receipt else None),
+                ("security", security.get("policy_ref")),
+            ],
+            integrity_errors=errs,
+        )
+        self.policyset_ref = _coalesce_identity(
+            self.policyset_ref,
+            field_name="policyset_ref",
+            candidates=[
+                ("route", route.policyset_ref if route else None),
+                ("receipt", receipt.policyset_ref if receipt else None),
+                ("e_state", e_state.controller.policyset_ref if e_state else None),
+                ("security", security.get("policyset_ref")),
+            ],
+            integrity_errors=errs,
+        )
+        self.config_fingerprint = _coalesce_identity(
+            self.config_fingerprint,
+            field_name="config_fingerprint",
+            candidates=[
+                ("route", route.config_fingerprint if route else None),
+                ("receipt", receipt.cfg_fp if receipt else None),
+                ("e_state", (e_state.controller.cfg_fp or e_state.controller.config_fingerprint) if e_state else None),
+                ("security", security.get("cfg_fp")),
+            ],
+            integrity_errors=errs,
+        )
+        self.bundle_version = _coalesce_identity(
+            self.bundle_version,
+            field_name="bundle_version",
+            candidates=[
+                ("route", route.bundle_version if route else None),
+                ("e_state", e_state.controller.bundle_version if e_state else None),
+                ("security", security.get("bundle_version")),
+            ],
+            integrity_errors=errs,
+        )
+        self.state_domain_id = _coalesce_identity(
+            self.state_domain_id,
+            field_name="state_domain_id",
+            candidates=[
+                ("receipt", receipt.state_domain_id if receipt else None),
+                ("e_state", e_state.controller.state_domain_id if e_state else None),
+                ("security", security.get("state_domain_id")),
+            ],
+            integrity_errors=errs,
+        )
+        self.decision_id = _coalesce_identity(
+            self.decision_id,
+            field_name="decision_id",
+            candidates=[
+                ("route", route.decision_id if route else None),
+                ("receipt", receipt.decision_id if receipt else None),
+            ],
+            integrity_errors=errs,
+        )
+        self.route_plan_id = _coalesce_identity(
+            self.route_plan_id,
+            field_name="route_plan_id",
+            candidates=[
+                ("route", route.route_plan_id if route else None),
+                ("receipt", receipt.route_plan_id if receipt else None),
+            ],
+            integrity_errors=errs,
+        )
+        self.event_id = _coalesce_identity(
+            self.event_id,
+            field_name="event_id",
+            candidates=[
+                ("receipt", receipt.event_id if receipt else None),
+                ("security", security.get("event_id")),
+            ],
+            integrity_errors=errs,
+        )
+        self.audit_ref = _coalesce_identity(
+            self.audit_ref,
+            field_name="audit_ref",
+            candidates=[
+                ("receipt", receipt.audit_ref if receipt else None),
+                ("security", security.get("audit_ref")),
+            ],
+            integrity_errors=errs,
+        )
+        self.receipt_ref = _coalesce_identity(
+            self.receipt_ref,
+            field_name="receipt_ref",
+            candidates=[
+                ("receipt", receipt.receipt_ref if receipt else None),
+                ("security", security.get("receipt_ref")),
+            ],
+            integrity_errors=errs,
+        )
+
+        if route is not None:
             if self.trust_zone is None:
-                self.trust_zone = self.route.trust_zone
+                self.trust_zone = route.trust_zone
+            elif self.trust_zone != route.trust_zone:
+                errs.append("trust_zone_conflict")
             if self.route_profile is None:
-                self.route_profile = self.route.route_profile
-            if self.policy_ref is None:
-                self.policy_ref = self.route.policy_ref
-            if self.policyset_ref is None:
-                self.policyset_ref = self.route.policyset_ref
-            if self.config_fingerprint is None:
-                self.config_fingerprint = self.route.config_fingerprint
-            if self.bundle_version is None:
-                self.bundle_version = self.route.bundle_version
-            if self.decision_id is None:
-                self.decision_id = self.route.decision_id
-            if self.route_plan_id is None:
-                self.route_plan_id = self.route.route_plan_id
+                self.route_profile = route.route_profile
+            elif self.route_profile != route.route_profile:
+                errs.append("route_profile_conflict")
             if self.controller_mode is None:
-                self.controller_mode = self.route.controller_mode
+                self.controller_mode = route.controller_mode
             if self.statistical_guarantee_scope is None:
-                self.statistical_guarantee_scope = self.route.guarantee_scope
-            if self.pq_required is False and self.route.receipt_required is not None:
-                # do not over-promise; only set if explicit route-level pq flag exists
-                if self.route.pq_required is not None:
-                    self.pq_required = bool(self.route.pq_required)
-            if self.pq_ok is None and self.route.pq_ok is not None:
-                self.pq_ok = self.route.pq_ok
+                self.statistical_guarantee_scope = route.guarantee_scope
+            if self.receipt_required is None:
+                self.receipt_required = route.receipt_required
+            if self.ledger_required is None:
+                self.ledger_required = route.ledger_required
+            if self.attestation_required is None:
+                self.attestation_required = route.attestation_required
+            if self.pq_required is False and route.pq_required is not None:
+                self.pq_required = bool(route.pq_required)
+            if self.pq_ok is None:
+                self.pq_ok = route.pq_ok
 
-        # Backfill from e_state controller block
-        if self.e_state is not None:
-            ctrl = self.e_state.controller
-            if self.policyset_ref is None:
-                self.policyset_ref = ctrl.policyset_ref
-            if self.config_fingerprint is None:
-                self.config_fingerprint = ctrl.cfg_fp or ctrl.config_fingerprint
-            if self.bundle_version is None:
-                self.bundle_version = ctrl.bundle_version
-            if self.state_domain_id is None:
-                self.state_domain_id = ctrl.state_domain_id
+        if e_state is not None:
             if self.controller_mode is None:
-                self.controller_mode = ctrl.controller_mode
+                self.controller_mode = e_state.controller.controller_mode
+            elif e_state.controller.controller_mode and self.controller_mode != e_state.controller.controller_mode:
+                errs.append("controller_mode_conflict")
+            if self.statistical_guarantee_scope is None:
+                self.statistical_guarantee_scope = e_state.validity.statistical_guarantee_scope
 
-        # Backfill from security dict
         if self.security:
-            if self.policy_ref is None:
-                pr = _safe_blob_string(self.security.get("policy_ref"), max_len=256)
-                if pr:
-                    self.policy_ref = pr
-            if self.policyset_ref is None:
-                ps = _safe_blob_string(self.security.get("policyset_ref"), max_len=256)
-                if ps:
-                    self.policyset_ref = ps
-            if self.config_fingerprint is None:
-                fp = _safe_blob_string(self.security.get("cfg_fp"), max_len=256)
-                if fp:
-                    self.config_fingerprint = fp
-            if self.state_domain_id is None:
-                sd = _safe_blob_string(self.security.get("state_domain_id"), max_len=256)
-                if sd:
-                    self.state_domain_id = sd
             if self.statistical_guarantee_scope is None:
                 gs = _safe_blob_string(self.security.get("statistical_guarantee_scope"), max_len=128)
                 if gs:
                     self.statistical_guarantee_scope = gs
+            if self.event_id is None:
+                eid = _safe_blob_string(self.security.get("event_id"), max_len=256)
+                if eid:
+                    self.event_id = eid
+            if self.ledger_stage is None:
+                ls = _safe_label(self.security.get("ledger_stage"), default="")
+                if ls in _ALLOWED_LEDGER_STAGE:
+                    self.ledger_stage = ls
+            if self.outbox_status is None:
+                os_ = _safe_label(self.security.get("outbox_status"), default="")
+                if os_ in _ALLOWED_OUTBOX_STATUS:
+                    self.outbox_status = os_
+            if self.body_digest is None:
+                bd = _safe_blob_string(self.security.get("body_digest"), max_len=256)
+                if bd:
+                    self.body_digest = bd
+            if self.event_digest is None:
+                ed = _safe_blob_string(self.security.get("event_digest"), max_len=256)
+                if ed:
+                    self.event_digest = ed
 
+        if self.pq_signature_required is None:
+            self.pq_signature_required = self.pq_required
+        if self.pq_signature_ok is None:
+            self.pq_signature_ok = self.pq_ok
+
+        # Decision/verdict/action invariants
+        if self.verdict is True and self.action in {"block", "degraded_block"}:
+            errs.append("verdict_action_conflict")
+        if self.verdict is False and self.action in {"allow", "advisory", "degraded_allow"}:
+            errs.append("verdict_action_conflict")
+        if self.route_contract is not None and self.route_contract.required_action == "block" and self.action == "allow":
+            errs.append("route_contract_action_conflict")
+        if self.route_contract is not None and not self.route_contract.integrity_ok:
+            errs.extend(self.route_contract.integrity_errors)
+
+        if self.receipt_required is True:
+            self.receipt_issued = bool(self.receipt is not None or self.receipt_ref or self.receipt_body)
+        if self.attestation_required is True and self.attestation_issued is None:
+            self.attestation_issued = bool(self.attestation_ref or (self.receipt and self.receipt.attestation_id))
+        if self.ledger_required is True and self.ledger_committed is None:
+            self.ledger_committed = self.ledger_stage in {"committed", "outboxed"}
+
+        self.evidence_identity = self._build_evidence_identity()
+        self.artifacts = self._build_artifacts()
+
+        self.deprecated_fields_present = sorted(set(deprecated))
+        self.integrity_errors = sorted(set(errs))
+        self.integrity_ok = not self.integrity_errors
         return self
+
+    def assert_integrity(self) -> None:
+        if not self.integrity_ok:
+            raise ValueError(f"diagnose integrity failed: {','.join(self.integrity_errors)}")
+
+    def to_public_dict(self, *, strict: bool = True, include_receipt: bool = False) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        out = {
+            "surface_version": _PUBLIC_SURFACE_VERSION,
+            "verdict": self.verdict,
+            "decision": self.decision,
+            "action": self.action,
+            "cause": self.cause,
+            "score": self.score,
+            "threshold": self.threshold,
+            "budget_remaining": self.budget_remaining,
+            "step": self.step,
+            "e_value": self.e_value,
+            "alpha_alloc": self.alpha_alloc,
+            "alpha_spent": self.alpha_spent,
+            "trust_zone": self.trust_zone,
+            "route_profile": self.route_profile,
+            "threat_kind": self.threat_kind,
+            "threat_confidence": self.threat_confidence,
+            "pq_signature_required": self.pq_signature_required,
+            "pq_signature_ok": self.pq_signature_ok,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "config_fingerprint": self.config_fingerprint,
+            "bundle_version": self.bundle_version,
+            "controller_mode": self.controller_mode,
+            "statistical_guarantee_scope": self.statistical_guarantee_scope,
+            "route_contract": self.route_contract.model_dump(exclude_none=True) if self.route_contract else None,
+            "evidence_identity": self.evidence_identity.model_dump(exclude_none=True) if self.evidence_identity else None,
+            "artifacts": self.artifacts.model_dump(exclude_none=True) if self.artifacts else None,
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+            "compat_unknown_fields_count": self.compat_unknown_fields_count,
+            "compat_unknown_fields_sample": list(self.compat_unknown_fields_sample),
+        }
+        if include_receipt and self.receipt is not None:
+            out["receipt"] = self.receipt.to_public_dict(strict=False)
+        return out
+
+    def to_audit_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        return {
+            "surface_version": _AUDIT_SURFACE_VERSION,
+            "verdict": self.verdict,
+            "decision": self.decision,
+            "action": self.action,
+            "cause": self.cause,
+            "score": self.score,
+            "threshold": self.threshold,
+            "budget_remaining": self.budget_remaining,
+            "step": self.step,
+            "e_value": self.e_value,
+            "alpha_alloc": self.alpha_alloc,
+            "alpha_spent": self.alpha_spent,
+            "components": dict(self.components),
+            "route": self.route.to_audit_dict(strict=False) if self.route else None,
+            "e_state": self.e_state.model_dump(exclude_none=True) if self.e_state else None,
+            "receipt": self.receipt.to_audit_dict(strict=False) if self.receipt else None,
+            "security": dict(self.security),
+            "evidence_identity": self.evidence_identity.model_dump(exclude_none=True) if self.evidence_identity else None,
+            "artifacts": self.artifacts.model_dump(exclude_none=True) if self.artifacts else None,
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+            "normalization_warnings": list(self.normalization_warnings),
+            "compat_warnings": list(self.compat_warnings),
+            "deprecated_fields_present": list(self.deprecated_fields_present),
+        }
+
+    def to_receipt_dict(self, *, strict: bool = True) -> Dict[str, Any]:
+        if strict:
+            self.assert_integrity()
+        out: Dict[str, Any] = {
+            "surface_version": _RECEIPT_SURFACE_VERSION,
+            "verdict": self.verdict,
+            "decision": self.decision,
+            "action": self.action,
+            "score": self.score,
+            "threshold": self.threshold,
+            "budget_remaining": self.budget_remaining,
+            "step": self.step,
+            "e_value": self.e_value,
+            "alpha_alloc": self.alpha_alloc,
+            "alpha_spent": self.alpha_spent,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "config_fingerprint": self.config_fingerprint,
+            "bundle_version": self.bundle_version,
+            "controller_mode": self.controller_mode,
+            "statistical_guarantee_scope": self.statistical_guarantee_scope,
+            "evidence_identity": self.evidence_identity.model_dump(exclude_none=True) if self.evidence_identity else None,
+            "route_contract": self.route_contract.model_dump(exclude_none=True) if self.route_contract else None,
+            "artifacts": self.artifacts.model_dump(exclude_none=True) if self.artifacts else None,
+        }
+        if self.route is not None:
+            out["route"] = self.route.to_receipt_dict(strict=False)
+        if self.e_state is not None:
+            out["e_state"] = self.e_state.model_dump(exclude_none=True)
+        if self.receipt is not None:
+            out["receipt"] = self.receipt.to_public_dict(strict=False)
+        return out
