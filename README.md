@@ -101,7 +101,9 @@ curl -i \
   }'
 
 ### 4. Inspect the runtime contract
+
 A successful TCD response is not just a payload. It can also attach stable runtime identifiers, for example:
+
 - `X-Request-Id`
 - `X-TCD-Event-Id`
 - `X-TCD-Http-Version`
@@ -109,16 +111,22 @@ A successful TCD response is not just a payload. It can also attach stable runti
 - `X-TCD-Bundle-Version`
 - `X-TCD-Decision-Id`
 - `X-TCD-Route-Plan-Id`
+
 These are important because they let operators and downstream systems correlate the live request with policy/config identity, decision identity, and route-plan identity.
+
 ### 5. Turn on the evidence path
+
 For a meaningful deployment, wire in:
+
 - attestation
 - verification
 - governed storage
 - ledger and/or local audit
 - admin control-plane endpoints
 - telemetry and metrics
+
 If you want to adopt TCD incrementally, start with:
+
 1. ingress + decision
 2. route/security orchestration
 3. receipt/verify/storage
