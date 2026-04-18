@@ -163,7 +163,7 @@ At a high level:
 
 ⸻
 
-Evidence model
+## Evidence model
 
 TCD does not treat “a receipt” as one flat object.
 
