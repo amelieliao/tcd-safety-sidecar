@@ -102,6 +102,7 @@ curl -i \
       "model_id": "model-a"
     }
   }'
+```
 
 ### 4. Inspect the runtime contract
 
