@@ -100,45 +100,36 @@ curl -i \
     }
   }'
 
-4. Inspect the runtime contract
+把你粘贴的这部分直接替换成下面这版就行，前面的内容不用动。
 
+### 4. Inspect the runtime contract
 A successful TCD response is not just a payload. It can also attach stable runtime identifiers, for example:
-
-* X-Request-Id
-* X-TCD-Event-Id
-* X-TCD-Http-Version
-* X-TCD-Config-Fingerprint
-* X-TCD-Bundle-Version
-* X-TCD-Decision-Id
-* X-TCD-Route-Plan-Id
-
+- `X-Request-Id`
+- `X-TCD-Event-Id`
+- `X-TCD-Http-Version`
+- `X-TCD-Config-Fingerprint`
+- `X-TCD-Bundle-Version`
+- `X-TCD-Decision-Id`
+- `X-TCD-Route-Plan-Id`
 These are important because they let operators and downstream systems correlate the live request with policy/config identity, decision identity, and route-plan identity.
-
-5. Turn on the evidence path
-
+### 5. Turn on the evidence path
 For a meaningful deployment, wire in:
-
-* attestation
-* verification
-* governed storage
-* ledger and/or local audit
-* admin control-plane endpoints
-* telemetry and metrics
-
+- attestation
+- verification
+- governed storage
+- ledger and/or local audit
+- admin control-plane endpoints
+- telemetry and metrics
 If you want to adopt TCD incrementally, start with:
-
 1. ingress + decision
 2. route/security orchestration
 3. receipt/verify/storage
 4. admin mutation governance
 5. ledger/auditor/trust graph
-
-⸻
-
-Runtime model
-
+---
+## Runtime model
 A typical inference path through TCD looks like this:
-
+```text
 client
   -> HTTP/gRPC surface
   -> request / auth / security middleware
