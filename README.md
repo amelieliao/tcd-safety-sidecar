@@ -100,8 +100,6 @@ curl -i \
     }
   }'
 
-把你粘贴的这部分直接替换成下面这版就行，前面的内容不用动。
-
 ### 4. Inspect the runtime contract
 A successful TCD response is not just a payload. It can also attach stable runtime identifiers, for example:
 - `X-Request-Id`
