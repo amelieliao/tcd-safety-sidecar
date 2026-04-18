@@ -1,66 +1,143 @@
-```text
-TCD
+# TCD
+> **Trusted Control Plane for Governed, Quantified, and Verifiable AI Inference**
+TCD is an infrastructure-native control plane for AI inference.
+It sits beside model-serving runtimes, intercepts inference requests before execution, binds each request to identity and policy context, evaluates runtime risk and statistical budget state, produces an explicit decision, and emits verifiable evidence that can be stored, replayed, audited, and independently verified.
+In practical terms, **TCD turns an LLM call from an opaque application-side operation into a governed systems event**.
+---
+## What TCD is
+TCD is a **runtime control plane** for inference systems.
+It is designed for teams that need to:
+- govern inference behavior before model execution
+- bind requests to stable runtime identity
+- combine policy, routing, risk, and statistical budget state in one decision surface
+- issue receipts and evidence that survive the request
+- operate a control plane that is itself governed and auditable
+TCD is not implemented as a thin SDK hook. It is built as an infrastructure-native sidecar/gateway/control-plane layer that can sit next to model-serving runtimes.
+---
+## What TCD is not
+TCD is **not**:
+- a model provider
+- a prompt archive
+- a generic event bus
+- a generic SIEM replacement
+- a globally consistent consensus system for receipts
+- a one-file AI firewall
+- a pure logging wrapper
+- a thin gateway plugin with post-hoc safety checks
+If all you need is a lightweight content filter or a single middleware that blocks obviously bad prompts, TCD is probably more system than you need.
+---
+## Why teams use TCD
+Most production AI stacks still treat inference as a black-box API call.
+The application decides what to send, the model returns output, and whatever “safety” or “governance” exists is often split across SDK hooks, logs, ad hoc middleware, and post hoc review.
+That leaves recurring gaps:
+- no unified runtime identity for requests, sessions, chains, and subjects
+- no single place where policy, risk, and statistical budget meet
+- no evidence object that outlives the request
+- no governed control plane for mutations and runtime actions
+- no durable boundary between “decision made” and “decision can be proven”
+TCD is built to close those gaps.
+---
+## When to use TCD
+TCD is a good fit when you need one or more of the following:
+- **Multi-tenant or multi-team inference infrastructure**
+- **Regulated or audit-heavy environments**
+- **Inference-time routing and enforcement**, not just offline review
+- **Per-stream statistical controls** rather than single-request thresholding
+- **Receipts, verification, replay, and evidence storage**
+- **Governed runtime mutations** such as reloads, policy updates, or patch actions
+- **A separate control plane** instead of embedding governance logic inside every application
+Examples:
+- internal AI platforms serving multiple products or teams
+- high-value customer workflows
+- government or large financial environments
+- AI systems where route, action, and evidence must be explainable after the fact
+---
+## When not to use TCD
+TCD is probably the wrong tool if:
+- you only need a lightweight prompt filter
+- you do not need a separate control plane
+- you do not care about receipts, verification, or replay
+- you want globally strong distributed guarantees without providing shared state or an external coordinator
+- you are looking for a hosted model platform rather than an inference governance layer
+---
+## Deployment modes
+TCD can be used in more than one way.
+| Mode | What it looks like | Best for |
+|---|---|---|
+| **Sidecar mode** | One TCD instance sits next to one model-serving runtime or workload | Single service ownership, local strong control semantics |
+| **Shared gateway mode** | One TCD cluster fronts multiple model runtimes | Platform teams, shared routing and governance |
+| **Control-plane-first mode** | You keep your existing serving path and introduce TCD for admin, verify, storage, and policy/governance first | Incremental adoption |
+| **Verify / audit mode** | Use TCD primarily for verify, receipt ingest, storage, ledger, and audit workflows | Audit-first deployments or staged rollout |
+| **Hybrid mode** | Use HTTP/gRPC inference surfaces in some paths and receipt/verify/storage/admin in others | Large, mixed estates |
+---
+## 5-minute quickstart
+This section is intentionally practical: the goal is to tell a reader how to evaluate TCD quickly.
+### 1. Choose a deployment mode
+Start with one:
+- sidecar
+- shared gateway
+- control-plane-first
+- verify / audit only
+If you are unsure, start with **sidecar mode** for one protected inference path.
+### 2. Bring up an inference-facing surface
+TCD exposes both:
+- an HTTP inference surface
+- a gRPC inference surface
+Use whichever matches your serving stack.
+### 3. Send a request through TCD
+A minimal HTTP-style example:
+```bash
+curl -i \
+  -X POST http://localhost:8080/diagnose \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-1' \
+  -d '{
+    "input_kind": "request",
+    "input_json": {
+      "tenant": "demo",
+      "route": "/chat",
+      "model_id": "model-a"
+    }
+  }'
 
-Trusted Control Plane for Governed, Quantified, and Verifiable AI Inference
+4. Inspect the runtime contract
 
-TCD is an infrastructure-native control plane for AI inference. It sits beside model-serving runtimes, intercepts each inference request before execution, binds it to identity and policy context, evaluates runtime risk and statistical budget state, produces a structured decision, and emits verifiable evidence that can be stored, replayed, audited, and independently verified. In practical terms: TCD turns an LLM call from an opaque application-side operation into a governed systems event.  ￼  ￼  ￼
+A successful TCD response is not just a payload. It can also attach stable runtime identifiers, for example:
+
+* X-Request-Id
+* X-TCD-Event-Id
+* X-TCD-Http-Version
+* X-TCD-Config-Fingerprint
+* X-TCD-Bundle-Version
+* X-TCD-Decision-Id
+* X-TCD-Route-Plan-Id
+
+These are important because they let operators and downstream systems correlate the live request with policy/config identity, decision identity, and route-plan identity.
+
+5. Turn on the evidence path
+
+For a meaningful deployment, wire in:
+
+* attestation
+* verification
+* governed storage
+* ledger and/or local audit
+* admin control-plane endpoints
+* telemetry and metrics
+
+If you want to adopt TCD incrementally, start with:
+
+1. ingress + decision
+2. route/security orchestration
+3. receipt/verify/storage
+4. admin mutation governance
+5. ledger/auditor/trust graph
 
 ⸻
 
-Why TCD exists
+Runtime model
 
-Most production AI stacks still treat inference as a black-box API call. The application decides what to send, the model returns output, and whatever “safety” or “governance” exists is often split across SDK hooks, logs, ad hoc middleware, and post hoc review. That leaves five recurring gaps:
-
-* no unified runtime identity for requests, sessions, chains, and subjects,
-* no single place where policy, risk, and statistical budget meet,
-* no evidence object that outlives the request,
-* no governed control plane for mutations and runtime actions,
-* no durable boundary between “decision made” and “decision can be proven.”  ￼  ￼  ￼  ￼
-
-TCD is built to close those gaps. It is not a prompt filter, not a logging wrapper, and not a thin gateway plugin. It is a control plane that governs inference-time behavior and the evidence produced by that behavior.  ￼  ￼  ￼
-
-⸻
-
-What TCD does
-
-At a high level, TCD provides six capabilities.
-
-1. Ingress governance
-    Request, session, request-chain, trusted-upstream, XFF, edge security, and edge rate-limit semantics are established before model execution begins.  ￼  ￼
-2. Runtime risk interpretation
-    Detector outputs, calibrated p-values, multivariate signals, SLO pressure, and policy state are turned into explicit actions and reason codes rather than ad hoc branching.  ￼  ￼  ￼
-3. Always-valid statistical control
-    Cross-request evidence processes are maintained per stream, with explicit guarantee scope, controller mode, and degradation semantics.  ￼
-4. Route and security orchestration
-    Strategy routing and security routing produce route contracts, enforcement modes, and required actions that can be enforced, audited, and reasoned about independently from the model implementation.  ￼  ￼
-5. Receipt and evidence generation
-    Decisions, controller state, route identity, artifacts, and attestation metadata are normalized into structured evidence objects suitable for receipts, verification, storage, and audit.   ￼  ￼
-6. Durable governance and audit
-    Storage, ledger, local audit, and chain auditing provide idempotent persistence, anti-fork receipt chains, replay-safe event handling, and continuous verification.   ￼  ￼  ￼
-
-⸻
-
-Architecture
-
-TCD is easiest to understand as three cooperating planes.
-
-1. Inference Data Plane
-
-This is the path that sees live inference traffic. It handles request identity, trusted transport context, authentication, edge security, edge rate limiting, and the transport adapters for HTTP and gRPC. Its job is not to make the final governance decision; its job is to turn an incoming request into a well-formed, budgeted, identity-bearing inference event.  ￼  ￼  ￼  ￼  ￼
-
-2. Decision & Policy Plane
-
-This is where detection, calibration, multivariate aggregation, policy binding, always-valid evidence processes, route planning, and security orchestration meet. It produces the runtime decision surface: action, reason, enforcement mode, route contract, statistical state, and decision identity.  ￼  ￼  ￼  ￼  ￼  ￼
-
-3. Governance & Evidence Plane
-
-This is where TCD becomes more than “runtime middleware.” The governance and evidence plane includes the admin API, action agent, patch runtime, attestation, crypto envelope, schemas, signals, storage, ledger, audit log, chain auditor, and trust graph. It governs control-plane changes and it gives every important inference or mutation path a durable, verifiable afterlife.  ￼  ￼  ￼  ￼  ￼   ￼  ￼
-
-⸻
-
-Request lifecycle
-
-A typical inference request through TCD looks like this:
+A typical inference path through TCD looks like this:
 
 client
   -> HTTP/gRPC surface
@@ -73,164 +150,301 @@ client
   -> storage + ledger + audit
   -> response headers / receipt refs / telemetry
 
-More concretely:
+At a high level:
 
-1. The HTTP or gRPC surface accepts a request and enforces hard limits on body size, headers, metadata, JSON depth, and endpoint budgets. It attaches request and event identifiers plus config/bundle fingerprints to the response path.  ￼  ￼
-2. Middleware establishes request context, session semantics, trusted-upstream handling, chain propagation, and edge fairness/DoS controls. Authentication normalizes principal identity and replay-resistant auth state.  ￼  ￼  ￼
-3. Detector, calibration, and multivariate analysis produce risk signals and bounded, content-agnostic evidence fragments.  ￼  ￼  ￼
-4. DecisionEngine interprets those signals under explicit policy and data-quality semantics, while AlwaysValidRiskController updates cross-request statistical state for the relevant stream.  ￼  ￼
-5. StrategyRouter and SecurityRouter convert the decision surface into a route contract and required action, including fail-closed or degraded behavior where needed.  ￼  ￼
-6. schemas.py and signals.py unify route, controller, receipt, and security fragments into evidence-oriented views.   ￼
-7. attest.py, crypto.py, storage.py, ledger.py, audit.py, and auditor.py issue, bind, persist, and re-verify the resulting evidence.  ￼  ￼   ￼  ￼  ￼
-
-⸻
-
-The evidence model
-
-TCD does not treat “a receipt” as a single flat object. The repository separates evidence into layers:
-
-* Decision identity from decision_engine.py
-    policy_digest, config_hash, decision_id, reason_code, and canonicalized snapshots anchor the decision itself.  ￼
-* Statistical evidence state from risk_av.py (and the earlier receipt_v2.py path)
-    e_state, guarantee scope, controller mode, stream identity status, and backend degradation state anchor the cross-request statistical story.  ￼
-* Unified evidence views from schemas.py and signals.py
-    TCD aligns public, audit, receipt, and verification views and prevents silent cross-object inconsistencies.   ￼
-* Attestation and crypto envelope from attest.py and crypto.py
-    Canonical body, head, integrity hash, message versioning, policy digest binding, and key/registry governance anchor authenticity and integrity.  ￼  ￼
-* Durable persistence and replay semantics from storage.py, ledger.py, audit.py, and auditor.py
-    These modules provide explicit conflict, anti-fork chains, idempotent event handling, local trust anchors, and ongoing verification.   ￼  ￼  ￼
+1. the transport surface accepts and bounds the request
+2. middleware establishes request/session/chain/trust context
+3. detector, calibration, and multivariate layers produce risk signals
+4. decision and always-valid control produce action and statistical state
+5. routing and security orchestration produce a route contract and required action
+6. schemas and signals normalize the evidence surface
+7. attest, crypto, storage, ledger, and audit make that evidence durable and verifiable
 
 ⸻
 
-Operational model
+Evidence model
 
-TCD’s operational semantics are explicit by design.
+TCD does not treat “a receipt” as one flat object.
 
-* Policies and config are process-local atomic swaps unless an external coordinator is introduced. Multi-instance propagation is best-effort.  ￼
-* Runtime controllers such as RateLimiter and AlwaysValidRiskController are strong local control primitives, but they should be described as local or local-best-effort unless backed by stronger shared state.  ￼  ￼
-* Receipt and evidence storage use idempotent boundary semantics with explicit conflict rather than silent overwrite. Ordering is storage-view unless a stronger backend contract is supplied.  ￼
-* Ledger semantics are durable and anti-fork within store constraints, but they are not a global consensus system. The ledger is best described as strong local durability plus replay- and idempotency-safe event handling.  ￼
+The evidence model is layered:
 
-That explicitness matters. TCD is opinionated about governance, but it does not hide system boundaries behind vague “enterprise-grade” language.
+Decision identity
+
+From decision_engine.py:
+
+* policy_digest
+* config_hash
+* decision_id
+* reason_code
+* canonicalized snapshot fields
+
+These anchor the decision itself.
+
+Statistical evidence state
+
+From risk_av.py and the compatibility path in receipt_v2.py:
+
+* e_state
+* guarantee scope
+* controller mode
+* stream identity status
+* backend degradation state
+
+These anchor the cross-request statistical story.
+
+Unified evidence views
+
+From schemas.py and signals.py:
+
+* public view
+* audit view
+* receipt view
+* verification view
+
+These prevent silent cross-object inconsistency and align evidence identity, artifact refs, route contracts, and receipt fragments.
+
+Attestation and crypto envelope
+
+From attest.py and crypto.py:
+
+* canonical body
+* head
+* integrity hash
+* message versioning
+* policy digest binding
+* key and registry governance
+
+These anchor authenticity and integrity.
+
+Durable persistence and replay semantics
+
+From storage.py, ledger.py, audit.py, and auditor.py:
+
+* explicit conflict
+* anti-fork chain semantics
+* idempotent event handling
+* local trust anchors
+* continuous verification
+
+These give evidence a durable afterlife.
 
 ⸻
 
-Repository map
+Integration surfaces
 
-The repository naturally groups into a few subsystems. Every file below is part of the runtime/control/evidence story.
+From an operator perspective, TCD is not a single endpoint. It is a set of cooperating surfaces.
 
-Transport, ingress, and request governance
+Inference-facing
 
-* service_http.py — hardened HTTP inference surface with request envelopes, response headers, diagnose/verify endpoints, and receipt issuance hooks.
-* service_grpc.py — gRPC transport shim with bounded metadata/payload handling, authz, verify isolation, and evidence prepare/commit flow.
-* api_v1.py — /v1/diagnose API surface with end-to-end deadlines, concurrency gates, outbox-aware evidence flow, and structured request-end logging.
-* middleware.py — request context, session/chain semantics, edge rate limiting, metrics middleware, plus pure ASGI variants.
-* middleware_request.py — higher-level request governance: bounded body read, auth-first flow, policy bind, subject-aware limits, idempotency, and classification derivation.
-* middleware_security.py — edge security middleware for IP controls, CORS/origin policy, browser security headers, and structured security events.
-* auth.py — pluggable authentication and identity normalization for HMAC, JWT/JWKS, bearer, and mTLS/XFCC.  ￼  ￼  ￼  ￼  ￼  ￼  ￼
+* HTTP surface
+* gRPC surface
+* ingress/request/auth/security middleware
+* detector, calibration, multivariate, decision, route, security orchestration
 
-Detection, calibration, and decisioning
+Evidence-facing
 
-* detector.py — bounded, pluggable detector with monotone calibration and conformal fallback.
-* calibration.py — predictable calibration core that turns scores into conservative p-values using previous-block-only state.
-* multivariate.py — multivariate risk detector with immutable policy bundle semantics and bounded snapshots.
-* decision_engine.py — explicit risk interpreter with data-quality policy, threshold normalization, and receipt-oriented decision identities.
-* risk_av.py — always-valid statistical controller platform with guarantee scopes, controller modes, and stream-level evidence state.
-* receipt_v2.py — compatibility-oriented, receipt-first statistical state builder used by existing service surfaces.  ￼  ￼  ￼  ￼  ￼
+* schemas
+* signals
+* attestation
+* crypto
+* verification
+* storage
+* ledger
+* audit
+* auditor
 
-Policy, rate, route, and security orchestration
+Control-plane-facing
 
-* policies.py — policy compilation and binding with rich match context, canonical rule/set hashing, and bounded overrides.
-* ratelimit.py — compiled-bundle rate limiting with typed keys, fixed-point accounting, dual clocks, and event identity.
-* routing.py — strategy router that turns signals into route contracts, required actions, and route-plan identity.
-* security_router.py — content-agnostic orchestration layer that combines policy, rate, signals, route contracts, attest/ledger requirements, and outbox fallbacks.
-* rewrite_engine.py — semi-automatic rewrite proposal engine that generates bounded patch proposals, never mutates the repository directly, and annotates origin/risk for higher-level control planes.  ￼  ￼  ￼  ￼  ￼
+* admin HTTP surface
+* policy and config reloads
+* verify / receipt ingest
+* health / readiness / runtime introspection
+* action agent
+* patch runtime
 
-Governance execution and control-plane actions
+⸻
 
-* agent.py — TrustAgent execution shell with gates, bounded executors, circuit breakers, prepare/commit semantics, outbox support, and side-effect uncertainty handling.
-* patch_runtime.py — governed runtime patch pipeline with artifact digests, approvals, canary constraints, and receipt/telemetry metadata controls.
-* admin_http.py — admin-only HTTP surface for policies, verification, receipt ingest/access, health, readiness, runtime status, and explicit consistency semantics.  ￼  ￼  ￼
+Guarantees vs non-guarantees
 
-Evidence, verification, and persistence
+This section is intentionally explicit.
 
-* schemas.py — unified public, audit, receipt, and verification views, including DiagnoseIn/DiagnoseOut.
-* signals.py — governed signal/evidence bus used to move route, security, receipt, ledger, and lifecycle signals without leaking raw content.
-* attest.py — structured attestation generator with deterministic canonicalization and verifier-friendly records.
-* crypto.py — cryptographic control-plane substrate with message versions, digest binding, key registry governance, and envelope signing/verification.
-* verify.py — receipt and chain verification surface with strict schema and budget enforcement.
-* storage.py — governed persistence boundary for receipts and wealth state, with explicit conflict, anti-fork semantics, and compatibility shims.
-* ledger.py — durable wealth and receipt-chain substrate with idempotent events and anti-fork constraints.
-* audit.py — local append-only audit trust anchor.
-* auditor.py — one-shot and periodic chain auditor with anomaly accounting and verification isolation.   ￼  ￼  ￼  ￼   ￼  ￼  ￼
+Strong local guarantees available now
 
-Observability, configuration, and foundations
+TCD already provides strong local or single-process / single-node semantics for:
 
-* exporter.py — governed Prometheus exporter with schema-driven metric surface, label governance, privacy modes, and cardinality hard-stops.
-* otel_exporter.py — governed OTEL-style exporter with deep sanitization, async delivery, and bundle-aware fingerprinting.
-* telemetry_gpu.py — content-agnostic GPU telemetry boundary that emits bounded hardware/runtime evidence.
-* logging.py — structured logging surface with governance-aware redaction, rate limiting, and stable envelope semantics.
-* config.py — settings compiler/governor with effective vs provenance hashing, signature verification, reload semantics, and break-glass.
-* kv.py — canonical key/value hashing and deterministic-ID substrate used across receipts, chains, events, and evidence envelopes.
-* utils.py — shared sanitization and bounded JSON/meta helpers for content-agnostic output paths.
-* trust_graph.py — relationship layer for subjects, evidence, edges, trust state, and audit/telemetry projections.  ￼  ￼  ￼  ￼  ￼  ￼  ￼  ￼
+* request/session/chain identity establishment
+* bounded ingress behavior
+* explicit decision identities
+* explicit route and security contracts
+* verify-first ingest
+* explicit storage conflict instead of silent overwrite
+* anti-fork receipt-chain constraints within store boundaries
+* local audit anchoring
+* continuous chain auditing
+
+What is local-best-effort unless you add stronger infrastructure
+
+Without external coordination or shared state, do not describe the following as globally strong guarantees:
+
+* multi-instance config/policy propagation
+* globally ordered receipt streams
+* globally shared statistical budget state
+* globally synchronized route decisions
+* distributed consensus semantics for ledger ordering
+
+Control-plane semantics to state explicitly
+
+TCD already makes several operational semantics explicit:
+
+* Policies/config: process-local atomic swap
+* Multi-instance propagation: best-effort unless externally coordinated
+* Receipt store: idempotent writes at the boundary; overwrite yields explicit conflict
+* Receipt ordering: storage-view unless the backend guarantees more
+* Ledger: at-least-once with deterministic event IDs for dedupe
+* Readiness: separate from liveness; readiness can depend on strict-mode hard dependencies and breaker state
+
+Crypto boundary honesty
+
+TCD already defines a governed cryptographic control plane, but you should not market it as a fully production-complete PQ stack unless you specify the exact backend, key-management environment, and deployment profile in use.
 
 ⸻
 
 Design principles
 
-TCD follows a few explicit design rules that show up across the repository.
+TCD follows a few strict design rules across the repository.
 
 Content-agnostic by default
 
-Evidence, storage, signals, telemetry, and most runtime outputs are designed to avoid carrying raw prompts, completions, request bodies, response bodies, cookies, or authorization material. The system prefers structured identifiers, bounded metadata, artifact references, and digests.  ￼   ￼  ￼
+Evidence, storage, signals, telemetry, and most runtime outputs are designed to avoid carrying raw prompts, completions, request bodies, response bodies, cookies, or authorization material.
+
+TCD prefers:
+
+* structured identifiers
+* bounded metadata
+* artifact references
+* digests
 
 Deterministic and reproducible
 
-Canonical JSON, stable digests, message versions, bounded normalization, and stable event/decision/route identifiers are treated as system primitives, not convenience features.  ￼  ￼  ￼
+Canonical JSON, stable digests, message versions, bounded normalization, and stable event/decision/route identifiers are treated as system primitives, not convenience features.
 
 Explicit conflict over silent overwrite
 
-Storage, admin ingest, and ledger layers consistently prefer explicit conflict semantics and idempotent dedupe over hidden replacement or last-write-wins behavior.  ￼   ￼
+Storage, admin ingest, and ledger layers prefer:
+
+* explicit conflict
+* idempotent dedupe
+* anti-fork semantics
+
+over hidden replacement or last-write-wins behavior.
 
 Governance over convenience
 
-Strict modes, scope enforcement, approvals, change tickets, break-glass, outbox fallback, and prepare/commit semantics appear repeatedly because TCD optimizes for governance and verifiability, not just API ergonomics.  ￼  ￼  ￼  ￼
+Strict modes, scope enforcement, approvals, change tickets, break-glass, outbox fallback, and prepare/commit semantics appear repeatedly because TCD optimizes for governance and verifiability, not just API ergonomics.
 
 Boundedness everywhere
 
-Untrusted input is always expected. Body size, JSON depth, cardinality, evidence node counts, string lengths, queue sizes, stream counts, chain windows, and patch segment sizes are bounded throughout the repo.  ￼  ￼  ￼  ￼  ￼  ￼
+Untrusted input is always expected. Body size, JSON depth, cardinality, evidence node counts, string lengths, queue sizes, stream counts, chain windows, and patch segment sizes are bounded throughout the system.
 
 ⸻
 
-What TCD is not
+Repository guide
 
-TCD is not:
+This is the short root-level map. It highlights the modules most readers actually need first.
 
-* a model provider,
-* a prompt archive,
-* a generic event bus,
-* a generic SIEM replacement,
-* a consensus system for globally ordered receipts,
-* a one-file “AI firewall.”
+Transport and ingress
 
-signals.py explicitly says it is not a generic event bus; service_grpc.py explicitly says it is a transport/control-plane adapter, not a policy engine; storage.py explicitly says it is not a casual helper layer; and the white paper positions the system as a control plane around inference events, not an SDK-bound application feature.  ￼  ￼   ￼
+* service_http.py — HTTP inference surface
+* service_grpc.py — gRPC inference surface
+* middleware.py — request/session/chain context + edge rate limit + metrics
+* middleware_request.py — higher-level request governance
+* middleware_security.py — edge security controls
+* auth.py — authentication and identity normalization
+
+Decision and policy
+
+* detector.py — bounded detector runtime
+* calibration.py — score-to-p calibration core
+* multivariate.py — multivariate risk detector
+* decision_engine.py — explicit decision interpreter
+* risk_av.py — always-valid statistical controller
+* routing.py — strategy router
+* security_router.py — policy/risk/route/evidence orchestration
+* policies.py — policy compilation and binding
+* ratelimit.py — compiled-bundle runtime rate limiting
+
+Evidence and persistence
+
+* schemas.py — unified public/audit/receipt/verification views
+* signals.py — governed signal/evidence bus
+* attest.py — structured attestation generator
+* crypto.py — crypto control-plane substrate
+* verify.py — receipt and chain verification
+* storage.py — governed persistence boundary
+* ledger.py — durable wealth + receipt-chain substrate
+* audit.py — local append-only audit trust anchor
+* auditor.py — chain auditor
+
+Governance execution
+
+* admin_http.py — admin-only HTTP control plane
+* agent.py — TrustAgent execution shell
+* patch_runtime.py — governed runtime patch pipeline
+* rewrite_engine.py — bounded rewrite proposal engine
+* trust_graph.py — relationship and trust-state layer
+
+Observability and foundations
+
+* exporter.py — governed Prometheus exporter
+* otel_exporter.py — governed OTEL exporter
+* telemetry_gpu.py — governed GPU telemetry boundary
+* logging.py — structured logging surface
+* config.py — settings compiler / governor
+* kv.py — canonical key/value hashing and deterministic IDs
+* utils.py — shared sanitization and bounded JSON/meta helpers
 
 ⸻
 
-Current status and honest boundaries
+Current maturity
 
-The current repository already proves a lot, but it is important to describe it accurately.
+A useful way to read the repository is by maturity layer.
 
-* TCD already has strong runtime control, structured evidence generation, and durable local persistence boundaries.  ￼   ￼
-* Runtime controllers such as RateLimiter and AlwaysValidRiskController should still be described as local or local-best-effort primitives unless backed by stronger shared state.  ￼  ￼
-* The repository already defines a governed cryptographic control plane, but you should not casually market it as a fully production-complete PQ stack without specifying the exact backend and key-management environment in use.  ￼
+Available now
 
-That honesty is part of the design philosophy. TCD is explicit about system boundaries because governance without accurate semantics is theater.
+* strong ingress governance
+* auth normalization
+* bounded detector/calibration/decision flow
+* always-valid controller with structured state
+* strategy routing and security orchestration
+* unified evidence views
+* attestation and verification paths
+* governed storage + durable ledger + local audit + chain auditor
+* admin control plane with explicit DoD semantics
+
+Strong local semantics
+
+* request and decision identity
+* per-process or per-node controller state
+* local durable audit and ledger paths
+* explicit storage conflicts
+* anti-fork chain checks within store boundaries
+
+Requires external coordination or shared state for stronger distributed guarantees
+
+* globally synchronized config/policy rollout
+* globally shared budget/controller state
+* globally ordered receipt semantics
+* stronger distributed lock/coordinator semantics
+* hardware-backed or externally governed signing environments
+
+Compatibility / transitional paths
+
+* receipt_v2.py remains relevant as a compatibility-oriented statistical receipt builder
+* richer evidence and persistence paths increasingly center on risk_av.py, schemas.py, signals.py, and storage.py
 
 ⸻
 
 In one sentence
 
-TCD turns inference from an opaque application call into a governed systems event with identity, policy binding, statistical budget state, route contracts, verifiable evidence, and durable auditability.  ￼  ￼
-```
+TCD turns inference from an opaque application call into a governed systems event with identity, policy binding, statistical budget state, route contracts, verifiable evidence, and durable auditability.
+
