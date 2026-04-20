@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import base64
 import hashlib
 import hmac
@@ -12,10 +13,13 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple, Literal
+
 try:  # optional, explicit use only when selected by config
     from .crypto import Blake3Hash
 except ImportError:  # pragma: no cover
     Blake3Hash = None  # type: ignore[assignment]
+
+
 __all__ = [
     "StreamIdentityPolicy",
     "StreamIdentityResult",
@@ -38,27 +42,34 @@ __all__ = [
     "InMemoryEProcessStateBackend",
     "AlwaysValidRiskController",
 ]
+
 # ---------------------------------------------------------------------------
 # Constants / schemas / enums
 # ---------------------------------------------------------------------------
+
 Profile = Literal["DEV", "PROD", "FINREG", "LOCKDOWN"]
+
 # backward-compatible: "fallback" will be normalized to "use_last_known_good"
 OnConfigError = Literal["use_last_known_good", "fail_closed", "raise", "fallback"]
+
 DecisionMode = Literal[
     "strict_only",
     "controller_only",
     "prefer_current_strict",
     "dual_track",
 ]
+
 LegacyDecisionSource = Literal[
     "controller",
     "strict",
     "strict_if_available_else_controller",
 ]
+
 ScoreToPMode = Literal["one_minus_score", "sigmoid_tail", "exp_tail"]
 NewStreamPolicy = Literal["deny_new_when_full", "evict_lru"]
 OnStateExhaustion = Literal["allow", "deny"]
 StreamHashAlgorithm = Literal["hmac_sha256", "blake2b", "blake3"]
+
 IdentityMode = Literal[
     "require_explicit",
     "derive_from_ctx",
@@ -66,12 +77,14 @@ IdentityMode = Literal[
     "dev_fallback_default",
 ]
 IdentityErrorMode = Literal["fail_closed", "allow_degraded", "use_default"]
+
 GuaranteeScope = Literal[
     "strict_direct_p",
     "predictable_calibrated_p",
     "heuristic_only",
     "none",
 ]
+
 ControllerMode = Literal[
     "normal",
     "last_known_good",
@@ -80,16 +93,20 @@ ControllerMode = Literal[
     "degraded_state_backend",
     "degraded_calibration",
 ]
+
 Action = Literal["allow", "advisory", "block", "degraded_allow", "degraded_block"]
 NeutralUpdateMode = Literal["noop", "decay", "reward"]
+
 _CONTROLLER_NAME = "tcd.risk_av"
 _CONTROLLER_VERSION = "2.0.0"
 _SCHEMA = "tcd.eprocess.v3"
+
 _ASCII_CTRL_RE = __import__("re").compile(r"[\x00-\x1F\x7F]")
 _SAFE_LABEL_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
 _SAFE_NAME_RE = __import__("re").compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
 _SAFE_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#]{0,255}$")
 _HEX_RE = __import__("re").compile(r"^[0-9a-fA-F]{16,4096}$")
+
 # Conservative secret detection for caller-provided metadata/context
 _JWT_RE = __import__("re").compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 _PRIVKEY_RE = __import__("re").compile(
@@ -107,6 +124,7 @@ _BASIC_RE = __import__("re").compile(
 _KV_SECRET_RE = __import__("re").compile(
     r"(?i)\b(?:api[_-]?key|apikey|token|secret|password|passwd|pwd)\s*[:=]\s*([^\s,;]{8,})"
 )
+
 _FORBIDDEN_META_KEY_TOKENS = {
     "prompt",
     "completion",
@@ -131,6 +149,7 @@ _FORBIDDEN_META_KEY_TOKENS = {
     "private",
     "privatekey",
 }
+
 _DEFAULT_SEVERITY_WEIGHTS = MappingProxyType(
     {
         "low": 1.0,
@@ -139,10 +158,14 @@ _DEFAULT_SEVERITY_WEIGHTS = MappingProxyType(
         "critical": 4.0,
     }
 )
+
 _DEFAULT_P_TO_E_KAPPAS = (0.2, 0.5, 0.8)
+
 # ---------------------------------------------------------------------------
 # Low-level hardening helpers
 # ---------------------------------------------------------------------------
+
+
 def _has_unsafe_unicode(s: str) -> bool:
     for ch in s:
         if ch in ("\u2028", "\u2029"):
@@ -151,20 +174,25 @@ def _has_unsafe_unicode(s: str) -> bool:
         if cat in ("Cc", "Cf", "Cs", "Zl", "Zp"):
             return True
     return False
+
+
 def _strip_unsafe_text(s: Any, *, max_len: int) -> str:
     if not isinstance(s, str):
         return ""
     if len(s) > max_len:
         s = s[:max_len]
+
     if s.isascii():
         if _ASCII_CTRL_RE.search(s):
             s = _ASCII_CTRL_RE.sub("", s)
         return s.strip()
+
     if not _ASCII_CTRL_RE.search(s) and not _has_unsafe_unicode(s):
         if any(0x80 <= ord(ch) <= 0x9F for ch in s):
             pass
         else:
             return s.strip()
+
     out: list[str] = []
     for ch in s:
         o = ord(ch)
@@ -179,16 +207,22 @@ def _strip_unsafe_text(s: Any, *, max_len: int) -> str:
             continue
         out.append(ch)
     return "".join(out).strip()
+
+
 def _safe_label(v: Any, *, default: str) -> str:
     s = _strip_unsafe_text(v, max_len=64).lower()
     if not s or not _SAFE_LABEL_RE.fullmatch(s):
         return default
     return s
+
+
 def _safe_name(v: Any, *, default: str) -> str:
     s = _strip_unsafe_text(v, max_len=128)
     if not s or not _SAFE_NAME_RE.fullmatch(s):
         return default
     return s
+
+
 def _safe_id(v: Any, *, default: Optional[str], max_len: int = 256) -> Optional[str]:
     s = _strip_unsafe_text(v, max_len=max_len)
     if not s:
@@ -196,6 +230,8 @@ def _safe_id(v: Any, *, default: Optional[str], max_len: int = 256) -> Optional[
     if not _SAFE_ID_RE.fullmatch(s):
         return default
     return s
+
+
 def _looks_like_secret(s: str) -> bool:
     if not s:
         return False
@@ -210,6 +246,8 @@ def _looks_like_secret(s: str) -> bool:
     if _KV_SECRET_RE.search(s):
         return True
     return False
+
+
 def _coerce_float(v: Any) -> Optional[float]:
     if type(v) is bool:
         return None
@@ -229,6 +267,8 @@ def _coerce_float(v: Any) -> Optional[float]:
             return None
         return x if math.isfinite(x) else None
     return None
+
+
 def _coerce_int(v: Any) -> Optional[int]:
     if type(v) is int:
         return int(v)
@@ -249,6 +289,8 @@ def _coerce_int(v: Any) -> Optional[int]:
         except Exception:
             return None
     return None
+
+
 def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
     x = _coerce_float(v)
     if x is None:
@@ -258,6 +300,8 @@ def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
     if x > hi:
         return float(hi)
     return float(x)
+
+
 def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
     x = _coerce_int(v)
     if x is None:
@@ -267,6 +311,8 @@ def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
     if x > hi:
         return int(hi)
     return int(x)
+
+
 def _safe_exp(x: float) -> float:
     try:
         if x > 700.0:
@@ -276,6 +322,8 @@ def _safe_exp(x: float) -> float:
         return math.exp(x)
     except Exception:
         return float("nan")
+
+
 def _canon_json(obj: Any) -> str:
     return json.dumps(
         obj,
@@ -284,6 +332,8 @@ def _canon_json(obj: Any) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
 def _parse_key_material(v: Any) -> Optional[bytes]:
     """
     Supports:
@@ -297,11 +347,14 @@ def _parse_key_material(v: Any) -> Optional[bytes]:
         if 1 <= len(v) <= 4096:
             return bytes(v)
         return None
+
     if type(v) is not str:
         return None
+
     s = _strip_unsafe_text(v, max_len=4096)
     if not s:
         return None
+
     if s.lower().startswith("hex:"):
         hx = s[4:].strip()
         if not _HEX_RE.fullmatch(hx) or len(hx) % 2 != 0:
@@ -310,6 +363,7 @@ def _parse_key_material(v: Any) -> Optional[bytes]:
             return bytes.fromhex(hx)
         except Exception:
             return None
+
     if s.lower().startswith("b64:"):
         raw = s[4:].strip()
         try:
@@ -318,17 +372,21 @@ def _parse_key_material(v: Any) -> Optional[bytes]:
             return out if out else None
         except Exception:
             return None
+
     if _HEX_RE.fullmatch(s) and len(s) % 2 == 0:
         try:
             return bytes.fromhex(s)
         except Exception:
             return None
+
     try:
         pad = "=" * ((4 - (len(s) % 4)) % 4)
         out = base64.urlsafe_b64decode((s + pad).encode("utf-8", errors="strict"))
         return out if out else None
     except Exception:
         return None
+
+
 def _logsumexp(values: Sequence[float]) -> float:
     if not values:
         return float("-inf")
@@ -341,6 +399,8 @@ def _logsumexp(values: Sequence[float]) -> float:
     if acc <= 0.0 or not math.isfinite(acc):
         return m
     return m + math.log(acc)
+
+
 def _key_tokenize(k: str) -> Tuple[str, ...]:
     s = _strip_unsafe_text(k, max_len=128)
     if not s:
@@ -368,8 +428,11 @@ def _key_tokenize(k: str) -> Tuple[str, ...]:
     if fused and fused not in out:
         out.append(fused)
     return tuple(x for x in out if x)
+
+
 class _JsonBudget:
     __slots__ = ("max_nodes", "max_items", "max_depth", "max_str_total", "nodes", "str_used")
+
     def __init__(self, *, max_nodes: int, max_items: int, max_depth: int, max_str_total: int):
         self.max_nodes = max_nodes
         self.max_items = max_items
@@ -377,12 +440,16 @@ class _JsonBudget:
         self.max_str_total = max_str_total
         self.nodes = 0
         self.str_used = 0
+
     def take_node(self) -> bool:
         self.nodes += 1
         return self.nodes <= self.max_nodes
+
     def take_str(self, n: int) -> bool:
         self.str_used += n
         return self.str_used <= self.max_str_total
+
+
 def _json_sanitize(
     obj: Any,
     *,
@@ -396,7 +463,9 @@ def _json_sanitize(
     """
     if not budget.take_node():
         return "[truncated]"
+
     t = type(obj)
+
     if obj is None:
         return None
     if t is bool:
@@ -418,8 +487,10 @@ def _json_sanitize(
         return s
     if t in (bytes, bytearray):
         return f"[bytes:{len(obj)}]"
+
     if depth >= budget.max_depth:
         return "[truncated-depth]"
+
     if t is dict:
         out: Dict[str, Any] = {}
         n = 0
@@ -443,6 +514,7 @@ def _json_sanitize(
             )
             n += 1
         return out
+
     if t in (list, tuple):
         out_list = []
         for i, item in enumerate(obj):
@@ -458,12 +530,19 @@ def _json_sanitize(
                 )
             )
         return out_list
+
     return f"[type:{t.__name__}]"
+
+
 def _clone_deque_floats(d: deque[float], maxlen: Optional[int]) -> deque[float]:
     return deque(list(d), maxlen=maxlen)
+
+
 # ---------------------------------------------------------------------------
 # Public models / split config
 # ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class StreamIdentityPolicy:
     mode: IdentityMode = "dev_fallback_default"
@@ -473,6 +552,7 @@ class StreamIdentityPolicy:
     expose_raw_stream_id: bool = False
     hash_only_in_strict: bool = True
     on_identity_error: IdentityErrorMode = "fail_closed"
+
     def normalized_copy(self) -> "StreamIdentityPolicy":
         mode = self.mode if self.mode in {"require_explicit", "derive_from_ctx", "use_default", "dev_fallback_default"} else "dev_fallback_default"
         schema_ref = _safe_id(self.schema_ref, default="stream.v1", max_len=64) or "stream.v1"
@@ -493,6 +573,8 @@ class StreamIdentityPolicy:
             hash_only_in_strict=bool(self.hash_only_in_strict),
             on_identity_error=on_err,
         )
+
+
 @dataclass(frozen=True)
 class StreamIdentityResult:
     raw_stream_id: Optional[str]
@@ -501,22 +583,30 @@ class StreamIdentityResult:
     identity_status: Literal["ok", "missing", "invalid", "derived", "degraded_default"]
     schema_ref: str
     raw_exposed: bool
+
+
 @dataclass(frozen=True)
 class EvidencePacket:
     current_step_has_direct_p: bool
     strict_p_value: Optional[float]
+
     current_step_has_controller_p: bool
     controller_p_value: Optional[float]
     controller_p_kind: Literal["direct", "calibrated", "heuristic", "neutral"]
+
     current_step_has_calibrated_p: bool
     calibrated_p_value: Optional[float]
     calibration_ref: Optional[str]
     calibration_cfg_digest: Optional[str]
     calibration_state_digest: Optional[str]
+
     current_step_has_score: bool
     raw_score: Optional[float]
     score_source: Optional[str]
+
     guarantee_scope: GuaranteeScope
+
+
 @dataclass(frozen=True)
 class AlwaysValidPolicySpec:
     schema_version: int
@@ -524,36 +614,46 @@ class AlwaysValidPolicySpec:
     label: str
     policyset_ref: Optional[str]
     on_config_error: OnConfigError
+
     decision_mode: DecisionMode
     block_on_trigger: bool
+
     threshold_log_e: float
     threshold_clear_log_e: float
     max_log_e: float
     min_log_e: float
     max_step_abs_log_e: float
+
     alpha_base: float
     alpha_wealth_init: float
     alpha_wealth_cap: float
     alpha_spend_per_decision: float
     alpha_reward_per_safe_decision: float
     freeze_on_exhaust: bool
+
     max_weight: float
     severity_weights: Mapping[str, float]
+
     min_p_value: float
     max_p_value: float
     p_to_e_kappas: Tuple[float, ...]
     p_to_e_weights: Tuple[float, ...]
+
     score_to_p_mode: ScoreToPMode
     score_reference: float
     score_scale: float
     heuristic_p_weight: float
+
     strict_requires_direct_p: bool
     heuristic_allowed_for_blocking: bool
     calibrated_score_allowed_for_blocking: bool
     neutral_update_mode: NeutralUpdateMode
     neutral_decay_rate: float
+
     stream_identity: StreamIdentityPolicy
     score_adapter_default: Optional[str]
+
+
 @dataclass(frozen=True)
 class AlwaysValidSecretConfig:
     stream_hash_algorithm: StreamHashAlgorithm
@@ -561,6 +661,8 @@ class AlwaysValidSecretConfig:
     stream_hash_key_id: Optional[str]
     stream_hash_mode: str
     min_stream_hash_key_bytes: int
+
+
 @dataclass(frozen=True)
 class AlwaysValidRuntimeConfig:
     enabled: bool
@@ -571,20 +673,25 @@ class AlwaysValidRuntimeConfig:
     on_state_exhaustion: OnStateExhaustion
     evict_only_inactive_streams: bool
     max_retired_state_domains: int
+
     history_window: int
     retain_history: bool
     include_history_in_snapshot: bool
     ewma_alpha: float
+
     meta_max_nodes: int
     meta_max_items: int
     meta_max_depth: int
     meta_max_str_total: int
+
     audit_emit_all_steps: bool
     audit_emit_triggers: bool
     telemetry_emit_all_steps: bool
     telemetry_emit_triggers: bool
     receipt_issue_on_block: bool
     receipt_issue_on_trigger: bool
+
+
 @dataclass(frozen=True)
 class AlwaysValidPublicConfigView:
     cfg_fp: str
@@ -602,6 +709,8 @@ class AlwaysValidPublicConfigView:
     enabled: bool
     has_errors: bool
     has_warnings: bool
+
+
 @dataclass(frozen=True)
 class AlwaysValidBundleDiagnostics:
     active_cfg_fp: str
@@ -621,10 +730,13 @@ class AlwaysValidBundleDiagnostics:
     using_last_known_good: bool
     last_known_good_cfg_fp: Optional[str]
     last_rejected_cfg_fp: Optional[str]
+
+
 @dataclass
 class AlwaysValidConfig:
     """
     Aggregate configuration.
+
     This remains the public configuration object for backward compatibility,
     but internally the controller compiles it into:
       - AlwaysValidPolicySpec
@@ -632,22 +744,26 @@ class AlwaysValidConfig:
       - AlwaysValidRuntimeConfig
       - immutable compiled bundle
     """
+
     schema_version: int = 3
     enabled: bool = True
     profile: Profile = "PROD"
     label: str = "default"
     policyset_ref: Optional[str] = None
     on_config_error: OnConfigError = "use_last_known_good"
+
     # Decision semantics (new + backward-compatible legacy alias)
     decision_mode: Optional[DecisionMode] = None
     decision_source: Optional[LegacyDecisionSource] = "controller"
     block_on_trigger: bool = False
+
     # Trigger thresholds / hysteresis
     threshold_log_e: float = 4.0
     threshold_clear_log_e: float = 3.0
     max_log_e: float = 32.0
     min_log_e: float = -32.0
     max_step_abs_log_e: float = 16.0
+
     # Alpha-wealth / controller budgeting
     alpha_base: float = 0.05
     alpha_wealth_init: float = 1.0
@@ -655,29 +771,36 @@ class AlwaysValidConfig:
     alpha_spend_per_decision: float = 0.0
     alpha_reward_per_safe_decision: float = 0.0
     freeze_on_exhaust: bool = False
+
     # Weighting
     max_weight: float = 10.0
     severity_weights: Dict[str, float] = field(default_factory=lambda: dict(_DEFAULT_SEVERITY_WEIGHTS))
+
     # P-value handling
     min_p_value: float = 1e-12
     max_p_value: float = 1.0
+
     # Direct p -> e calibrator
     p_to_e_kappas: Tuple[float, ...] = _DEFAULT_P_TO_E_KAPPAS
     p_to_e_weights: Optional[Tuple[float, ...]] = None
+
     # Score -> pseudo-p mapping
     score_to_p_mode: ScoreToPMode = "one_minus_score"
     score_reference: float = 0.5
     score_scale: float = 10.0
     heuristic_p_weight: float = 0.5
     score_adapter_default: Optional[str] = None
+
     # Track semantics
     strict_requires_direct_p: bool = True
     heuristic_allowed_for_blocking: bool = False
     calibrated_score_allowed_for_blocking: bool = True
     neutral_update_mode: NeutralUpdateMode = "noop"
     neutral_decay_rate: float = 0.0
+
     # Stream identity governance
     stream_identity: StreamIdentityPolicy = field(default_factory=StreamIdentityPolicy)
+
     # Stream store governance
     max_streams: int = 100_000
     idle_ttl_s: float = 24.0 * 3600.0
@@ -686,24 +809,29 @@ class AlwaysValidConfig:
     on_state_exhaustion: OnStateExhaustion = "deny"
     evict_only_inactive_streams: bool = True
     max_retired_state_domains: int = 2
+
     # Stream hashing / pseudonymization
     stream_hash_algorithm: StreamHashAlgorithm = "hmac_sha256"
     stream_hash_key: Optional[Any] = None
     stream_hash_key_id: Optional[str] = None
     auto_ephemeral_hash_key_if_missing: bool = True
     min_stream_hash_key_bytes: int = 16
+
     # Time
     monotonic_fn: Optional[Callable[[], Any]] = None
     wall_time_fn: Optional[Callable[[], Any]] = None
+
     # Diagnostics / history / output budgets
     history_window: int = 64
     retain_history: bool = True
     include_history_in_snapshot: bool = False
     ewma_alpha: float = 0.1
+
     meta_max_nodes: int = 256
     meta_max_items: int = 64
     meta_max_depth: int = 4
     meta_max_str_total: int = 8192
+
     # Sink emission policy
     audit_emit_all_steps: bool = False
     audit_emit_triggers: bool = True
@@ -711,22 +839,28 @@ class AlwaysValidConfig:
     telemetry_emit_triggers: bool = True
     receipt_issue_on_block: bool = True
     receipt_issue_on_trigger: bool = False
+
     def normalized_copy(self) -> "AlwaysValidConfig":
         c = AlwaysValidConfig()
+
         c.schema_version = _clamp_int(self.schema_version, default=3, lo=1, hi=1_000_000)
+
         prof = _safe_label(self.profile, default="prod").upper()
         if prof not in {"DEV", "PROD", "FINREG", "LOCKDOWN"}:
             prof = "PROD"
         c.profile = prof  # type: ignore[assignment]
+
         c.enabled = bool(self.enabled)
         c.label = _safe_label(self.label, default="default")
         c.policyset_ref = _safe_id(self.policyset_ref, default=None, max_len=128)
+
         on_err = self.on_config_error
         if on_err not in {"use_last_known_good", "fail_closed", "raise", "fallback"}:
             on_err = "fail_closed"
         if on_err == "fallback":
             on_err = "use_last_known_good"
         c.on_config_error = on_err  # type: ignore[assignment]
+
         if self.decision_mode in {"strict_only", "controller_only", "prefer_current_strict", "dual_track"}:
             c.decision_mode = self.decision_mode
         else:
@@ -739,15 +873,19 @@ class AlwaysValidConfig:
                 c.decision_mode = "controller_only"
         c.decision_source = None
         c.block_on_trigger = bool(self.block_on_trigger)
+
         c.threshold_log_e = _clamp_float(self.threshold_log_e, default=4.0, lo=0.0, hi=1_000_000.0)
         c.threshold_clear_log_e = _clamp_float(self.threshold_clear_log_e, default=3.0, lo=-1_000_000.0, hi=c.threshold_log_e)
         if c.threshold_clear_log_e > c.threshold_log_e:
             c.threshold_clear_log_e = c.threshold_log_e
+
         c.max_log_e = _clamp_float(self.max_log_e, default=32.0, lo=0.0, hi=1_000_000.0)
         c.min_log_e = _clamp_float(self.min_log_e, default=-32.0, lo=-1_000_000.0, hi=0.0)
         if c.min_log_e > c.max_log_e:
             c.min_log_e, c.max_log_e = c.max_log_e, c.min_log_e
+
         c.max_step_abs_log_e = _clamp_float(self.max_step_abs_log_e, default=16.0, lo=0.0, hi=1_000_000.0)
+
         c.alpha_base = _clamp_float(self.alpha_base, default=0.05, lo=1e-12, hi=1.0)
         c.alpha_wealth_init = _clamp_float(self.alpha_wealth_init, default=1.0, lo=0.0, hi=1_000_000.0)
         c.alpha_wealth_cap = _clamp_float(self.alpha_wealth_cap, default=max(1.0, c.alpha_wealth_init), lo=0.0, hi=1_000_000.0)
@@ -756,7 +894,9 @@ class AlwaysValidConfig:
         c.alpha_spend_per_decision = _clamp_float(self.alpha_spend_per_decision, default=0.0, lo=0.0, hi=1_000_000.0)
         c.alpha_reward_per_safe_decision = _clamp_float(self.alpha_reward_per_safe_decision, default=0.0, lo=0.0, hi=1_000_000.0)
         c.freeze_on_exhaust = bool(self.freeze_on_exhaust)
+
         c.max_weight = _clamp_float(self.max_weight, default=10.0, lo=0.0, hi=1_000_000.0)
+
         sev: Dict[str, float] = {}
         if isinstance(self.severity_weights, Mapping):
             for k, v in self.severity_weights.items():
@@ -768,10 +908,12 @@ class AlwaysValidConfig:
         if not sev:
             sev = dict(_DEFAULT_SEVERITY_WEIGHTS)
         c.severity_weights = sev
+
         c.min_p_value = _clamp_float(self.min_p_value, default=1e-12, lo=1e-300, hi=1.0)
         c.max_p_value = _clamp_float(self.max_p_value, default=1.0, lo=c.min_p_value, hi=1.0)
         if c.max_p_value < c.min_p_value:
             c.max_p_value = c.min_p_value
+
         kappas: list[float] = []
         seq: Sequence[Any]
         if isinstance(self.p_to_e_kappas, tuple):
@@ -789,6 +931,7 @@ class AlwaysValidConfig:
         if not kappas:
             kappas = list(_DEFAULT_P_TO_E_KAPPAS)
         c.p_to_e_kappas = tuple(kappas)
+
         if isinstance(self.p_to_e_weights, tuple):
             wseq = self.p_to_e_weights
         elif isinstance(self.p_to_e_weights, list):
@@ -810,17 +953,21 @@ class AlwaysValidConfig:
                 c.p_to_e_weights = None
         else:
             c.p_to_e_weights = None
+
         c.score_to_p_mode = self.score_to_p_mode if self.score_to_p_mode in {"one_minus_score", "sigmoid_tail", "exp_tail"} else "one_minus_score"
         c.score_reference = _clamp_float(self.score_reference, default=0.5, lo=-1_000_000.0, hi=1_000_000.0)
         c.score_scale = _clamp_float(self.score_scale, default=10.0, lo=1e-6, hi=1_000_000.0)
         c.heuristic_p_weight = _clamp_float(self.heuristic_p_weight, default=0.5, lo=0.0, hi=1.0)
         c.score_adapter_default = _safe_id(self.score_adapter_default, default=None, max_len=64)
+
         c.strict_requires_direct_p = bool(self.strict_requires_direct_p)
         c.heuristic_allowed_for_blocking = bool(self.heuristic_allowed_for_blocking)
         c.calibrated_score_allowed_for_blocking = bool(self.calibrated_score_allowed_for_blocking)
         c.neutral_update_mode = self.neutral_update_mode if self.neutral_update_mode in {"noop", "decay", "reward"} else "noop"
         c.neutral_decay_rate = _clamp_float(self.neutral_decay_rate, default=0.0, lo=0.0, hi=1.0)
+
         c.stream_identity = self.stream_identity.normalized_copy()
+
         c.max_streams = _clamp_int(self.max_streams, default=100_000, lo=1, hi=10_000_000)
         c.idle_ttl_s = _clamp_float(self.idle_ttl_s, default=24.0 * 3600.0, lo=0.0, hi=1_000_000_000.0)
         c.stream_cleanup_budget = _clamp_int(self.stream_cleanup_budget, default=8, lo=0, hi=10_000)
@@ -828,6 +975,7 @@ class AlwaysValidConfig:
         c.on_state_exhaustion = self.on_state_exhaustion if self.on_state_exhaustion in {"allow", "deny"} else "deny"
         c.evict_only_inactive_streams = bool(self.evict_only_inactive_streams)
         c.max_retired_state_domains = _clamp_int(self.max_retired_state_domains, default=2, lo=0, hi=64)
+
         c.stream_hash_algorithm = (
             self.stream_hash_algorithm
             if self.stream_hash_algorithm in {"hmac_sha256", "blake2b", "blake3"}
@@ -837,22 +985,27 @@ class AlwaysValidConfig:
         c.stream_hash_key_id = _safe_id(self.stream_hash_key_id, default=None, max_len=64)
         c.auto_ephemeral_hash_key_if_missing = bool(self.auto_ephemeral_hash_key_if_missing)
         c.min_stream_hash_key_bytes = _clamp_int(self.min_stream_hash_key_bytes, default=16, lo=1, hi=4096)
+
         c.monotonic_fn = self.monotonic_fn if callable(self.monotonic_fn) else None
         c.wall_time_fn = self.wall_time_fn if callable(self.wall_time_fn) else None
+
         c.history_window = _clamp_int(self.history_window, default=64, lo=0, hi=4096)
         c.retain_history = bool(self.retain_history)
         c.include_history_in_snapshot = bool(self.include_history_in_snapshot)
         c.ewma_alpha = _clamp_float(self.ewma_alpha, default=0.1, lo=0.0, hi=1.0)
+
         c.meta_max_nodes = _clamp_int(self.meta_max_nodes, default=256, lo=16, hi=1_000_000)
         c.meta_max_items = _clamp_int(self.meta_max_items, default=64, lo=1, hi=4096)
         c.meta_max_depth = _clamp_int(self.meta_max_depth, default=4, lo=1, hi=32)
         c.meta_max_str_total = _clamp_int(self.meta_max_str_total, default=8192, lo=256, hi=10_000_000)
+
         c.audit_emit_all_steps = bool(self.audit_emit_all_steps)
         c.audit_emit_triggers = bool(self.audit_emit_triggers)
         c.telemetry_emit_all_steps = bool(self.telemetry_emit_all_steps)
         c.telemetry_emit_triggers = bool(self.telemetry_emit_triggers)
         c.receipt_issue_on_block = bool(self.receipt_issue_on_block)
         c.receipt_issue_on_trigger = bool(self.receipt_issue_on_trigger)
+
         # profile-aware tightening
         if c.profile in {"FINREG", "LOCKDOWN"}:
             if c.on_config_error == "use_last_known_good":
@@ -871,7 +1024,9 @@ class AlwaysValidConfig:
                 hash_only_in_strict=True,
                 on_identity_error="fail_closed" if c.stream_identity.on_identity_error == "use_default" else c.stream_identity.on_identity_error,
             ).normalized_copy()
+
         return c
+
     def to_policy_spec(self) -> AlwaysValidPolicySpec:
         c = self.normalized_copy()
         sev = MappingProxyType(dict(sorted(c.severity_weights.items())))
@@ -913,6 +1068,7 @@ class AlwaysValidConfig:
             stream_identity=c.stream_identity,
             score_adapter_default=c.score_adapter_default,
         )
+
     def to_secret_config(self) -> AlwaysValidSecretConfig:
         c = self.normalized_copy()
         key_bytes = _parse_key_material(c.stream_hash_key)
@@ -924,6 +1080,7 @@ class AlwaysValidConfig:
             stream_hash_mode=mode,
             min_stream_hash_key_bytes=c.min_stream_hash_key_bytes,
         )
+
     def to_runtime_config(self) -> AlwaysValidRuntimeConfig:
         c = self.normalized_copy()
         return AlwaysValidRuntimeConfig(
@@ -950,10 +1107,12 @@ class AlwaysValidConfig:
             receipt_issue_on_block=c.receipt_issue_on_block,
             receipt_issue_on_trigger=c.receipt_issue_on_trigger,
         )
+
     def secret_stripped_copy(self) -> "AlwaysValidConfig":
         c = self.normalized_copy()
         c.stream_hash_key = None
         return c
+
     def fingerprint(self) -> str:
         spec = self.to_policy_spec()
         secret = self.to_secret_config()
@@ -1032,47 +1191,63 @@ class AlwaysValidConfig:
         raw = _canon_json(payload).encode("utf-8", errors="strict")
         d = hashlib.sha256(raw).hexdigest()
         return f"cfg1:{d}"
+
+
 # ---------------------------------------------------------------------------
 # State models / backend
 # ---------------------------------------------------------------------------
+
+
 @dataclass(slots=True)
 class EProcessState:
     strict_log_e: float = 0.0
     controller_log_e: float = 0.0
     alpha_wealth: float = 1.0
+
     decisions: int = 0
     triggers: int = 0
     active: bool = False
     frozen: bool = False
     last_trigger_step: Optional[int] = None
     exhausted_step: Optional[int] = None
+
     last_update_mono_ns: int = 0
     last_update_unix_ns: int = 0
+
     last_p_value: float = 1.0
     last_p_source: str = "neutral"
     last_score: Optional[float] = None
+
     last_calibration_ref: Optional[str] = None
     last_calibration_cfg_digest: Optional[str] = None
     last_calibration_state_digest: Optional[str] = None
     last_guarantee_scope: GuaranteeScope = "none"
+
     ewma_score: Optional[float] = None
     ewma_neglogp: float = 0.0
+
     min_p_value: float = 1.0
     min_p_value_step: Optional[int] = None
     max_score: Optional[float] = None
     max_score_step: Optional[int] = None
+
     direct_p_steps: int = 0
     calibrated_p_steps: int = 0
     heuristic_p_steps: int = 0
     neutral_steps: int = 0
+
     small_p_count_05: int = 0
     small_p_count_01: int = 0
     small_p_count_001: int = 0
+
     fisher_stat: float = 0.0
     fisher_df: int = 0
+
     history_p: deque[float] = field(default_factory=deque)
     history_score: deque[float] = field(default_factory=deque)
     history_log_e: deque[float] = field(default_factory=deque)
+
+
 def _clone_state(st: EProcessState, *, history_window: int) -> EProcessState:
     maxlen = history_window if history_window > 0 else None
     return EProcessState(
@@ -1113,15 +1288,45 @@ def _clone_state(st: EProcessState, *, history_window: int) -> EProcessState:
         history_score=deque(list(st.history_score), maxlen=maxlen),
         history_log_e=deque(list(st.history_log_e), maxlen=maxlen),
     )
+
+
 @dataclass(frozen=True)
 class StateRecord:
     state_domain_id: str
     stream_hash: str
     revision: int
     state: EProcessState
+
+
+class ScoreToPAdapter(Protocol):
+    def p_value(self, *, score: float, meta: Mapping[str, Any], ctx: Mapping[str, Any]) -> float:
+        ...
+
+    def provenance(self) -> Dict[str, Any]:
+        ...
+
+
+class AlwaysValidAuditSink(Protocol):
+    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Optional[str]:
+        ...
+
+
+class AlwaysValidTelemetrySink(Protocol):
+    def record_metric(self, name: str, value: float, labels: Mapping[str, str]) -> None:
+        ...
+
+    def record_event(self, name: str, payload: Mapping[str, Any]) -> None:
+        ...
+
+
+class AlwaysValidReceiptSink(Protocol):
+    def issue(self, payload: Mapping[str, Any]) -> Optional[str]:
+        ...
+
 class EProcessStateBackend(Protocol):
     def load(self, *, state_domain_id: str, stream_hash: str, history_window: int) -> Optional[StateRecord]:
         ...
+
     def upsert(
         self,
         *,
@@ -1137,22 +1342,32 @@ class EProcessStateBackend(Protocol):
         history_window: int,
     ) -> Tuple[bool, Optional[StateRecord], str]:
         ...
+
     def delete_stream(self, *, state_domain_id: str, stream_hash: str) -> bool:
         ...
+
     def clear_domain(self, *, state_domain_id: str) -> int:
         ...
+
     def compact(self, *, state_domain_id: str, idle_ttl_ns: int, now_mono_ns: int, budget: int) -> Dict[str, int]:
         ...
+
     def list_streams(self, *, state_domain_id: str, limit: int, history_window: int) -> List[StateRecord]:
         ...
+
     def count_streams(self, *, state_domain_id: str) -> int:
         ...
+
     def health(self) -> Dict[str, Any]:
         ...
+
+
 @dataclass
 class _DomainStore:
     records: Dict[str, StateRecord] = field(default_factory=dict)
     lru: "OrderedDict[str, None]" = field(default_factory=OrderedDict)
+
+
 class InMemoryEProcessStateBackend:
     """
     Local best-effort backend with:
@@ -1161,12 +1376,14 @@ class InMemoryEProcessStateBackend:
       - idle compaction
       - compare-and-swap style revision updates
     """
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._domains: Dict[str, _DomainStore] = {}
         self._cas_conflicts = 0
         self._compactions = 0
         self._evictions = 0
+
     def load(self, *, state_domain_id: str, stream_hash: str, history_window: int) -> Optional[StateRecord]:
         with self._lock:
             ds = self._domains.get(state_domain_id)
@@ -1183,6 +1400,7 @@ class InMemoryEProcessStateBackend:
                 revision=rec.revision,
                 state=_clone_state(rec.state, history_window=history_window),
             )
+
     def upsert(
         self,
         *,
@@ -1200,11 +1418,13 @@ class InMemoryEProcessStateBackend:
         with self._lock:
             ds = self._domains.setdefault(state_domain_id, _DomainStore())
             self._compact_domain_locked(ds, idle_ttl_ns=idle_ttl_ns, now_mono_ns=now_mono_ns, budget=max(1, 8))
+
             existing = ds.records.get(stream_hash)
             if existing is None:
                 if len(ds.records) >= max_streams:
                     if new_stream_policy != "evict_lru":
                         return False, None, "state_capacity_exhausted"
+
                     victim: Optional[str] = None
                     for k in ds.lru.keys():
                         rec = ds.records.get(k)
@@ -1215,17 +1435,21 @@ class InMemoryEProcessStateBackend:
                             continue
                         victim = k
                         break
+
                     if victim is None:
                         return False, None, "state_capacity_exhausted"
+
                     ds.records.pop(victim, None)
                     ds.lru.pop(victim, None)
                     self._evictions += 1
+
                 revision = 1
             else:
                 if expected_revision is not None and existing.revision != expected_revision:
                     self._cas_conflicts += 1
                     return False, None, "revision_conflict"
                 revision = existing.revision + 1
+
             rec = StateRecord(
                 state_domain_id=state_domain_id,
                 stream_hash=stream_hash,
@@ -1235,6 +1459,7 @@ class InMemoryEProcessStateBackend:
             ds.records[stream_hash] = rec
             ds.lru.pop(stream_hash, None)
             ds.lru[stream_hash] = None
+
             out = StateRecord(
                 state_domain_id=rec.state_domain_id,
                 stream_hash=rec.stream_hash,
@@ -1242,6 +1467,7 @@ class InMemoryEProcessStateBackend:
                 state=_clone_state(rec.state, history_window=history_window),
             )
             return True, out, "ok"
+
     def delete_stream(self, *, state_domain_id: str, stream_hash: str) -> bool:
         with self._lock:
             ds = self._domains.get(state_domain_id)
@@ -1253,12 +1479,14 @@ class InMemoryEProcessStateBackend:
             if not ds.records:
                 self._domains.pop(state_domain_id, None)
             return existed
+
     def clear_domain(self, *, state_domain_id: str) -> int:
         with self._lock:
             ds = self._domains.pop(state_domain_id, None)
             if ds is None:
                 return 0
             return len(ds.records)
+
     def compact(self, *, state_domain_id: str, idle_ttl_ns: int, now_mono_ns: int, budget: int) -> Dict[str, int]:
         with self._lock:
             ds = self._domains.get(state_domain_id)
@@ -1268,6 +1496,7 @@ class InMemoryEProcessStateBackend:
             if not ds.records:
                 self._domains.pop(state_domain_id, None)
             return {"removed": removed}
+
     def list_streams(self, *, state_domain_id: str, limit: int, history_window: int) -> List[StateRecord]:
         lim = _clamp_int(limit, default=100, lo=1, hi=100_000)
         with self._lock:
@@ -1290,10 +1519,12 @@ class InMemoryEProcessStateBackend:
                 if len(out) >= lim:
                     break
             return out
+
     def count_streams(self, *, state_domain_id: str) -> int:
         with self._lock:
             ds = self._domains.get(state_domain_id)
             return len(ds.records) if ds is not None else 0
+
     def health(self) -> Dict[str, Any]:
         with self._lock:
             total = 0
@@ -1311,6 +1542,7 @@ class InMemoryEProcessStateBackend:
                 "compactions": int(self._compactions),
                 "evictions": int(self._evictions),
             }
+
     def _compact_domain_locked(self, ds: _DomainStore, *, idle_ttl_ns: int, now_mono_ns: int, budget: int) -> int:
         if idle_ttl_ns <= 0 or budget <= 0:
             return 0
@@ -1331,9 +1563,13 @@ class InMemoryEProcessStateBackend:
         if removed > 0:
             self._compactions += 1
         return removed
+
+
 # ---------------------------------------------------------------------------
 # Split config -> compiled bundle
 # ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class _CompiledBundle:
     version: int
@@ -1349,14 +1585,19 @@ class _CompiledBundle:
     runtime_cfg: AlwaysValidRuntimeConfig
     monotonic_fn: Callable[[], Any]
     wall_time_fn: Callable[[], Any]
+
+
 # ---------------------------------------------------------------------------
 # Adapter implementations
 # ---------------------------------------------------------------------------
+
+
 class HeuristicScoreAdapter:
     """
     Deterministic heuristic adapter.
     Advisory-grade by default; not strict-valid.
     """
+
     def __init__(
         self,
         *,
@@ -1369,6 +1610,7 @@ class HeuristicScoreAdapter:
         self._score_reference = float(score_reference)
         self._score_scale = float(score_scale) if math.isfinite(float(score_scale)) and float(score_scale) > 0.0 else 10.0
         self._ref = _safe_id(adapter_ref, default="heuristic.default", max_len=64) or "heuristic.default"
+
     def p_value(self, *, score: float, meta: Mapping[str, Any], ctx: Mapping[str, Any]) -> float:
         s = float(score)
         if self._mode == "one_minus_score":
@@ -1387,6 +1629,7 @@ class HeuristicScoreAdapter:
         if not math.isfinite(x):
             return 1.0
         return float(x)
+
     def provenance(self) -> Dict[str, Any]:
         payload = {
             "adapter_ref": self._ref,
@@ -1402,20 +1645,26 @@ class HeuristicScoreAdapter:
             "state_digest": None,
             "engine": "heuristic",
         }
+
+
 class PredictableScoreAdapter:
     """
     Adapter around an external calibrator-like object.
+
     Supported methods (first matching callable is used):
       - p_value(score=..., meta=..., ctx=...)
       - predict_p_value(score=..., meta=..., ctx=...)
       - predict(score)
       - __call__(score)
     """
+
     def __init__(self, calibrator: Any, *, adapter_ref: str = "predictable.default") -> None:
         self._calibrator = calibrator
         self._ref = _safe_id(adapter_ref, default="predictable.default", max_len=64) or "predictable.default"
+
     def p_value(self, *, score: float, meta: Mapping[str, Any], ctx: Mapping[str, Any]) -> float:
         cal = self._calibrator
+
         for method_name in ("p_value", "predict_p_value"):
             fn = getattr(cal, method_name, None)
             if callable(fn):
@@ -1426,6 +1675,7 @@ class PredictableScoreAdapter:
                 p = _coerce_float(out)
                 if p is not None:
                     return float(p)
+
         fn_pred = getattr(cal, "predict", None)
         if callable(fn_pred):
             try:
@@ -1435,6 +1685,7 @@ class PredictableScoreAdapter:
             p = _coerce_float(out)
             if p is not None:
                 return float(p)
+
         if callable(cal):
             try:
                 out = cal(score)
@@ -1443,18 +1694,22 @@ class PredictableScoreAdapter:
             p = _coerce_float(out)
             if p is not None:
                 return float(p)
+
         raise ValueError("predictable calibrator did not return a valid finite p-value")
+
     def provenance(self) -> Dict[str, Any]:
         cal = self._calibrator
         cfg_digest = None
         state_digest = None
         engine = "predictable"
+
         x = getattr(cal, "cfg_digest_hex", None)
         if type(x) is str:
             cfg_digest = _safe_id(x, default=None, max_len=128)
         x = getattr(cal, "cfg_fp", None)
         if cfg_digest is None and type(x) is str:
             cfg_digest = _safe_id(x, default=None, max_len=128)
+
         fn = getattr(cal, "state_digest", None)
         if callable(fn):
             try:
@@ -1463,9 +1718,11 @@ class PredictableScoreAdapter:
                 sd = None
             if type(sd) is str:
                 state_digest = _safe_id(sd, default=None, max_len=128)
+
         x = getattr(cal, "engine_version", None)
         if type(x) is str:
             engine = _safe_id(x, default="predictable", max_len=64) or "predictable"
+
         if cfg_digest is None:
             payload = {
                 "adapter_ref": self._ref,
@@ -1473,6 +1730,7 @@ class PredictableScoreAdapter:
                 "type": type(cal).__name__,
             }
             cfg_digest = hashlib.sha256(_canon_json(payload).encode("utf-8", errors="strict")).hexdigest()
+
         return {
             "adapter_ref": self._ref,
             "guarantee_scope": "predictable_calibrated_p",
@@ -1480,12 +1738,17 @@ class PredictableScoreAdapter:
             "state_digest": state_digest,
             "engine": engine,
         }
+
+
 # ---------------------------------------------------------------------------
 # Main controller
 # ---------------------------------------------------------------------------
+
+
 class AlwaysValidRiskController:
     """
     Research-grade anytime-valid / e-process statistical platform.
+
     Properties:
       - immutable compiled config bundle + atomic swap
       - strict direct-p track and richer controller track
@@ -1494,6 +1757,7 @@ class AlwaysValidRiskController:
       - optional audit / receipt / telemetry integration
       - content-agnostic: never inspects request payloads
     """
+
     def __init__(
         self,
         config: Optional[AlwaysValidConfig] = None,
@@ -1512,24 +1776,33 @@ class AlwaysValidRiskController:
                     setattr(base, key, value)
                 except Exception:
                     pass
+
         self._bundle_lock = threading.RLock()
         self._seq_lock = threading.Lock()
         self._instance_id = os.urandom(8).hex()
+
         self._audit_sink = audit_sink
         self._telemetry_sink = telemetry_sink
         self._receipt_sink = receipt_sink
+
         self._backend: EProcessStateBackend = state_backend or InMemoryEProcessStateBackend()
+
         self._score_adapters = self._normalize_score_adapters(score_adapters or {})
         self._adapter_registry_fp = self._fingerprint_score_adapters(self._score_adapters)
+
         self._source_config = base.normalized_copy()
         initial_bundle = self._compile_bundle(self._source_config, previous=None, adapter_registry_fp=self._adapter_registry_fp)
+
         if initial_bundle.errors and initial_bundle.policy_spec.on_config_error == "raise":
             raise ValueError("invalid AlwaysValidConfig: " + "; ".join(initial_bundle.errors[:3]))
+
         self._bundle = initial_bundle
         self._last_known_good: Optional[_CompiledBundle] = None if initial_bundle.errors else initial_bundle
         self._rejected_bundle: Optional[_CompiledBundle] = None
         self._using_last_known_good = False
+
         self._retired_domain_ids: deque[str] = deque(maxlen=max(1, initial_bundle.runtime_cfg.max_retired_state_domains))
+
         # health counters
         self._decision_seq = 0
         self._state_capacity_denies = 0
@@ -1541,9 +1814,11 @@ class AlwaysValidRiskController:
         self._audit_emit_failures = 0
         self._telemetry_emit_failures = 0
         self._receipt_emit_failures = 0
+
     # ------------------------------------------------------------------
     # Public config / diagnostics API
     # ------------------------------------------------------------------
+
     @property
     def config(self) -> AlwaysValidConfig:
         """
@@ -1551,14 +1826,17 @@ class AlwaysValidRiskController:
         """
         with self._bundle_lock:
             return self._source_config.secret_stripped_copy()
+
     @property
     def cfg_fp(self) -> str:
         with self._bundle_lock:
             return self._bundle.cfg_fp
+
     @property
     def bundle_version(self) -> int:
         with self._bundle_lock:
             return self._bundle.version
+
     def public_config_snapshot(self) -> AlwaysValidPublicConfigView:
         with self._bundle_lock:
             b = self._bundle
@@ -1579,6 +1857,7 @@ class AlwaysValidRiskController:
                 has_errors=bool(b.errors),
                 has_warnings=bool(b.warnings),
             )
+
     def bundle_diagnostics(self) -> AlwaysValidBundleDiagnostics:
         with self._bundle_lock:
             active = self._bundle
@@ -1603,6 +1882,7 @@ class AlwaysValidRiskController:
                 last_known_good_cfg_fp=lkg.cfg_fp if lkg is not None else None,
                 last_rejected_cfg_fp=rejected.cfg_fp if rejected is not None else None,
             )
+
     def diagnostics(self) -> Dict[str, Any]:
         d = self.bundle_diagnostics()
         return {
@@ -1631,25 +1911,32 @@ class AlwaysValidRiskController:
             "last_rejected_cfg_fp": d.last_rejected_cfg_fp,
             "state_scope": "local_best_effort",
         }
+
     def set_config(self, config: AlwaysValidConfig) -> None:
         new_cfg = config.normalized_copy()
         with self._bundle_lock:
             previous = self._bundle
             new_bundle = self._compile_bundle(new_cfg, previous=previous, adapter_registry_fp=self._adapter_registry_fp)
+
             if new_bundle.errors and new_bundle.policy_spec.on_config_error == "raise":
                 raise ValueError("invalid AlwaysValidConfig: " + "; ".join(new_bundle.errors[:3]))
+
             if new_bundle.errors and new_bundle.policy_spec.on_config_error == "use_last_known_good" and self._last_known_good is not None:
                 self._rejected_bundle = new_bundle
                 self._using_last_known_good = True
                 return
+
             old_domain = previous.state_domain_id
             self._source_config = new_cfg
             self._bundle = new_bundle
             self._rejected_bundle = new_bundle if new_bundle.errors else None
             self._using_last_known_good = False
+
             if not new_bundle.errors:
                 self._last_known_good = new_bundle
+
             new_domain = new_bundle.state_domain_id
+
             if old_domain != new_domain:
                 self._retired_domain_ids.append(old_domain)
                 max_keep = max(0, new_bundle.runtime_cfg.max_retired_state_domains)
@@ -1659,6 +1946,7 @@ class AlwaysValidRiskController:
                         self._backend.clear_domain(state_domain_id=stale)
                     except Exception:
                         pass
+
     def set_score_adapters(self, adapters: Mapping[str, ScoreToPAdapter]) -> None:
         normalized = self._normalize_score_adapters(adapters)
         adapter_fp = self._fingerprint_score_adapters(normalized)
@@ -1689,9 +1977,11 @@ class AlwaysValidRiskController:
                         self._backend.clear_domain(state_domain_id=stale)
                     except Exception:
                         pass
+
     # ------------------------------------------------------------------
     # Public runtime API
     # ------------------------------------------------------------------
+
     def step(
         self,
         request: Any = None,
@@ -1708,8 +1998,10 @@ class AlwaysValidRiskController:
         bundle, base_mode = self._bundle_snapshot()
         now_mono_ns = self._mono_ns(bundle)
         now_unix_ns = self._wall_ns(bundle)
+
         meta_s = self._sanitize_meta_dict(bundle, meta or {})
         ctx_s = self._sanitize_meta_dict(bundle, ctx or {})
+
         identity = self._build_identity_result(
             bundle=bundle,
             stream_id=stream_id,
@@ -1717,6 +2009,7 @@ class AlwaysValidRiskController:
             meta=meta_s,
             ctx=ctx_s,
         )
+
         # Disabled
         if not bundle.enabled:
             seq = self._next_decision_seq()
@@ -1760,6 +2053,7 @@ class AlwaysValidRiskController:
             )
             self._emit_artifacts(bundle=bundle, result=result)
             return result
+
         # Config errors on active bundle
         if bundle.errors:
             if bundle.policy_spec.on_config_error == "raise":
@@ -1807,6 +2101,7 @@ class AlwaysValidRiskController:
             )
             self._emit_artifacts(bundle=bundle, result=result)
             return result
+
         # Identity gating
         if identity.identity_status in {"missing", "invalid"}:
             if bundle.policy_spec.stream_identity.on_identity_error == "allow_degraded":
@@ -1852,6 +2147,7 @@ class AlwaysValidRiskController:
                 )
                 self._emit_artifacts(bundle=bundle, result=result)
                 return result
+
             seq = self._next_decision_seq()
             self._identity_denies += 1
             self._blocked_steps += 1
@@ -1895,6 +2191,7 @@ class AlwaysValidRiskController:
             )
             self._emit_artifacts(bundle=bundle, result=result)
             return result
+
         evidence, calibration_degraded = self._build_evidence_packet(
             bundle=bundle,
             p_value=p_value,
@@ -1904,12 +2201,14 @@ class AlwaysValidRiskController:
             ctx=ctx_s,
         )
         eff_weight = self._effective_weight(bundle, weight, severity)
+
         stream_hash = identity.stream_hash
         state_revision: Optional[int] = None
         final_state: Optional[EProcessState] = None
         degraded_reasons: List[str] = []
         if calibration_degraded:
             degraded_reasons.append(calibration_degraded)
+
         for _attempt in range(3):
             try:
                 rec = self._backend.load(
@@ -1919,12 +2218,14 @@ class AlwaysValidRiskController:
                 )
             except Exception:
                 rec = None
+
             if rec is None:
                 st = self._make_initial_state(bundle, now_mono_ns, now_unix_ns)
                 expected_revision = None
             else:
                 st = _clone_state(rec.state, history_window=bundle.runtime_cfg.history_window)
                 expected_revision = rec.revision
+
             self._update_state(
                 bundle=bundle,
                 state=st,
@@ -1933,7 +2234,9 @@ class AlwaysValidRiskController:
                 now_mono_ns=now_mono_ns,
                 now_unix_ns=now_unix_ns,
             )
+
             selected_log_e, selected_source, guarantee_scope = self._selected_track(bundle, st, evidence)
+
             prev_active = st.active
             if not prev_active:
                 active = bool(selected_log_e >= bundle.policy_spec.threshold_log_e)
@@ -1941,20 +2244,24 @@ class AlwaysValidRiskController:
             else:
                 active = bool(selected_log_e >= bundle.policy_spec.threshold_clear_log_e)
                 newly_triggered = False
+
             st.active = active
             if newly_triggered:
                 st.triggers += 1
                 st.last_trigger_step = st.decisions
+
             if (not active) and (not st.frozen) and bundle.policy_spec.alpha_reward_per_safe_decision > 0.0:
                 st.alpha_wealth = min(
                     bundle.policy_spec.alpha_wealth_cap,
                     st.alpha_wealth + bundle.policy_spec.alpha_reward_per_safe_decision,
                 )
+
             block_basis_allowed = True
             if guarantee_scope == "heuristic_only" and not bundle.policy_spec.heuristic_allowed_for_blocking:
                 block_basis_allowed = False
             if guarantee_scope == "predictable_calibrated_p" and not bundle.policy_spec.calibrated_score_allowed_for_blocking:
                 block_basis_allowed = False
+
             if active and bundle.policy_spec.block_on_trigger and block_basis_allowed:
                 allowed = False
                 action: Action = "block"
@@ -1967,6 +2274,7 @@ class AlwaysValidRiskController:
                 allowed = True
                 action = "allow"
                 reason = "always-valid"
+
             try:
                 ok, new_rec, status = self._backend.upsert(
                     state_domain_id=bundle.state_domain_id,
@@ -1984,13 +2292,16 @@ class AlwaysValidRiskController:
                 ok = False
                 new_rec = None
                 status = "backend_error"
+
             if ok and new_rec is not None:
                 final_state = _clone_state(new_rec.state, history_window=bundle.runtime_cfg.history_window)
                 state_revision = new_rec.revision
                 break
+
             if status == "revision_conflict":
                 degraded_reasons.append("revision_conflict")
                 continue
+
             if status == "state_capacity_exhausted":
                 seq = self._next_decision_seq()
                 if bundle.runtime_cfg.on_state_exhaustion == "allow":
@@ -2046,6 +2357,7 @@ class AlwaysValidRiskController:
                     )
                 self._emit_artifacts(bundle=bundle, result=result)
                 return result
+
             # backend error / unknown failure
             seq = self._next_decision_seq()
             degraded_reasons.append(status)
@@ -2131,6 +2443,7 @@ class AlwaysValidRiskController:
             )
             self._emit_artifacts(bundle=bundle, result=result)
             return result
+
         if final_state is None:
             # extremely defensive fallback
             seq = self._next_decision_seq()
@@ -2161,14 +2474,17 @@ class AlwaysValidRiskController:
             )
             self._emit_artifacts(bundle=bundle, result=result)
             return result
+
         seq = self._next_decision_seq()
         if action in {"block", "degraded_block"}:
             self._blocked_steps += 1
         else:
             self._allowed_steps += 1
+
         controller_mode: ControllerMode = base_mode
         if calibration_degraded:
             controller_mode = "degraded_calibration"
+
         result = self._build_step_result(
             bundle=bundle,
             sid=identity.canonical_stream_id or "default",
@@ -2194,6 +2510,7 @@ class AlwaysValidRiskController:
         )
         self._emit_artifacts(bundle=bundle, result=result)
         return result
+
     def step_direct_p(
         self,
         *,
@@ -2215,6 +2532,7 @@ class AlwaysValidRiskController:
             meta=dict(meta or {}),
             **dict(ctx or {}),
         )
+
     def step_score(
         self,
         *,
@@ -2238,6 +2556,7 @@ class AlwaysValidRiskController:
             meta=dict(meta or {}),
             **dict(ctx or {}),
         )
+
     def step_many(self, items: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for item in items:
@@ -2252,10 +2571,12 @@ class AlwaysValidRiskController:
                 kwargs[k] = v
             out.append(self.step(request=request, **kwargs))
         return out
+
     def snapshot(self, stream_id: Optional[str] = None) -> Dict[str, Any]:
         bundle, base_mode = self._bundle_snapshot()
         now_mono_ns = self._mono_ns(bundle)
         now_unix_ns = self._wall_ns(bundle)
+
         identity = self._build_identity_result(
             bundle=bundle,
             stream_id=stream_id,
@@ -2279,6 +2600,7 @@ class AlwaysValidRiskController:
             controller_mode=base_mode,
             identity=identity,
         )
+
     def reset_stream(self, stream_id: str) -> bool:
         bundle, _ = self._bundle_snapshot()
         identity = self._build_identity_result(
@@ -2309,6 +2631,7 @@ class AlwaysValidRiskController:
                 },
             )
         return existed
+
     def clear(self) -> None:
         bundle, _ = self._bundle_snapshot()
         removed = self._backend.clear_domain(state_domain_id=bundle.state_domain_id)
@@ -2327,6 +2650,7 @@ class AlwaysValidRiskController:
                 "ts_unix_ns": self._wall_ns(bundle),
             },
         )
+
     def compact(self, *, budget: Optional[int] = None) -> Dict[str, Any]:
         bundle, _ = self._bundle_snapshot()
         b = _clamp_int(budget, default=bundle.runtime_cfg.stream_cleanup_budget, lo=0, hi=1_000_000)
@@ -2352,6 +2676,7 @@ class AlwaysValidRiskController:
             },
         )
         return stats
+
     def all_stream_ids(self) -> Dict[str, int]:
         bundle, _ = self._bundle_snapshot()
         recs = self._backend.list_streams(
@@ -2360,6 +2685,7 @@ class AlwaysValidRiskController:
             history_window=0,
         )
         return {r.stream_hash: int(r.state.decisions) for r in recs}
+
     def streams_overview(
         self,
         *,
@@ -2370,11 +2696,13 @@ class AlwaysValidRiskController:
         now_mono_ns = self._mono_ns(bundle)
         now_unix_ns = self._wall_ns(bundle)
         lim = _clamp_int(limit, default=100, lo=1, hi=10_000)
+
         recs = self._backend.list_streams(
             state_domain_id=bundle.state_domain_id,
             limit=max(lim, 1_000),
             history_window=bundle.runtime_cfg.history_window,
         )
+
         rows = []
         for rec in recs:
             st = rec.state
@@ -2421,6 +2749,7 @@ class AlwaysValidRiskController:
                     "last_update_unix_ns": int(st.last_update_unix_ns),
                 }
             )
+
         key_name = sort_by if sort_by in {
             "selected_log_e",
             "strict_log_e",
@@ -2430,6 +2759,7 @@ class AlwaysValidRiskController:
         } else "controller_log_e"
         rows.sort(key=lambda r: (r.get(key_name, 0.0), r["decisions"]), reverse=True)
         rows = rows[:lim]
+
         return {
             "schema": _SCHEMA,
             "controller": {
@@ -2450,10 +2780,12 @@ class AlwaysValidRiskController:
             },
             "streams": rows,
         }
+
     def controller_health(self) -> Dict[str, Any]:
         bundle, base_mode = self._bundle_snapshot()
         now_mono_ns = self._mono_ns(bundle)
         now_unix_ns = self._wall_ns(bundle)
+
         recs = self._backend.list_streams(
             state_domain_id=bundle.state_domain_id,
             limit=1_000_000,
@@ -2467,6 +2799,7 @@ class AlwaysValidRiskController:
                 active_count += 1
             if st.frozen:
                 frozen_count += 1
+
         return {
             "schema": _SCHEMA,
             "controller": {
@@ -2506,9 +2839,11 @@ class AlwaysValidRiskController:
             "errors": list(bundle.errors[:50]),
             "warnings": list(bundle.warnings[:50]),
         }
+
     # ------------------------------------------------------------------
     # Internal helpers: bundle / config compilation
     # ------------------------------------------------------------------
+
     def _normalize_score_adapters(self, adapters: Mapping[str, ScoreToPAdapter]) -> Dict[str, ScoreToPAdapter]:
         out: Dict[str, ScoreToPAdapter] = {}
         for k, v in adapters.items():
@@ -2518,6 +2853,7 @@ class AlwaysValidRiskController:
             if hasattr(v, "p_value") and hasattr(v, "provenance"):
                 out[kk] = v
         return out
+
     def _fingerprint_score_adapters(self, adapters: Mapping[str, ScoreToPAdapter]) -> str:
         rows = []
         for name in sorted(adapters.keys()):
@@ -2529,6 +2865,7 @@ class AlwaysValidRiskController:
             rows.append({"name": name, "prov": prov})
         raw = _canon_json(rows).encode("utf-8", errors="strict")
         return "adp1:" + hashlib.sha256(raw).hexdigest()
+
     def _compile_bundle(
         self,
         cfg: AlwaysValidConfig,
@@ -2540,12 +2877,16 @@ class AlwaysValidRiskController:
         policy = c.to_policy_spec()
         runtime = c.to_runtime_config()
         secret = c.to_secret_config()
+
         errors: List[str] = []
         warnings: List[str] = []
+
         if secret.stream_hash_key is not None and len(secret.stream_hash_key) < secret.min_stream_hash_key_bytes:
             errors.append("stream_hash_key shorter than min_stream_hash_key_bytes")
+
         key_bytes = secret.stream_hash_key
         key_mode = secret.stream_hash_mode
+
         if secret.stream_hash_algorithm == "hmac_sha256":
             if key_bytes is None and c.auto_ephemeral_hash_key_if_missing:
                 if previous is not None and previous.secret_cfg.stream_hash_mode == "ephemeral" and previous.secret_cfg.stream_hash_key is not None:
@@ -2558,11 +2899,13 @@ class AlwaysValidRiskController:
         elif secret.stream_hash_algorithm == "blake3":
             if Blake3Hash is None:
                 errors.append("stream_hash_algorithm='blake3' requested but Blake3Hash unavailable")
+
         # Compile p->e mixture
         kappas = tuple(x for x in policy.p_to_e_kappas if 0.0 < x < 1.0)
         if not kappas:
             errors.append("no valid p_to_e_kappas after normalization")
             kappas = _DEFAULT_P_TO_E_KAPPAS
+
         weights = policy.p_to_e_weights
         if len(weights) != len(kappas):
             warnings.append("p_to_e_weights missing/invalid length; using equal weights")
@@ -2574,6 +2917,7 @@ class AlwaysValidRiskController:
                 weights = tuple(1.0 / len(kappas) for _ in kappas)
             else:
                 weights = tuple(float(w) / tot for w in weights)
+
         stream_key_id = secret.stream_hash_key_id or ("ephemeral" if key_mode == "ephemeral" else "none")
         state_domain_payload = {
             "cfg_fp": c.fingerprint(),
@@ -2584,9 +2928,11 @@ class AlwaysValidRiskController:
             "adapter_registry_fp": adapter_registry_fp,
         }
         state_domain_id = "dom1:" + hashlib.sha256(_canon_json(state_domain_payload).encode("utf-8", errors="strict")).hexdigest()[:32]
+
         updated_at_unix_ns = self._call_time_ns(c.wall_time_fn or time.time_ns, fallback=time.time_ns)
         version = 1 if previous is None else previous.version + 1
         cfg_fp = c.fingerprint()
+
         compiled_secret = AlwaysValidSecretConfig(
             stream_hash_algorithm=secret.stream_hash_algorithm,
             stream_hash_key=key_bytes,
@@ -2594,6 +2940,7 @@ class AlwaysValidRiskController:
             stream_hash_mode=key_mode,
             min_stream_hash_key_bytes=secret.min_stream_hash_key_bytes,
         )
+
         return _CompiledBundle(
             version=version,
             updated_at_unix_ns=updated_at_unix_ns,
@@ -2609,9 +2956,11 @@ class AlwaysValidRiskController:
             monotonic_fn=c.monotonic_fn or time.monotonic_ns,
             wall_time_fn=c.wall_time_fn or time.time_ns,
         )
+
     # ------------------------------------------------------------------
     # Internal helpers: time / identity / evidence
     # ------------------------------------------------------------------
+
     def _bundle_snapshot(self) -> Tuple[_CompiledBundle, ControllerMode]:
         with self._bundle_lock:
             if self._using_last_known_good:
@@ -2619,6 +2968,7 @@ class AlwaysValidRiskController:
             if self._bundle.errors and self._bundle.policy_spec.on_config_error == "fail_closed":
                 return self._bundle, "fail_closed"
             return self._bundle, "normal"
+
     def _call_time_ns(self, fn: Callable[[], Any], *, fallback: Callable[[], int]) -> int:
         try:
             v = fn()
@@ -2629,20 +2979,26 @@ class AlwaysValidRiskController:
         if isinstance(v, (float, int)) and math.isfinite(float(v)):
             return int(float(v) * 1_000_000_000.0)
         return int(fallback())
+
     def _mono_ns(self, bundle: _CompiledBundle) -> int:
         return self._call_time_ns(bundle.monotonic_fn, fallback=time.monotonic_ns)
+
     def _wall_ns(self, bundle: _CompiledBundle) -> int:
         return self._call_time_ns(bundle.wall_time_fn, fallback=time.time_ns)
+
     def _next_decision_seq(self) -> int:
         with self._seq_lock:
             self._decision_seq += 1
             return self._decision_seq
+
     def _sanitize_stream_id(self, stream_id: Optional[str]) -> Optional[str]:
         return _safe_id(stream_id, default=None, max_len=256)
+
     def _hash_stream_id(self, bundle: _CompiledBundle, canonical_stream_id: str) -> str:
         sid = _strip_unsafe_text(canonical_stream_id, max_len=4096)
         data = sid.encode("utf-8", errors="surrogatepass")
         key_id = bundle.secret_cfg.stream_hash_key_id or ("ephemeral" if bundle.secret_cfg.stream_hash_mode == "ephemeral" else "none")
+
         if bundle.secret_cfg.stream_hash_algorithm == "hmac_sha256":
             key = bundle.secret_cfg.stream_hash_key or b""
             dig = hmac.new(
@@ -2651,18 +3007,21 @@ class AlwaysValidRiskController:
                 digestmod=hashlib.sha256,
             ).hexdigest()[:48]
             return f"{key_id}:{dig}"
+
         if bundle.secret_cfg.stream_hash_algorithm == "blake3" and Blake3Hash is not None:
             dig = Blake3Hash().hex(
                 b"tcd:eprocess:stream:v2\x00" + data,
                 ctx="tcd:eprocess:stream",
             )[:48]
             return f"{key_id}:{dig}"
+
         dig = hashlib.blake2b(
             b"tcd:eprocess:stream:v2\x00" + data,
             digest_size=24,
             key=bundle.secret_cfg.stream_hash_key or b"",
         ).hexdigest()[:48]
         return f"{key_id}:{dig}"
+
     def _build_identity_result(
         self,
         *,
@@ -2676,6 +3035,7 @@ class AlwaysValidRiskController:
         raw = self._sanitize_stream_id(stream_id)
         canonical: Optional[str] = None
         status: Literal["ok", "missing", "invalid", "derived", "degraded_default"]
+
         if raw is not None:
             canonical = raw
             status = "ok"
@@ -2705,19 +3065,24 @@ class AlwaysValidRiskController:
                     status = "missing"
             else:
                 status = "missing"
+
         if status == "degraded_default" and pol.strict_profiles_forbid_default and bundle.policy_spec.profile in {"FINREG", "LOCKDOWN"}:
             canonical = None
             status = "missing"
+
         if canonical is None and pol.on_identity_error == "use_default":
             if not (pol.strict_profiles_forbid_default and bundle.policy_spec.profile in {"FINREG", "LOCKDOWN"}):
                 canonical = "default"
                 status = "degraded_default"
+
         if canonical is None:
             canonical = "__missing__"
+
         stream_hash = self._hash_stream_id(bundle, canonical)
         raw_exposed = bool(pol.expose_raw_stream_id)
         if bundle.policy_spec.profile in {"FINREG", "LOCKDOWN"} and pol.hash_only_in_strict:
             raw_exposed = False
+
         return StreamIdentityResult(
             raw_stream_id=raw if raw_exposed else None,
             canonical_stream_id=(canonical if canonical != "__missing__" else None),
@@ -2726,9 +3091,11 @@ class AlwaysValidRiskController:
             schema_ref=pol.schema_ref,
             raw_exposed=raw_exposed,
         )
+
     def _normalize_score(self, score: Optional[float]) -> Optional[float]:
         s = _coerce_float(score)
         return float(s) if s is not None else None
+
     def _heuristic_p(self, bundle: _CompiledBundle, score: float) -> float:
         if bundle.policy_spec.score_to_p_mode == "one_minus_score":
             x = 1.0 - score
@@ -2743,9 +3110,11 @@ class AlwaysValidRiskController:
         else:
             z = max(0.0, score - bundle.policy_spec.score_reference)
             x = math.exp(-bundle.policy_spec.score_scale * z)
+
         if not math.isfinite(x):
             x = 1.0
         return min(bundle.policy_spec.max_p_value, max(bundle.policy_spec.min_p_value, float(x)))
+
     def _build_evidence_packet(
         self,
         *,
@@ -2778,6 +3147,7 @@ class AlwaysValidRiskController:
                 ),
                 None,
             )
+
         s = self._normalize_score(score)
         if s is None:
             return (
@@ -2799,6 +3169,7 @@ class AlwaysValidRiskController:
                 ),
                 None,
             )
+
         adapter_name = _safe_id(score_adapter, default=None, max_len=64) or bundle.policy_spec.score_adapter_default
         if adapter_name is not None:
             adapter = self._score_adapters.get(adapter_name)
@@ -2877,6 +3248,7 @@ class AlwaysValidRiskController:
                 ),
                 "adapter_missing_fell_back_to_heuristic",
             )
+
         return (
             EvidencePacket(
                 current_step_has_direct_p=False,
@@ -2896,9 +3268,11 @@ class AlwaysValidRiskController:
             ),
             None,
         )
+
     # ------------------------------------------------------------------
     # Internal helpers: update math
     # ------------------------------------------------------------------
+
     def _effective_weight(
         self,
         bundle: _CompiledBundle,
@@ -2920,6 +3294,7 @@ class AlwaysValidRiskController:
         if eff > bundle.policy_spec.max_weight:
             eff = bundle.policy_spec.max_weight
         return float(eff)
+
     def _e_log_increment(self, bundle: _CompiledBundle, p_like: float) -> float:
         p = min(bundle.policy_spec.max_p_value, max(bundle.policy_spec.min_p_value, p_like))
         lp = math.log(p)
@@ -2935,6 +3310,7 @@ class AlwaysValidRiskController:
         if inc < -bundle.policy_spec.max_step_abs_log_e:
             return -bundle.policy_spec.max_step_abs_log_e
         return float(inc)
+
     def _selected_track(
         self,
         bundle: _CompiledBundle,
@@ -2942,47 +3318,45 @@ class AlwaysValidRiskController:
         evidence: EvidencePacket,
     ) -> Tuple[float, str, GuaranteeScope]:
         mode = bundle.policy_spec.decision_mode
+
         if mode == "controller_only":
             return float(st.controller_log_e), "controller", st.last_guarantee_scope
+
         if mode == "strict_only":
             if bundle.policy_spec.strict_requires_direct_p and st.direct_p_steps <= 0:
                 return 0.0, "strict", "none"
             return float(st.strict_log_e), "strict", "strict_direct_p"
+
         if mode == "prefer_current_strict":
             if evidence.current_step_has_direct_p:
                 return float(st.strict_log_e), "strict", "strict_direct_p"
             return float(st.controller_log_e), "controller", st.last_guarantee_scope
+
         # dual_track
         if st.strict_log_e >= st.controller_log_e:
             if bundle.policy_spec.strict_requires_direct_p and st.direct_p_steps <= 0:
                 return float(st.controller_log_e), "dual_controller", st.last_guarantee_scope
             return float(st.strict_log_e), "dual_strict", "strict_direct_p"
         return float(st.controller_log_e), "dual_controller", st.last_guarantee_scope
+
+
     def _make_initial_state(
         self,
         bundle: _CompiledBundle,
         now_mono_ns: int,
         now_unix_ns: int,
     ) -> EProcessState:
-        """
-        Initialize per-stream e-process state.
-        This restores the missing initialization path used when a stream_hash
-        is first seen by the controller. It preserves the current v3 semantics:
-          - fresh strict/controller log-e start at 0
-          - alpha wealth starts from policy_spec.alpha_wealth_init
-          - timestamps are initialized immediately
-          - bounded history deques honor runtime_cfg.retain_history/history_window
-          - if freeze_on_exhaust is enabled and initial wealth is already zero,
-            the state starts frozen and marks exhausted_step=0
-        """
         history_window = int(bundle.runtime_cfg.history_window)
         retain_history = bool(bundle.runtime_cfg.retain_history)
         maxlen = history_window if (retain_history and history_window > 0) else None
+
         alpha_wealth = float(bundle.policy_spec.alpha_wealth_init)
         if not math.isfinite(alpha_wealth):
             alpha_wealth = 0.0
         alpha_wealth = max(0.0, min(alpha_wealth, float(bundle.policy_spec.alpha_wealth_cap)))
+
         exhausted_at_boot = bool(bundle.policy_spec.freeze_on_exhaust and alpha_wealth <= 0.0)
+
         return EProcessState(
             strict_log_e=0.0,
             controller_log_e=0.0,
@@ -3039,6 +3413,7 @@ class AlwaysValidRiskController:
         state.last_calibration_cfg_digest = evidence.calibration_cfg_digest
         state.last_calibration_state_digest = evidence.calibration_state_digest
         state.last_guarantee_scope = evidence.guarantee_scope if evidence.controller_p_kind in {"calibrated", "heuristic"} else "none"
+
         # Step evidence source counters / last p
         if evidence.current_step_has_direct_p and evidence.strict_p_value is not None:
             p = float(evidence.strict_p_value)
@@ -3060,17 +3435,20 @@ class AlwaysValidRiskController:
             state.last_p_value = 1.0
             state.last_p_source = "neutral"
             state.neutral_steps += 1
+
         # descriptive stats
         if evidence.current_step_has_controller_p and evidence.controller_p_value is not None:
             nl = -math.log(max(bundle.policy_spec.min_p_value, evidence.controller_p_value))
             a = bundle.runtime_cfg.ewma_alpha
             state.ewma_neglogp = nl if state.decisions == 1 else ((a * nl) + ((1.0 - a) * state.ewma_neglogp))
+
         if evidence.raw_score is not None:
             a = bundle.runtime_cfg.ewma_alpha
             state.ewma_score = evidence.raw_score if state.ewma_score is None else ((a * evidence.raw_score) + ((1.0 - a) * state.ewma_score))
             if state.max_score is None or evidence.raw_score > state.max_score:
                 state.max_score = evidence.raw_score
                 state.max_score_step = state.decisions
+
         if evidence.current_step_has_controller_p and evidence.controller_p_value is not None:
             pv = evidence.controller_p_value
             if pv < state.min_p_value:
@@ -3082,6 +3460,7 @@ class AlwaysValidRiskController:
                 state.small_p_count_01 += 1
             if pv <= 0.001:
                 state.small_p_count_001 += 1
+
         # Fisher diagnostic: direct p-values only
         if evidence.current_step_has_direct_p and evidence.strict_p_value is not None:
             try:
@@ -3089,12 +3468,14 @@ class AlwaysValidRiskController:
                 state.fisher_df += 2
             except Exception:
                 pass
+
         # History
         if bundle.runtime_cfg.retain_history and bundle.runtime_cfg.history_window > 0:
             if evidence.current_step_has_controller_p and evidence.controller_p_value is not None:
                 state.history_p.append(float(evidence.controller_p_value))
             if evidence.raw_score is not None:
                 state.history_score.append(float(evidence.raw_score))
+
         # Strict process: only direct p-values update
         if evidence.current_step_has_direct_p and evidence.strict_p_value is not None:
             strict_inc = self._e_log_increment(bundle, evidence.strict_p_value)
@@ -3102,6 +3483,7 @@ class AlwaysValidRiskController:
                 bundle.policy_spec.max_log_e,
                 max(bundle.policy_spec.min_log_e, state.strict_log_e + strict_inc),
             )
+
         # Controller track
         if bundle.policy_spec.freeze_on_exhaust and state.frozen:
             pass
@@ -3109,6 +3491,7 @@ class AlwaysValidRiskController:
             if bundle.policy_spec.alpha_spend_per_decision > 0.0:
                 spend = bundle.policy_spec.alpha_spend_per_decision * max(1.0, effective_weight)
                 state.alpha_wealth = max(0.0, state.alpha_wealth - spend)
+
             if evidence.current_step_has_controller_p and evidence.controller_p_value is not None:
                 controller_inc = self._e_log_increment(bundle, evidence.controller_p_value)
                 if evidence.controller_p_kind == "heuristic":
@@ -3128,16 +3511,20 @@ class AlwaysValidRiskController:
                 elif bundle.policy_spec.neutral_update_mode == "reward":
                     # reward handled after trigger evaluation on safe decision
                     pass
+
             if bundle.policy_spec.freeze_on_exhaust and state.alpha_wealth <= 0.0:
                 state.alpha_wealth = 0.0
                 state.frozen = True
                 if state.exhausted_step is None:
                     state.exhausted_step = state.decisions
+
         if bundle.runtime_cfg.retain_history and bundle.runtime_cfg.history_window > 0:
             state.history_log_e.append(float(state.controller_log_e))
+
     # ------------------------------------------------------------------
     # Internal helpers: result building / sinks
     # ------------------------------------------------------------------
+
     def _sanitize_meta_dict(self, bundle: _CompiledBundle, obj: Mapping[str, Any]) -> Dict[str, Any]:
         budget = _JsonBudget(
             max_nodes=bundle.runtime_cfg.meta_max_nodes,
@@ -3147,6 +3534,7 @@ class AlwaysValidRiskController:
         )
         safe = _json_sanitize(obj, budget=budget, depth=0, redact_secrets=True)
         return safe if isinstance(safe, dict) else {}
+
     def _build_process_block(
         self,
         bundle: _CompiledBundle,
@@ -3183,6 +3571,7 @@ class AlwaysValidRiskController:
                 "active": False,
                 "exhausted_step": None,
             }
+
         selected_log_e = st.strict_log_e if selected_source in {"strict", "dual_strict"} else st.controller_log_e
         return {
             "strict_e_value": _safe_exp(st.strict_log_e),
@@ -3210,6 +3599,7 @@ class AlwaysValidRiskController:
             "active": bool(st.active),
             "exhausted_step": st.exhausted_step,
         }
+
     def _build_stats_block(self, bundle: _CompiledBundle, st: Optional[EProcessState]) -> Dict[str, Any]:
         if st is None:
             return {
@@ -3229,6 +3619,7 @@ class AlwaysValidRiskController:
                 "small_p_count_01": 0,
                 "small_p_count_001": 0,
             }
+
         out = {
             "direct_p_steps": int(st.direct_p_steps),
             "calibrated_p_steps": int(st.calibrated_p_steps),
@@ -3254,6 +3645,7 @@ class AlwaysValidRiskController:
             "last_update_mono_ns": int(st.last_update_mono_ns),
             "last_update_unix_ns": int(st.last_update_unix_ns),
         }
+
         if bundle.runtime_cfg.include_history_in_snapshot and bundle.runtime_cfg.retain_history and bundle.runtime_cfg.history_window > 0:
             out["history"] = {
                 "p_values": list(st.history_p),
@@ -3261,6 +3653,7 @@ class AlwaysValidRiskController:
                 "controller_log_e": list(st.history_log_e),
             }
         return out
+
     def _build_validity_block(
         self,
         bundle: _CompiledBundle,
@@ -3282,6 +3675,7 @@ class AlwaysValidRiskController:
             "has_calibrated_history": bool(state.calibrated_p_steps > 0) if state is not None else False,
             "has_heuristic_history": bool(state.heuristic_p_steps > 0) if state is not None else False,
         }
+
     def _build_step_result(
         self,
         *,
@@ -3317,6 +3711,7 @@ class AlwaysValidRiskController:
                 "none",
             )
         )
+
         process = self._build_process_block(
             bundle,
             st,
@@ -3325,6 +3720,7 @@ class AlwaysValidRiskController:
         )
         stats = self._build_stats_block(bundle, st)
         validity = self._build_validity_block(bundle, evidence=evidence, selected_source=selected_source, state=st)
+
         security = {
             "av_label": bundle.policy_spec.label,
             "policyset_ref": bundle.policy_spec.policyset_ref,
@@ -3339,6 +3735,7 @@ class AlwaysValidRiskController:
             "state_scope": "local_best_effort",
             "state_domain_id": bundle.state_domain_id,
         }
+
         return {
             "allowed": bool(allowed),
             "action": action,
@@ -3392,6 +3789,7 @@ class AlwaysValidRiskController:
             },
             "security": security,
         }
+
     def _build_snapshot_result(
         self,
         *,
@@ -3426,9 +3824,11 @@ class AlwaysValidRiskController:
         else:
             selected_source = "strict" if bundle.policy_spec.decision_mode == "strict_only" else "controller"
             guarantee_scope = "none"
+
         process = self._build_process_block(bundle, state, selected_source=selected_source, guarantee_scope=guarantee_scope)
         stats = self._build_stats_block(bundle, state)
         validity = self._build_validity_block(bundle, evidence=neutral_evidence, selected_source=selected_source, state=state)
+
         return {
             "schema": _SCHEMA,
             "controller": {
@@ -3459,23 +3859,28 @@ class AlwaysValidRiskController:
             "stats": stats,
             "validity": validity,
         }
+
     def _emit_artifacts(self, *, bundle: _CompiledBundle, result: Dict[str, Any]) -> None:
         audit_ref: Optional[str] = None
         receipt_ref: Optional[str] = None
+
         should_audit = bool(bundle.runtime_cfg.audit_emit_all_steps)
         if result["reason"] in {"e-process-trigger", "e-process-trigger-advisory", "config_error", "identity_error", "state_capacity_exhausted", "backend_error", "backend_conflict"}:
             should_audit = should_audit or bundle.runtime_cfg.audit_emit_triggers
+
         if should_audit and self._audit_sink is not None:
             try:
                 payload = self._sanitize_meta_dict(bundle, result)
                 audit_ref = self._audit_sink.emit("always_valid.step", payload)
             except Exception:
                 self._audit_emit_failures += 1
+
         should_receipt = False
         if result["action"] == "block" and bundle.runtime_cfg.receipt_issue_on_block:
             should_receipt = True
         if result["reason"] == "e-process-trigger-advisory" and bundle.runtime_cfg.receipt_issue_on_trigger:
             should_receipt = True
+
         if should_receipt and self._receipt_sink is not None:
             try:
                 payload = {
@@ -3499,10 +3904,12 @@ class AlwaysValidRiskController:
                 receipt_ref = self._receipt_sink.issue(payload)
             except Exception:
                 self._receipt_emit_failures += 1
+
         if self._telemetry_sink is not None:
             should_metric = bool(bundle.runtime_cfg.telemetry_emit_all_steps)
             if result["reason"] in {"e-process-trigger", "e-process-trigger-advisory", "config_error", "identity_error", "state_capacity_exhausted", "backend_error", "backend_conflict"}:
                 should_metric = should_metric or bundle.runtime_cfg.telemetry_emit_triggers
+
             if should_metric:
                 labels = {
                     "profile": bundle.policy_spec.profile,
@@ -3518,8 +3925,10 @@ class AlwaysValidRiskController:
                     self._telemetry_sink.record_event("tcd.av.step", labels)
                 except Exception:
                     self._telemetry_emit_failures += 1
+
         result["audit_ref"] = audit_ref
         result["receipt_ref"] = receipt_ref
+
     def _emit_mutation_event(self, *, bundle: _CompiledBundle, event_type: str, payload: Mapping[str, Any]) -> None:
         if self._audit_sink is not None:
             try:
