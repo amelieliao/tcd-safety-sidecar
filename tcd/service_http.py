@@ -29,6 +29,13 @@ from starlette.middleware.cors import CORSMiddleware
 from .attest import Attestor
 from .config import make_reloadable_settings
 from .detector import TCDConfig, TraceCollapseDetector
+try:  # production detector runtime
+    from .detector import DetectRequest, DetectOut, Detector, build_default_detector
+except ImportError:  # pragma: no cover
+    DetectRequest = None  # type: ignore[assignment]
+    DetectOut = None  # type: ignore[assignment]
+    Detector = Any  # type: ignore[misc,assignment]
+    build_default_detector = None  # type: ignore[assignment]
 from .exporter import TCDPrometheusExporter
 from .kv import RollingHasher
 from .multivariate import MultiVarConfig, MultiVarDetector
@@ -981,7 +988,7 @@ class ServiceHttpConfig:
         "http://localhost:3000",
     )
 
-    receipts_enable_default: bool = False
+    receipts_enable_default: bool = True
     require_receipts_on_fail: bool = True
     require_receipts_when_pq: bool = True
     require_security_router_when_strict: bool = False
@@ -1177,7 +1184,7 @@ def _build_http_cfg_from_env() -> Tuple[ServiceHttpConfig, VerifyLimits]:
             "http://localhost",
             "http://localhost:3000",
         ),
-        receipts_enable_default=_coerce_bool(os.getenv("TCD_HTTP_RECEIPTS_ENABLE_DEFAULT"), default=False),
+        receipts_enable_default=_coerce_bool(os.getenv("TCD_HTTP_RECEIPTS_ENABLE_DEFAULT"), default=True),
         require_receipts_on_fail=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_RECEIPTS_ON_FAIL"), default=True),
         require_receipts_when_pq=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_RECEIPTS_WHEN_PQ"), default=True),
         require_security_router_when_strict=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_SECURITY_ROUTER_WHEN_STRICT"), default=False),
@@ -1743,23 +1750,82 @@ class EdgeLimiter:
         return True
 
 
+class _DetectorRuntimeUnavailable:
+    """
+    Formal-detector-shaped fail-closed placeholder.
+
+    This avoids accidentally routing through TraceCollapseDetector legacy shim
+    while still preserving a deterministic detector contract for HTTP.
+    """
+
+    def __init__(self, *, reason: str = "formal_detector_unavailable") -> None:
+        self.reason = _safe_text(reason, max_len=128) or "formal_detector_unavailable"
+
+    def detect(self, req: Any) -> Dict[str, Any]:
+        return {
+            "ok": False,
+            "decision": "block",
+            "decision_legacy": "block",
+            "action_hint": "BLOCK",
+            "reason_code": "FAIL_CLOSED_DETECTOR_UNAVAILABLE",
+            "error_code": "INTERNAL_ERROR",
+            "score_raw": 1.0,
+            "p_value": 1e-12,
+            "risk": 1.0,
+            "latency_ms": 0.0,
+            "budget_left_ms": 0.0,
+            "thresholds": {"risk_low": 0.2, "risk_high": 0.8},
+            "calibrator": {"mode": "unavailable"},
+            "calibrator_state": {"mode": "unavailable", "state_digest": f"det-unavailable:{self.reason}"},
+            "model": {"name": "unavailable", "version": "0"},
+            "engine_version": "detector_unavailable",
+            "config_hash": f"detcfg:{_hash_hex(ctx='tcd:http:det_unavailable_cfg', payload={'reason': self.reason}, out_hex=32)}",
+            "policy_digest": f"detpol:{_hash_hex(ctx='tcd:http:det_unavailable_policy', payload={'reason': self.reason}, out_hex=32)}",
+            "state_digest": f"detstate:{_hash_hex(ctx='tcd:http:det_unavailable_state', payload={'reason': self.reason}, out_hex=32)}",
+            "decision_id": f"detdec:{_hash_hex(ctx='tcd:http:det_unavailable_decision', payload={'reason': self.reason}, out_hex=32)}",
+            "evidence_hash": f"detev:{_hash_hex(ctx='tcd:http:det_unavailable_evidence', payload={'reason': self.reason}, out_hex=32)}",
+            "evidence": {"error": self.reason},
+        }
+
+    def state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "mode": "unavailable",
+            "reason": self.reason,
+            "state_digest": f"detstate:{_hash_hex(ctx='tcd:http:det_unavailable_state', payload={'reason': self.reason}, out_hex=32)}",
+        }
+
+    def snapshot_state(self) -> Dict[str, Any]:
+        return self.state_snapshot()
+
+    def load_state(self, state: Mapping[str, Any]) -> None:
+        return None
+
+
 @dataclass
 class DetectorRegistry:
     settings: Any
     det_lock: threading.RLock = field(default_factory=threading.RLock)
     av_lock: threading.RLock = field(default_factory=threading.RLock)
     mv_lock: threading.RLock = field(default_factory=threading.RLock)
-    detectors: Dict[Tuple[str, str, str, str], TraceCollapseDetector] = field(default_factory=dict)
+    detectors: Dict[Tuple[str, str, str, str], Any] = field(default_factory=dict)
     av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = field(default_factory=dict)
     mv_by_model: Dict[str, MultiVarDetector] = field(default_factory=dict)
 
-    def get_trace_detector(self, key: Tuple[str, str, str, str]) -> TraceCollapseDetector:
+    def get_trace_detector(self, key: Tuple[str, str, str, str]) -> Any:
         with self.det_lock:
             inst = self.detectors.get(key)
             if inst is None:
-                inst = TraceCollapseDetector(config=TCDConfig())
+                inst = None
+                if callable(build_default_detector):
+                    with contextlib.suppress(Exception):
+                        inst = build_default_detector()
+                if inst is None:
+                    inst = _DetectorRuntimeUnavailable(reason="formal_detector_build_failed")
                 self.detectors[key] = inst
             return inst
+
+    def get_detector_runtime(self, key: Tuple[str, str, str, str]) -> Any:
+        return self.get_trace_detector(key)
 
     def get_alpha_controller(self, subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
         with self.av_lock:
@@ -2263,7 +2329,11 @@ def create_http_runtime(
 
     service_token = (os.environ.get(cfg_norm.service_token_env_var) or "").strip()
 
-    if attestor is None and cfg_norm.receipts_enable_default:
+    if attestor is None and (
+        cfg_norm.receipts_enable_default
+        or cfg_norm.require_receipts_on_fail
+        or cfg_norm.require_receipts_when_pq
+    ):
         attestor = _build_attestor_compat(hash_alg=cfg_norm.hash_alg)
 
     receipt_mgr = ReceiptManager(
@@ -2761,6 +2831,29 @@ def create_app(
     def runtime_diagnostics(_auth: None = Depends(auth_dependency)) -> Dict[str, Any]:
         return rt.diagnostics()
 
+    def _detector_state_snapshot_public(det: Any) -> Dict[str, Any]:
+        for attr in ("state_snapshot", "snapshot_state"):
+            fn = getattr(det, attr, None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    out = fn()
+                    if isinstance(out, Mapping):
+                        return _sanitize_json_mapping(dict(out), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=64_000)
+        return {}
+
+    def _detector_state_load_compat(det: Any, state: Mapping[str, Any]) -> bool:
+        load_fn = getattr(det, "load_state", None)
+        if callable(load_fn):
+            with contextlib.suppress(Exception):
+                load_fn(dict(state))
+                return True
+        restore_fn = getattr(det, "restore_state", None)
+        if callable(restore_fn):
+            with contextlib.suppress(Exception):
+                restore_fn(dict(state))
+                return True
+        return False
+
     @app.get("/state/get")
     def state_get(
         model_id: str = "model0",
@@ -2769,8 +2862,8 @@ def create_app(
         lang: str = "en",
         _auth: None = Depends(auth_dependency),
     ) -> Dict[str, Any]:
-        det = rt.detector_registry.get_trace_detector((model_id, gpu_id, task, lang))
-        return {"detector": det.snapshot_state()}
+        det = rt.detector_registry.get_detector_runtime((model_id, gpu_id, task, lang))
+        return {"detector": _detector_state_snapshot_public(det)}
 
     @app.post("/state/load")
     def state_load(
@@ -2781,9 +2874,9 @@ def create_app(
         lang: str = "en",
         _auth: None = Depends(auth_dependency),
     ) -> Dict[str, Any]:
-        det = rt.detector_registry.get_trace_detector((model_id, gpu_id, task, lang))
-        det.load_state(payload.state)
-        return {"ok": True}
+        det = rt.detector_registry.get_detector_runtime((model_id, gpu_id, task, lang))
+        ok = _detector_state_load_compat(det, payload.state)
+        return {"ok": bool(ok), "loaded": bool(ok), "detector_state_supported": bool(ok)}
 
     def _request_identity(request: Request, req: DiagnoseRequest) -> Tuple[str, str, str]:
         request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or (req.request_id or uuid.uuid4().hex[:16])
@@ -2833,11 +2926,317 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limited")
         return cost, decision
 
+    def _build_detector_compat_text(
+        req: DiagnoseRequest,
+        *,
+        trace_vec: Sequence[float],
+        spectrum: Sequence[float],
+        features: Sequence[float],
+    ) -> str:
+        raw_text = ""
+        if isinstance(req.context, Mapping):
+            raw_text = _safe_text(req.context.get("detector_text"), max_len=16_384)
+        if raw_text:
+            return raw_text
+
+        payload = {
+            "trace_vector": [round(float(x), 6) for x in list(trace_vec)[:256]],
+            "entropy": _coerce_float(req.entropy),
+            "spectrum": [round(float(x), 6) for x in list(spectrum)[:256]],
+            "features": [round(float(x), 6) for x in list(features)[:256]],
+            "task": req.task,
+            "gpu_id": req.gpu_id,
+            "drift_score": _coerce_float(req.drift_score),
+            "step_id": _coerce_int(req.step_id) if req.step_id is not None else None,
+            "context": _safe_context_subset(dict(req.context or {})),
+        }
+        txt = _compact_json(payload, max_bytes=16_384)
+        return txt or "{}"
+
+    def _make_detector_request(
+        req: DiagnoseRequest,
+        *,
+        trace_vec: Sequence[float],
+        spectrum: Sequence[float],
+        features: Sequence[float],
+    ) -> Any:
+        if DetectRequest is None:
+            return None
+        meta = {
+            "entropy": _coerce_float(req.entropy),
+            "step_id": _coerce_int(req.step_id) if req.step_id is not None else None,
+            "task": req.task,
+            "gpu_id": req.gpu_id,
+            "trust_zone": req.trust_zone,
+            "route_profile": req.route_profile,
+            "risk_label": req.risk_label,
+            "drift_score": _coerce_float(req.drift_score),
+            "trace_len": len(trace_vec),
+            "spectrum_len": len(spectrum),
+            "feature_len": len(features),
+            "context": _safe_context_subset(dict(req.context or {})),
+        }
+        kwargs = {
+            "tenant": req.tenant,
+            "user": req.user,
+            "session": req.session,
+            "model_id": req.model_id,
+            "lang": req.lang,
+            "kind": "completion",
+            "text": _build_detector_compat_text(req, trace_vec=trace_vec, spectrum=spectrum, features=features),
+            "meta": meta,
+        }
+        with contextlib.suppress(Exception):
+            return DetectRequest(**kwargs)
+        return None
+
+    def _normalize_detector_runtime_out(out: Any) -> Dict[str, Any]:
+        if out is None:
+            return {}
+        if isinstance(out, Mapping):
+            return dict(out)
+        if hasattr(out, "model_dump"):
+            with contextlib.suppress(Exception):
+                dumped = out.model_dump()
+                if isinstance(dumped, Mapping):
+                    return dict(dumped)
+        if dataclasses.is_dataclass(out):
+            with contextlib.suppress(Exception):
+                dumped = dataclasses.asdict(out)
+                if isinstance(dumped, Mapping):
+                    return dict(dumped)
+        return {}
+
+    def _detector_runtime_to_verdict_pack(out: Any, *, step_id: Optional[int]) -> Dict[str, Any]:
+        raw = _normalize_detector_runtime_out(out)
+        if not raw:
+            return {"verdict": True, "score": 1.0, "p_value": 1e-12, "decision": "block", "action": "block", "step": int(step_id or 0), "components": {"reason": "detector_runtime_empty"}}
+
+        decision = _safe_text(raw.get("decision"), max_len=32).lower()
+        if decision not in {"allow", "throttle", "block"}:
+            decision = "block" if not _coerce_bool(raw.get("ok"), default=True) else "allow"
+
+        action = "degrade" if decision == "throttle" else decision
+        risk = _coerce_float(raw.get("risk"))
+        if risk is None:
+            risk = _coerce_float(raw.get("score"))
+        if risk is None:
+            risk = _coerce_float(raw.get("score_raw"))
+        if risk is None:
+            risk = 1.0 if decision != "allow" else 0.0
+        risk = max(0.0, min(1.0, float(risk)))
+
+        p_value = _coerce_float(raw.get("p_value"))
+        if p_value is None:
+            p_value = max(1e-12, min(1.0, 1.0 - risk))
+        p_value = max(1e-12, min(1.0, float(p_value)))
+
+        components = {
+            "detector_runtime": True,
+            "decision": decision,
+            "action": action,
+            "action_hint": _safe_text(raw.get("action_hint"), max_len=32) or None,
+            "reason_code": _safe_text(raw.get("reason_code"), max_len=128) or None,
+            "error_code": _safe_text(raw.get("error_code"), max_len=128) or None,
+            "risk": risk,
+            "p_value": p_value,
+            "score_raw": _coerce_float(raw.get("score_raw")),
+            "latency_ms": _coerce_float(raw.get("latency_ms")),
+            "budget_left_ms": _coerce_float(raw.get("budget_left_ms")),
+            "engine_version": _safe_text(raw.get("engine_version"), max_len=64) or None,
+            "config_hash": _safe_text(raw.get("config_hash"), max_len=128) or None,
+            "policy_digest": _safe_text(raw.get("policy_digest"), max_len=128) or None,
+            "state_digest": _safe_text(raw.get("state_digest"), max_len=128) or None,
+            "decision_id": _safe_text(raw.get("decision_id"), max_len=128) or None,
+            "evidence_hash": _safe_text(raw.get("evidence_hash"), max_len=128) or None,
+            "thresholds": raw.get("thresholds") if isinstance(raw.get("thresholds"), Mapping) else {},
+            "calibrator": raw.get("calibrator") if isinstance(raw.get("calibrator"), Mapping) else {},
+            "calibrator_state": raw.get("calibrator_state") if isinstance(raw.get("calibrator_state"), Mapping) else {},
+            "model": raw.get("model") if isinstance(raw.get("model"), Mapping) else {},
+            "evidence": raw.get("evidence") if isinstance(raw.get("evidence"), Mapping) else {},
+        }
+
+        return {
+            "verdict": decision != "allow",
+            "score": risk,
+            "risk": risk,
+            "p_value": p_value,
+            "decision": decision,
+            "action": action,
+            "reason_code": _safe_text(raw.get("reason_code"), max_len=128) or None,
+            "error_code": _safe_text(raw.get("error_code"), max_len=128) or None,
+            "decision_id": _safe_text(raw.get("decision_id"), max_len=128) or None,
+            "config_hash": _safe_text(raw.get("config_hash"), max_len=128) or None,
+            "policy_digest": _safe_text(raw.get("policy_digest"), max_len=128) or None,
+            "state_digest": _safe_text(raw.get("state_digest"), max_len=128) or None,
+            "step": int(step_id or 0),
+            "components": components,
+        }
+
+    def _run_detector_runtime(
+        det: Any,
+        *,
+        req: DiagnoseRequest,
+        trace_vec: Sequence[float],
+        spectrum: Sequence[float],
+        features: Sequence[float],
+    ) -> Dict[str, Any]:
+        detect_fn = getattr(det, "detect", None)
+        if callable(detect_fn):
+            dreq = _make_detector_request(req, trace_vec=trace_vec, spectrum=spectrum, features=features)
+            if dreq is not None:
+                with contextlib.suppress(Exception):
+                    return _detector_runtime_to_verdict_pack(detect_fn(dreq), step_id=req.step_id)
+
+        diagnose_fn = getattr(det, "diagnose", None)
+        if callable(diagnose_fn):
+            with contextlib.suppress(Exception):
+                vp = diagnose_fn(trace_vec, req.entropy, spectrum, step_id=req.step_id)
+                if isinstance(vp, Mapping):
+                    out = dict(vp)
+                    if "p_value" not in out:
+                        score0 = float(_coerce_float(out.get("score")) or 0.0)
+                        out["p_value"] = max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score0))))
+                    if "action" not in out:
+                        out["action"] = "block" if _coerce_bool(out.get("verdict"), default=False) else "allow"
+                    return out
+
+        return {"verdict": True, "score": 1.0, "p_value": 1e-12, "decision": "block", "action": "block", "step": int(req.step_id or 0), "components": {"reason": "detector_runtime_unavailable"}}
+
+    def _extract_detector_signal(verdict_pack: Mapping[str, Any]) -> Dict[str, Any]:
+        decision = _safe_text(verdict_pack.get("decision"), max_len=32).lower()
+        action = _safe_text(verdict_pack.get("action"), max_len=32).lower()
+
+        if decision not in {"allow", "throttle", "block"}:
+            decision = ""
+        if action not in {"allow", "degrade", "block", "deny", "advisory"}:
+            if decision == "throttle":
+                action = "degrade"
+            elif decision == "block":
+                action = "block"
+            else:
+                action = "allow"
+
+        risk_score = _coerce_float(verdict_pack.get("risk"))
+        if risk_score is None:
+            risk_score = _coerce_float(verdict_pack.get("score"))
+        if risk_score is None:
+            risk_score = 1.0 if _coerce_bool(verdict_pack.get("verdict"), default=False) else 0.0
+        risk_score = max(0.0, min(1.0, float(risk_score)))
+
+        p_value = _coerce_float(verdict_pack.get("p_value"))
+        if p_value is None:
+            p_value = max(1e-12, min(1.0, 1.0 - risk_score))
+        p_value = max(1e-12, min(1.0, float(p_value)))
+
+        decision_fail = bool(
+            _coerce_bool(verdict_pack.get("verdict"), default=False)
+            or decision in {"block", "throttle"}
+            or action in {"block", "degrade", "deny", "advisory"}
+        )
+        return {
+            "decision": decision,
+            "action": action,
+            "risk_score": risk_score,
+            "p_value": p_value,
+            "decision_fail": decision_fail,
+            "reason_code": _safe_text(verdict_pack.get("reason_code"), max_len=128) or None,
+            "error_code": _safe_text(verdict_pack.get("error_code"), max_len=128) or None,
+            "decision_id": _safe_text(verdict_pack.get("decision_id"), max_len=128) or None,
+            "config_hash": _safe_text(verdict_pack.get("config_hash"), max_len=128) or None,
+            "policy_digest": _safe_text(verdict_pack.get("policy_digest"), max_len=128) or None,
+            "state_digest": _safe_text(verdict_pack.get("state_digest"), max_len=128) or None,
+        }
+
+    def _manual_route_action(
+        route: Any,
+        decision_fail: bool,
+        *,
+        threat_kind: Optional[str],
+        threat_conf: Optional[float],
+        pq_required: bool,
+        pq_ok: Optional[bool],
+    ) -> str:
+        req_action = _safe_text(getattr(route, "required_action", ""), max_len=32).lower() if route is not None else ""
+        if req_action == "block":
+            return "block"
+        if req_action == "degrade":
+            return "degrade"
+        if decision_fail:
+            if threat_kind in ("apt", "supply_chain") and (threat_conf or 0.0) >= 0.9:
+                return "block"
+            if pq_required and pq_ok is False:
+                return "block"
+            return "degrade"
+        return "none"
+
+    def _build_synthetic_route_contract(
+        *,
+        req: DiagnoseRequest,
+        request_id: str,
+        event_id: str,
+        score: float,
+        decision_fail: bool,
+        av_trigger: bool,
+        controller_mode: Optional[str],
+        guarantee_scope: Optional[str],
+        av_label: Optional[str],
+        threat_kind: Optional[str],
+    ) -> Dict[str, Any]:
+        required_action = "block" if (
+            decision_fail
+            and (
+                req.risk_label == "critical"
+                or (threat_kind in {"apt", "supply_chain"} and (_coerce_float(req.threat_confidence) or 0.0) >= 0.9)
+            )
+        ) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
+        return {
+            "schema": "tcd.route.synthetic.v1",
+            "router": "tcd.service_http",
+            "version": "1.0.0",
+            "config_fingerprint": rt.bundle.cfg_fp,
+            "bundle_version": rt.bundle.version,
+            "router_mode": "degraded",
+            "route_id_kind": "plan",
+            "route_plan_id": "rp1:sha256:" + _hash_hex(ctx="tcd:http:route_plan", payload={"event_id": event_id, "reason": "route_unavailable"}, out_hex=32),
+            "route_id": None,
+            "decision_id": "rd1:sha256:" + _hash_hex(ctx="tcd:http:route_decision", payload={"event_id": event_id, "reason": "route_unavailable"}, out_hex=32),
+            "decision_ts_unix_ns": time.time_ns(),
+            "decision_ts_mono_ns": time.monotonic_ns(),
+            "safety_tier": "strict" if required_action == "block" else ("elevated" if required_action == "degrade" else "normal"),
+            "required_action": required_action,
+            "action_hint": required_action,
+            "enforcement_mode": "fail_closed" if required_action == "block" else ("must_enforce" if required_action == "degrade" and cfgb.strict_mode else "advisory"),
+            "temperature": 0.2 if required_action == "block" else (0.4 if required_action == "degrade" else req.base_temp),
+            "top_p": 0.4 if required_action == "block" else (0.6 if required_action == "degrade" else req.base_top_p),
+            "decoder": "safe" if required_action != "allow" else "default",
+            "latency_hint": "high_safety" if required_action != "allow" else "normal",
+            "trust_zone": req.trust_zone,
+            "route_profile": req.route_profile,
+            "risk_label": req.risk_label,
+            "score": score,
+            "decision_fail": decision_fail,
+            "e_triggered": av_trigger,
+            "pq_unhealthy": False,
+            "av_label": av_label,
+            "av_trigger": av_trigger,
+            "threat_tags": [threat_kind] if threat_kind else [],
+            "controller_mode": controller_mode,
+            "guarantee_scope": guarantee_scope,
+            "signal_digest": "sg1:sha256:" + _hash_hex(ctx="tcd:http:signal", payload={"score": score, "decision_fail": decision_fail, "e_triggered": av_trigger, "threat_kind": threat_kind}, out_hex=32),
+            "context_digest": "cx1:sha256:" + _hash_hex(ctx="tcd:http:context", payload={"trust_zone": req.trust_zone, "route_profile": req.route_profile, "request_id": request_id}, out_hex=32),
+            "primary_reason_code": "ROUTE_UNAVAILABLE",
+            "reason_codes": ["ROUTE_UNAVAILABLE"],
+            "degraded_reason_codes": ["ROUTE_UNAVAILABLE"],
+            "reason": "route_unavailable",
+        }
+
     def _build_detector_payload(
         *,
         req: DiagnoseRequest,
         score: float,
         decision_fail: bool,
+        verdict_pack: Mapping[str, Any],
         av_out: Mapping[str, Any],
         threat_kind: Optional[str],
         event_id: str,
@@ -2846,19 +3245,28 @@ def create_app(
     ) -> Dict[str, Any]:
         e_state = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
         security = av_out.get("security") if isinstance(av_out.get("security"), Mapping) else {}
+        det_signal = _extract_detector_signal(verdict_pack)
+        action = det_signal.get("action") or ("block" if decision_fail and req.risk_label == "critical" else ("degrade" if decision_fail else "allow"))
+        if action == "deny":
+            action = "block"
         return {
-            "risk_score": float(score),
+            "risk_score": float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else score),
             "risk_label": req.risk_label,
-            "action": "block" if decision_fail and req.risk_label == "critical" else ("degrade" if decision_fail else "allow"),
+            "action": action,
             "trigger": bool(decision_fail),
+            "reason": _safe_text(det_signal.get("reason_code") or verdict_pack.get("reason_code"), max_len=128) or None,
             "controller_mode": _safe_text(security.get("controller_mode", ""), max_len=64) or None,
             "guarantee_scope": _safe_text(security.get("statistical_guarantee_scope", ""), max_len=128) or None,
             "av_label": _safe_text(getattr(getattr(rt.detector_registry.get_alpha_controller((req.tenant, req.user, req.session)), "config", None), "label", None), max_len=64) or None,
             "av_trigger": bool(av_out.get("trigger", False)),
             "threat_tags": [threat_kind] if threat_kind else [],
+            "decision_id": det_signal.get("decision_id"),
+            "config_hash": det_signal.get("config_hash"),
+            "policy_digest": det_signal.get("policy_digest"),
+            "state_digest": det_signal.get("state_digest"),
             "e_state": dict(e_state) if isinstance(e_state, Mapping) else {},
             "security": {
-                **dict(security) if isinstance(security, Mapping) else {},
+                **(dict(security) if isinstance(security, Mapping) else {}),
                 "request_id": request_id,
                 "event_id": event_id,
                 "body_digest": body_digest,
@@ -2874,6 +3282,7 @@ def create_app(
         event_id: str,
         score: float,
         decision_fail: bool,
+        verdict_pack: Mapping[str, Any],
         av_out: Mapping[str, Any],
         threat_kind: Optional[str],
     ) -> Any:
@@ -2918,6 +3327,7 @@ def create_app(
             req=req,
             score=score,
             decision_fail=decision_fail,
+            verdict_pack=verdict_pack,
             av_out=av_out,
             threat_kind=threat_kind,
             event_id=event_id,
@@ -2995,11 +3405,18 @@ def create_app(
         features = _sanitize_numeric_array(req.features, max_len=_MAX_FEATS)
 
         det_key = (req.model_id, req.gpu_id, req.task, req.lang)
-        det = rt.detector_registry.get_trace_detector(det_key)
-        verdict_pack = det.diagnose(trace_vec, req.entropy, spectrum, step_id=req.step_id)
+        det = rt.detector_registry.get_detector_runtime(det_key)
+        verdict_pack = _run_detector_runtime(
+            det,
+            req=req,
+            trace_vec=trace_vec,
+            spectrum=spectrum,
+            features=features,
+        )
         if not isinstance(verdict_pack, Mapping):
-            verdict_pack = {"verdict": False, "score": 0.0, "components": {}, "step": 0}
+            verdict_pack = {"verdict": True, "score": 1.0, "p_value": 1e-12, "decision": "block", "action": "block", "components": {"reason": "detector_runtime_invalid"}, "step": int(req.step_id or 0)}
         verdict_pack = dict(verdict_pack)
+        det_signal = _extract_detector_signal(verdict_pack)
 
         mv_info: Dict[str, Any] = {}
         if features:
@@ -3009,8 +3426,8 @@ def create_app(
                 if not isinstance(mv_info, Mapping):
                     mv_info = {}
 
-        score = float(_coerce_float(verdict_pack.get("score")) or 0.0)
-        p_final = max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score))))
+        score = float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else 0.0)
+        p_final = float(det_signal.get("p_value") if det_signal.get("p_value") is not None else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score)))))
         drift_w = max(0.0, min(2.0, 1.0 + 0.5 * float(req.drift_score or 0.0)))
 
         av = rt.detector_registry.get_alpha_controller(subject)
@@ -3037,7 +3454,7 @@ def create_app(
             },
         )
         budget = _alpha_budget_or_fail(av_out, tenant=req.tenant, user=req.user, session=req.session)
-        decision_fail = bool(_coerce_bool(verdict_pack.get("verdict"), default=False) or budget.triggered)
+        decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
 
         route = _route_decide_compat(
             rt.router,
@@ -3081,16 +3498,30 @@ def create_app(
             event_id=event_id,
             score=score,
             decision_fail=decision_fail,
+            verdict_pack=verdict_pack,
             av_out=av_out,
             threat_kind=req.threat_kind,
         )
 
         route_info = _extract_route_dict(route)
+        if not route_info:
+            route_info = _build_synthetic_route_contract(
+                req=req,
+                request_id=request_id,
+                event_id=event_id,
+                score=score,
+                decision_fail=decision_fail,
+                av_trigger=budget.triggered,
+                controller_mode=budget.controller_mode,
+                guarantee_scope=budget.statistical_guarantee_scope,
+                av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                threat_kind=req.threat_kind,
+            )
         allowed = True
         required_action = _route_required_action(route)
         enforcement_mode = _route_enforcement_mode(route)
         action_str = "none"
-        cause = "detector" if _coerce_bool(verdict_pack.get("verdict"), default=False) else ("av" if budget.triggered else "")
+        cause = _safe_text(det_signal.get("reason_code") or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")), max_len=128) or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
         receipt_data: Dict[str, Any] = {}
         audit_ref: Optional[str] = None
         receipt_ref: Optional[str] = None
@@ -3142,18 +3573,34 @@ def create_app(
             evidence_identity = _sanitize_json_mapping(getattr(security_decision, "evidence_identity", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
             artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
         else:
-            required_action = required_action if required_action in {"allow", "degrade", "block"} else ("degrade" if decision_fail else "allow")
-            action_str = rt.trust_wrapper.classify(score=score, decision_fail=decision_fail)
+            required_action = required_action if required_action in {"allow", "degrade", "block"} else (
+                "block" if (cfgb.strict_mode and req.risk_label == "critical" and decision_fail) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
+            )
+            action_str = _manual_route_action(
+                route,
+                decision_fail,
+                threat_kind=req.threat_kind,
+                threat_conf=req.threat_confidence,
+                pq_required=bool(req.pq_required),
+                pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
+            )
             if action_str not in _ALLOWED_ACTIONS:
-                action_str = "degrade" if decision_fail else "allow"
-            if action_str == "allow":
-                action_str = "none"
-            allowed = action_str != "block"
+                action_str = "degrade" if (decision_fail or cfgb.strict_mode) else "none"
             if required_action == "block":
                 action_str = "block"
                 allowed = False
-            elif required_action == "degrade" and action_str == "none":
-                action_str = "degrade"
+            elif required_action == "degrade":
+                if action_str in {"allow", "none"}:
+                    action_str = "degrade"
+                allowed = True
+            else:
+                if action_str == "allow":
+                    action_str = "none"
+                allowed = action_str != "block"
+
+            enforcement_mode = _safe_text(route_info.get("enforcement_mode"), max_len=32).lower() or (
+                "fail_closed" if (required_action == "block" and cfgb.strict_mode) else ("must_enforce" if (required_action != "allow" and cfgb.strict_mode) else "advisory")
+            )
             security_block = {
                 "trust_zone": req.trust_zone,
                 "route_profile": req.route_profile,
@@ -3162,6 +3609,11 @@ def create_app(
                 "threat_confidence": req.threat_confidence,
                 "pq_required": req.pq_required,
                 "pq_ok": route_info.get("pq_ok"),
+                "policy_ref": policy_ref,
+                "route_id": route_plan_id,
+                "build_id": req.build_id,
+                "image_digest": req.image_digest,
+                "compliance_tags": list(req.compliance_tags),
                 "request_id": request_id,
                 "event_id": event_id,
                 "body_digest": body_digest,
@@ -3236,7 +3688,25 @@ def create_app(
         }
 
         components: Dict[str, Any] = {
-            "detector": _sanitize_json_mapping(verdict_pack.get("components", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000),
+            "detector": _sanitize_json_mapping(
+                {
+                    **(dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {}),
+                    "decision": verdict_pack.get("decision"),
+                    "action": verdict_pack.get("action"),
+                    "risk": verdict_pack.get("risk"),
+                    "p_value": verdict_pack.get("p_value"),
+                    "reason_code": verdict_pack.get("reason_code"),
+                    "error_code": verdict_pack.get("error_code"),
+                    "decision_id": verdict_pack.get("decision_id"),
+                    "config_hash": verdict_pack.get("config_hash"),
+                    "policy_digest": verdict_pack.get("policy_digest"),
+                    "state_digest": verdict_pack.get("state_digest"),
+                },
+                max_depth=5,
+                max_items=64,
+                max_str_len=512,
+                max_total_bytes=64_000,
+            ),
             "multivariate": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
             "e_process": _sanitize_json_mapping(av_out.get("e_state", {}), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=96_000),
             "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
@@ -3331,7 +3801,7 @@ def create_app(
         response.headers["X-TCD-Decision-Id"] = decision_id
         response.headers["X-TCD-Route-Plan-Id"] = route_plan_id
 
-        decision_label = "block" if required_action == "block" else ("degrade" if required_action == "degrade" else "allow")
+        decision_label = "block" if action_str == "block" else ("degrade" if action_str in {"degrade", "advisory"} or required_action == "degrade" else "allow")
 
         return RiskResponse(
             verdict=bool(required_action != "allow"),
