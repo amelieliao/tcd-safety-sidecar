@@ -1,5 +1,3 @@
-下面是按你贴出来的版本，直接把 _make_initial_state(...) 插进 AlwaysValidRiskController 里、位置放在 _selected_track(...) 后面、_update_state(...) 前面 的完整代码框。
-
 from __future__ import annotations
 import base64
 import hashlib
