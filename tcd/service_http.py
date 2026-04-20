@@ -16,7 +16,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
@@ -28,14 +28,6 @@ from starlette.middleware.cors import CORSMiddleware
 
 from .attest import Attestor
 from .config import make_reloadable_settings
-from .detector import TCDConfig, TraceCollapseDetector
-try:  # production detector runtime
-    from .detector import DetectRequest, DetectOut, Detector, build_default_detector
-except ImportError:  # pragma: no cover
-    DetectRequest = None  # type: ignore[assignment]
-    DetectOut = None  # type: ignore[assignment]
-    Detector = Any  # type: ignore[misc,assignment]
-    build_default_detector = None  # type: ignore[assignment]
 from .exporter import TCDPrometheusExporter
 from .kv import RollingHasher
 from .multivariate import MultiVarConfig, MultiVarDetector
@@ -44,7 +36,18 @@ from .receipt_v2 import build_v2_body
 from .routing import StrategyRouter
 from .telemetry_gpu import GpuSampler
 from .utils import sanitize_floats
-from .verify import verify_chain, verify_receipt
+from .verify import verify_chain, verify_receipt_ex
+
+try:  # formal detector runtime
+    from .detector import DetectRequest, build_default_detector
+except Exception:  # pragma: no cover
+    DetectRequest = None  # type: ignore[assignment]
+    build_default_detector = None  # type: ignore[assignment]
+
+try:
+    from .schemas import ReceiptView
+except Exception:  # pragma: no cover
+    ReceiptView = None  # type: ignore[assignment]
 
 try:
     from .ratelimit import RateLimiter
@@ -140,9 +143,9 @@ __all__ = [
 _LOG = logging.getLogger(__name__)
 _SETTINGS = make_reloadable_settings()
 
-_SCHEMA = "tcd.http.service.v4"
-_EVENT_ID_VERSION = "hev2"
-_CFG_FP_VERSION = "hcfg2"
+_SCHEMA = "tcd.http.service.v5"
+_EVENT_ID_VERSION = "hev3"
+_CFG_FP_VERSION = "hcfg3"
 _SAFE_DIGEST_ALG = "sha256"
 
 _ALLOWED_TRUST_ZONES = frozenset({"internet", "internal", "partner", "admin", "ops"})
@@ -175,7 +178,6 @@ _DEFAULT_MAX_JSON_DEPTH = 16
 # ---------------------------------------------------------------------------
 # Low-level hardening helpers
 # ---------------------------------------------------------------------------
-
 
 def _has_unsafe_unicode(s: str) -> bool:
     for ch in s:
@@ -253,6 +255,30 @@ def _safe_text(v: Any, *, max_len: int = 256) -> str:
     return f"<{type(v).__name__}>"
 
 
+def _opaque_text(v: Any, *, max_bytes: int) -> Optional[str]:
+    """
+    Opaque text path for receipt_body: NEVER sanitize, normalize, or truncate.
+    """
+    if not isinstance(v, str):
+        return None
+    try:
+        b = v.encode("utf-8", errors="strict")
+    except Exception:
+        return None
+    if len(b) > max_bytes:
+        return None
+    return v
+
+
+def _opaque_handle(v: Any, *, max_len: int = 4096) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s or len(s) > max_len:
+        return None
+    return s
+
+
 def _coerce_float(v: Any) -> Optional[float]:
     if type(v) is bool:
         return None
@@ -315,22 +341,14 @@ def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
     x = _coerce_float(v)
     if x is None:
         return float(default)
-    if x < lo:
-        return float(lo)
-    if x > hi:
-        return float(hi)
-    return float(x)
+    return float(min(hi, max(lo, x)))
 
 
 def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
     x = _coerce_int(v)
     if x is None:
         return int(default)
-    if x < lo:
-        return int(lo)
-    if x > hi:
-        return int(hi)
-    return int(x)
+    return int(min(hi, max(lo, x)))
 
 
 def _stable_float(x: float) -> str:
@@ -375,7 +393,6 @@ def _hash_hex(*, ctx: str, payload: Mapping[str, Any], out_hex: int = 32, alg: s
     if alg == "blake3":
         try:
             from .crypto import Blake3Hash  # type: ignore
-
             return Blake3Hash().hex(raw, ctx=ctx)[:out_hex]
         except Exception:
             pass
@@ -386,7 +403,6 @@ def _body_digest(body: bytes, *, alg: str) -> str:
     if alg == "blake3":
         try:
             from .crypto import Blake3Hash  # type: ignore
-
             return f"body:blake3:{Blake3Hash().hex(body, ctx='tcd:http:body')[:32]}"
         except Exception:
             pass
@@ -497,13 +513,7 @@ class _JsonBudget:
         return self.str_used <= self.max_str_total
 
 
-def _safe_json_value(
-    obj: Any,
-    *,
-    budget: _JsonBudget,
-    depth: int,
-    max_str_len: int,
-) -> Any:
+def _safe_json_value(obj: Any, *, budget: _JsonBudget, depth: int, max_str_len: int) -> Any:
     if not budget.take_node():
         return "[truncated]"
     t = type(obj)
@@ -584,6 +594,7 @@ def _safe_context_subset(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "route_profile",
         "risk_label",
         "threat_kind",
+        "detector_text",
     }
     out: Dict[str, Any] = {}
     for k in allow_keys:
@@ -668,11 +679,6 @@ def _extract_security_public(decision: Any) -> Dict[str, Any]:
     return {}
 
 
-def _extract_mapping_attr(obj: Any, attr: str) -> Dict[str, Any]:
-    val = getattr(obj, attr, None)
-    return _extract_receipt_like(val)
-
-
 def _route_required_action(route: Any) -> str:
     route_dict = _extract_route_dict(route)
     val = _safe_label(route_dict.get("required_action"), default="")
@@ -742,7 +748,6 @@ def _route_decide_compat(
 
     try:
         from .routing import StrategyRouteContext, StrategySignalEnvelope  # type: ignore
-
         kwargs["route_context"] = StrategyRouteContext(
             request_id=request_id,
             trace_id=trace_id,
@@ -765,8 +770,7 @@ def _route_decide_compat(
         pass
 
     try:
-        call_kwargs = _filtered_kwargs_for(router.decide, kwargs)
-        return router.decide(**call_kwargs)
+        return router.decide(**_filtered_kwargs_for(router.decide, kwargs))
     except TypeError:
         try:
             return router.decide(
@@ -806,7 +810,6 @@ def _av_step_compat(
 ) -> Dict[str, Any]:
     if av is None:
         return {}
-
     kwargs = {
         "request": req,
         "stream_id": f"{subject[0]}:{subject[1]}:{subject[2]}:{model_id}",
@@ -820,13 +823,11 @@ def _av_step_compat(
         "pvals": {"final": float(p_value)},
         "drift_weight": float(drift_weight),
     }
-
     step_fn = getattr(av, "step", None)
     if not callable(step_fn):
         return {}
     try:
-        call_kwargs = _filtered_kwargs_for(step_fn, kwargs)
-        out = step_fn(**call_kwargs)
+        out = step_fn(**_filtered_kwargs_for(step_fn, kwargs))
         return dict(out) if isinstance(out, Mapping) else {}
     except TypeError:
         pass
@@ -941,14 +942,117 @@ def _security_context_compat(
         return None
 
 
+def _hash_handle_public(handle: Optional[str]) -> Optional[str]:
+    if not handle:
+        return None
+    return "vk1:" + _hash_hex(ctx="tcd:http:verify_key_handle", payload={"handle": handle}, out_hex=24)
+
+
+def _receipt_view_model(payload: Mapping[str, Any]) -> Any:
+    if ReceiptView is None:
+        return None
+    try:
+        if hasattr(ReceiptView, "model_validate"):
+            return ReceiptView.model_validate(dict(payload))
+        return ReceiptView(**dict(payload))
+    except Exception:
+        return None
+
+
+def _fallback_receipt_public(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema": payload.get("schema"),
+        "head": payload.get("receipt") or payload.get("head"),
+        "receipt_ref": payload.get("receipt_ref") or payload.get("receipt") or payload.get("head"),
+        "audit_ref": payload.get("audit_ref"),
+        "event_id": payload.get("event_id"),
+        "decision_id": payload.get("decision_id"),
+        "route_plan_id": payload.get("route_plan_id"),
+        "policy_ref": payload.get("policy_ref"),
+        "policyset_ref": payload.get("policyset_ref"),
+        "cfg_fp": payload.get("cfg_fp"),
+        "verify_key_id": payload.get("verify_key_id"),
+        "verify_key_fp": payload.get("verify_key_fp"),
+        "receipt_integrity": payload.get("receipt_integrity"),
+        "pq_signature_required": payload.get("pq_signature_required"),
+        "pq_signature_ok": payload.get("pq_signature_ok"),
+        "integrity_ok": payload.get("integrity_ok"),
+        "integrity_errors": payload.get("integrity_errors") or [],
+    }
+
+
+def _fallback_receipt_verification(payload: Mapping[str, Any], *, include_verify_key: bool) -> Dict[str, Any]:
+    return {
+        "schema": payload.get("schema"),
+        "head": payload.get("receipt") or payload.get("head"),
+        "body": payload.get("receipt_body") or payload.get("body"),
+        "sig": payload.get("receipt_sig") or payload.get("sig"),
+        "verify_key": payload.get("verify_key") if include_verify_key else None,
+        "verify_key_id": payload.get("verify_key_id"),
+        "verify_key_fp": payload.get("verify_key_fp"),
+        "receipt_integrity": payload.get("receipt_integrity"),
+        "body_kind": payload.get("body_kind"),
+        "body_digest": payload.get("body_digest"),
+        "head_verified": payload.get("head_verified"),
+        "body_canonical_verified": payload.get("body_canonical_verified"),
+        "integrity_hash_verified": payload.get("integrity_hash_verified"),
+        "signature_verified": payload.get("signature_verified"),
+        "verify_key_allowed": payload.get("verify_key_allowed"),
+        "policy_binding_verified": payload.get("policy_binding_verified"),
+        "cfg_binding_verified": payload.get("cfg_binding_verified"),
+        "integrity_ok": payload.get("integrity_ok"),
+        "integrity_errors": payload.get("integrity_errors") or [],
+    }
+
+
+def _build_receipt_surfaces(
+    payload: Mapping[str, Any],
+    *,
+    expose_verification_bundle_public: bool,
+    expose_verify_key_public: bool,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    rv = _receipt_view_model(payload)
+    if rv is not None:
+        with contextlib.suppress(Exception):
+            pub = rv.to_public_dict(strict=False)
+            ver = rv.to_verification_dict(strict=False, include_verify_key=bool(expose_verify_key_public))
+            return dict(pub or {}), (dict(ver or {}) if expose_verification_bundle_public else None)
+    pub2 = _fallback_receipt_public(payload)
+    ver2 = _fallback_receipt_verification(payload, include_verify_key=bool(expose_verify_key_public))
+    return pub2, (ver2 if expose_verification_bundle_public else None)
+
+
+def _compute_array_digest(trace: Sequence[float], spectrum: Sequence[float], features: Sequence[float], *, alg: str) -> str:
+    if RollingHasher is not None:
+        with contextlib.suppress(Exception):
+            rh = RollingHasher(alg=alg, ctx="tcd:http:array_digest")
+            rh.update_ints([int(round(float(x) * 1_000_000.0)) for x in list(trace)[:1024]])
+            rh.update_ints([int(round(float(x) * 1_000_000.0)) for x in list(spectrum)[:1024]])
+            rh.update_ints([int(round(float(x) * 1_000_000.0)) for x in list(features)[:1024]])
+            return rh.hex()
+    raw = _canon_json_bytes(
+        {
+            "trace": [round(float(x), 6) for x in list(trace)[:1024]],
+            "spectrum": [round(float(x), 6) for x in list(spectrum)[:1024]],
+            "features": [round(float(x), 6) for x in list(features)[:1024]],
+        }
+    )
+    if alg == "blake3":
+        try:
+            from .crypto import Blake3Hash  # type: ignore
+            return Blake3Hash().hex(raw, ctx="tcd:http:array_digest")
+        except Exception:
+            pass
+    return hashlib.sha256(raw).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Config and response models
 # ---------------------------------------------------------------------------
 
-
 @dataclass(frozen=True)
 class ServiceHttpConfig:
-    api_version: str = "0.14.0"
+    api_version: str = "0.15.0"
     enable_docs: bool = False
     strict_mode: bool = False
 
@@ -993,8 +1097,13 @@ class ServiceHttpConfig:
     require_receipts_when_pq: bool = True
     require_security_router_when_strict: bool = False
     require_attestor_when_receipt_required: bool = False
+    require_finalized_receipt_surface_when_strict: bool = True
+
     expose_verify_key_public: bool = False
-    expose_receipt_body_public: bool = True
+    expose_verification_bundle_public: bool = False
+    expose_legacy_receipt_aliases: bool = False
+
+    allow_detector_text_synthesis_for_compat: bool = False
 
     hash_alg: str = "blake3"
     alpha_wealth_floor: float = -1.0
@@ -1003,7 +1112,7 @@ class ServiceHttpConfig:
     image_digest: Optional[str] = None
 
     def normalized_copy(self) -> "ServiceHttpConfig":
-        api_version = _safe_text(self.api_version, max_len=32) or "0.14.0"
+        api_version = _safe_text(self.api_version, max_len=32) or "0.15.0"
         hash_alg = _safe_label(self.hash_alg, default="sha256")
         if hash_alg not in _ALLOWED_HASH_ALGS:
             hash_alg = "sha256"
@@ -1063,8 +1172,11 @@ class ServiceHttpConfig:
             require_receipts_when_pq=bool(self.require_receipts_when_pq),
             require_security_router_when_strict=bool(self.require_security_router_when_strict),
             require_attestor_when_receipt_required=bool(self.require_attestor_when_receipt_required),
+            require_finalized_receipt_surface_when_strict=bool(self.require_finalized_receipt_surface_when_strict),
             expose_verify_key_public=bool(self.expose_verify_key_public),
-            expose_receipt_body_public=bool(self.expose_receipt_body_public),
+            expose_verification_bundle_public=bool(self.expose_verification_bundle_public),
+            expose_legacy_receipt_aliases=bool(self.expose_legacy_receipt_aliases),
+            allow_detector_text_synthesis_for_compat=bool(self.allow_detector_text_synthesis_for_compat),
             hash_alg=hash_alg,
             alpha_wealth_floor=_clamp_float(self.alpha_wealth_floor, default=-1.0, lo=-10_000.0, hi=10_000.0),
             build_id=_safe_text(self.build_id, max_len=128) or None,
@@ -1106,8 +1218,11 @@ class ServiceHttpConfig:
             "require_receipts_when_pq": cfg.require_receipts_when_pq,
             "require_security_router_when_strict": cfg.require_security_router_when_strict,
             "require_attestor_when_receipt_required": cfg.require_attestor_when_receipt_required,
+            "require_finalized_receipt_surface_when_strict": cfg.require_finalized_receipt_surface_when_strict,
             "expose_verify_key_public": cfg.expose_verify_key_public,
-            "expose_receipt_body_public": cfg.expose_receipt_body_public,
+            "expose_verification_bundle_public": cfg.expose_verification_bundle_public,
+            "expose_legacy_receipt_aliases": cfg.expose_legacy_receipt_aliases,
+            "allow_detector_text_synthesis_for_compat": cfg.allow_detector_text_synthesis_for_compat,
             "hash_alg": cfg.hash_alg,
             "alpha_wealth_floor": _stable_float(cfg.alpha_wealth_floor),
             "build_id": cfg.build_id,
@@ -1119,7 +1234,7 @@ class ServiceHttpConfig:
 @dataclass(frozen=True)
 class VerifyLimits:
     max_head_hex_len: int = 130
-    max_verify_key_hex_len: int = 200
+    max_verify_key_len: int = 512
     max_sig_hex_len: int = 200
     max_receipt_body_bytes: int = _DEFAULT_RECEIPT_BODY_LIMIT
     max_window: int = 4096
@@ -1128,7 +1243,7 @@ class VerifyLimits:
     def normalized_copy(self) -> "VerifyLimits":
         return VerifyLimits(
             max_head_hex_len=_clamp_int(self.max_head_hex_len, default=130, lo=16, hi=4096),
-            max_verify_key_hex_len=_clamp_int(self.max_verify_key_hex_len, default=200, lo=16, hi=32768),
+            max_verify_key_len=_clamp_int(self.max_verify_key_len, default=512, lo=16, hi=32768),
             max_sig_hex_len=_clamp_int(self.max_sig_hex_len, default=200, lo=16, hi=32768),
             max_receipt_body_bytes=_clamp_int(self.max_receipt_body_bytes, default=_DEFAULT_RECEIPT_BODY_LIMIT, lo=256, hi=8 * 1024 * 1024),
             max_window=_clamp_int(self.max_window, default=4096, lo=1, hi=100_000),
@@ -1153,7 +1268,7 @@ class _CompiledHttpBundle:
 
 def _build_http_cfg_from_env() -> Tuple[ServiceHttpConfig, VerifyLimits]:
     cfg = ServiceHttpConfig(
-        api_version=os.getenv("TCD_HTTP_API_VERSION", "0.14.0"),
+        api_version=os.getenv("TCD_HTTP_API_VERSION", "0.15.0"),
         enable_docs=_coerce_bool(os.getenv("TCD_HTTP_ENABLE_DOCS", "0"), default=False),
         strict_mode=_coerce_bool(os.getenv("TCD_HTTP_STRICT_MODE", "0"), default=False),
         max_body_bytes=_coerce_int(os.getenv("TCD_HTTP_MAX_BODY_BYTES")) or _DEFAULT_MAX_BODY_BYTES,
@@ -1189,8 +1304,11 @@ def _build_http_cfg_from_env() -> Tuple[ServiceHttpConfig, VerifyLimits]:
         require_receipts_when_pq=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_RECEIPTS_WHEN_PQ"), default=True),
         require_security_router_when_strict=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_SECURITY_ROUTER_WHEN_STRICT"), default=False),
         require_attestor_when_receipt_required=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_ATTESTOR_WHEN_RECEIPT_REQUIRED"), default=False),
+        require_finalized_receipt_surface_when_strict=_coerce_bool(os.getenv("TCD_HTTP_REQUIRE_FINAL_RECEIPT_SURFACE_STRICT"), default=True),
         expose_verify_key_public=_coerce_bool(os.getenv("TCD_HTTP_EXPOSE_VERIFY_KEY_PUBLIC"), default=False),
-        expose_receipt_body_public=_coerce_bool(os.getenv("TCD_HTTP_EXPOSE_RECEIPT_BODY_PUBLIC"), default=True),
+        expose_verification_bundle_public=_coerce_bool(os.getenv("TCD_HTTP_EXPOSE_VERIFICATION_BUNDLE_PUBLIC"), default=False),
+        expose_legacy_receipt_aliases=_coerce_bool(os.getenv("TCD_HTTP_EXPOSE_LEGACY_RECEIPT_ALIASES"), default=False),
+        allow_detector_text_synthesis_for_compat=_coerce_bool(os.getenv("TCD_HTTP_ALLOW_DETECTOR_TEXT_SYNTHESIS"), default=False),
         hash_alg=os.getenv("TCD_HASH_ALG", "blake3"),
         tokens_divisor_default=_coerce_float(os.getenv("TCD_HTTP_TOKENS_DIVISOR_DEFAULT")) or 50.0,
         alpha_wealth_floor=_coerce_float(os.getenv("TCD_HTTP_ALPHA_WEALTH_FLOOR")) or -1.0,
@@ -1200,7 +1318,7 @@ def _build_http_cfg_from_env() -> Tuple[ServiceHttpConfig, VerifyLimits]:
 
     verify_limits = VerifyLimits(
         max_head_hex_len=_coerce_int(os.getenv("TCD_VERIFY_HEAD_HEX_MAXLEN")) or 130,
-        max_verify_key_hex_len=_coerce_int(os.getenv("TCD_VERIFY_KEY_HEX_MAXLEN")) or 200,
+        max_verify_key_len=_coerce_int(os.getenv("TCD_VERIFY_KEY_MAXLEN")) or 512,
         max_sig_hex_len=_coerce_int(os.getenv("TCD_VERIFY_SIG_HEX_MAXLEN")) or 200,
         max_receipt_body_bytes=_coerce_int(os.getenv("TCD_VERIFY_RECEIPT_BODY_MAXBYTES")) or _DEFAULT_RECEIPT_BODY_LIMIT,
         max_window=_coerce_int(os.getenv("TCD_VERIFY_WINDOW_MAX")) or 4096,
@@ -1281,9 +1399,7 @@ class DiagnoseRequest(_Model):
         if v is None:
             return None
         x = _coerce_float(v)
-        if x is None:
-            return None
-        return float(x)
+        return None if x is None else float(x)
 
     @field_validator("step_id", "base_max_tokens", mode="before")
     @classmethod
@@ -1291,9 +1407,7 @@ class DiagnoseRequest(_Model):
         if v is None:
             return None
         x = _coerce_int(v)
-        if x is None:
-            return None
-        return int(x)
+        return None if x is None else int(x)
 
     @field_validator("model_id", "gpu_id", "task", "lang", "tenant", "user", "session", "request_id", "trace_id", "build_id", "image_digest", mode="before")
     @classmethod
@@ -1350,10 +1464,7 @@ class DiagnoseRequest(_Model):
     def _tags(cls, v: Any) -> List[str]:
         if v is None:
             return []
-        if isinstance(v, str):
-            seq = [v]
-        else:
-            seq = list(v)
+        seq = [v] if isinstance(v, str) else list(v)
         out: List[str] = []
         seen = set()
         for item in seq[:32]:
@@ -1424,16 +1535,50 @@ class RiskResponse(_Model):
     pq_required: Optional[bool] = None
     pq_ok: Optional[bool] = None
 
+    receipt_public: Dict[str, Any] = Field(default_factory=dict)
+    receipt_verification: Optional[Dict[str, Any]] = None
+    evidence_identity: Dict[str, Any] = Field(default_factory=dict)
+    artifacts: Dict[str, Any] = Field(default_factory=dict)
+
+    # Deprecated compatibility aliases. Kept only so older clients do not hard-break.
     receipt: Optional[str] = None
     receipt_body: Optional[str] = None
     receipt_sig: Optional[str] = None
     verify_key: Optional[str] = None
 
-    @field_validator("decision", "required_action", "enforcement_mode", "cause", "action", "request_id", "event_id", "decision_id", "route_plan_id", "policy_ref", "policyset_ref", "config_fingerprint", "state_domain_id", "controller_mode", "statistical_guarantee_scope", "audit_ref", "receipt_ref", "trust_zone", "route_profile", "threat_kind", "receipt", "receipt_body", "receipt_sig", "verify_key", mode="before")
+    @field_validator(
+        "decision",
+        "required_action",
+        "enforcement_mode",
+        "cause",
+        "action",
+        "request_id",
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "policy_ref",
+        "policyset_ref",
+        "config_fingerprint",
+        "state_domain_id",
+        "controller_mode",
+        "statistical_guarantee_scope",
+        "audit_ref",
+        "receipt_ref",
+        "trust_zone",
+        "route_profile",
+        "threat_kind",
+        "receipt",
+        "receipt_body",
+        "receipt_sig",
+        "verify_key",
+        mode="before",
+    )
     @classmethod
     def _txt(cls, v: Any) -> Any:
         if v is None:
             return None
+        if isinstance(v, str):
+            return v if len(v) <= 256_000 else v[:256_000]
         return _safe_text(v, max_len=4096)
 
     @field_validator("score", "threshold", "budget_remaining", "e_value", "alpha_alloc", "alpha_spent", mode="before")
@@ -1448,10 +1593,17 @@ class RiskResponse(_Model):
         x = _coerce_int(v)
         return 0 if x is None else max(0, int(x))
 
-    @field_validator("components", mode="before")
+    @field_validator("components", "receipt_public", "evidence_identity", "artifacts", mode="before")
     @classmethod
-    def _components(cls, v: Any) -> Dict[str, Any]:
+    def _maps(cls, v: Any) -> Dict[str, Any]:
         return _sanitize_json_mapping(v or {}, max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=_DEFAULT_MAX_JSON_COMPONENT_BYTES)
+
+    @field_validator("receipt_verification", mode="before")
+    @classmethod
+    def _maybe_verification(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        return _sanitize_json_mapping(v, max_depth=6, max_items=128, max_str_len=2048, max_total_bytes=_DEFAULT_RECEIPT_BODY_LIMIT)
 
     @field_validator("verdict", "allowed", "pq_required", "pq_ok", mode="before")
     @classmethod
@@ -1473,20 +1625,29 @@ class SnapshotState(_Model):
 class VerifyRequest(_Model):
     receipt_head_hex: Optional[str] = Field(default=None)
     receipt_body_json: Optional[str] = Field(default=None)
-    verify_key_hex: Optional[str] = Field(default=None)
+    verify_key: Optional[str] = Field(default=None)
+    verify_key_hex: Optional[str] = Field(default=None)  # legacy alias
     receipt_sig_hex: Optional[str] = Field(default=None)
 
     req_obj: Optional[Dict[str, Any]] = None
     comp_obj: Optional[Dict[str, Any]] = None
     e_obj: Optional[Dict[str, Any]] = None
-    witness_segments: Optional[Tuple[List[int], List[int], List[int]]] = None
+    witness_segments: Optional[List[Dict[str, Any]]] = None
 
     heads: Optional[List[str]] = None
     bodies: Optional[List[str]] = None
 
     pq_required: Optional[bool] = None
+    require_signature: Optional[bool] = None
 
-    @field_validator("receipt_head_hex", "verify_key_hex", "receipt_sig_hex", mode="before")
+    expected_policy_ref: Optional[str] = None
+    expected_policyset_ref: Optional[str] = None
+    expected_policy_digest: Optional[str] = None
+    expected_cfg_fp: Optional[str] = None
+    expected_build_id: Optional[str] = None
+    expected_image_digest: Optional[str] = None
+
+    @field_validator("receipt_head_hex", "receipt_sig_hex", mode="before")
     @classmethod
     def _hex_ok(cls, v: Any) -> Any:
         if v is None:
@@ -1496,6 +1657,14 @@ class VerifyRequest(_Model):
             raise ValueError("invalid hex")
         return s
 
+    @field_validator("verify_key", "verify_key_hex", mode="before")
+    @classmethod
+    def _verify_key(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        s = _opaque_handle(v, max_len=4096)
+        return s
+
     @field_validator("receipt_body_json", mode="before")
     @classmethod
     def _receipt_body(cls, v: Any) -> Any:
@@ -1503,7 +1672,14 @@ class VerifyRequest(_Model):
             return None
         if isinstance(v, (dict, list)):
             return _compact_json(v, max_bytes=_DEFAULT_RECEIPT_BODY_LIMIT)
-        return _safe_text(v, max_len=_DEFAULT_RECEIPT_BODY_LIMIT * 2)
+        if not isinstance(v, str):
+            raise ValueError("receipt_body_json must be string or JSON object")
+        try:
+            if len(v.encode("utf-8", errors="strict")) > (_DEFAULT_RECEIPT_BODY_LIMIT * 2):
+                raise ValueError("receipt_body_json too large")
+        except Exception as e:
+            raise ValueError(str(e)) from e
+        return v
 
     @field_validator("req_obj", "comp_obj", "e_obj", mode="before")
     @classmethod
@@ -1527,29 +1703,45 @@ class VerifyRequest(_Model):
     def _bodies(cls, v: Any) -> Any:
         if v is None:
             return None
-        return [_safe_text(x, max_len=_DEFAULT_RECEIPT_BODY_LIMIT * 2) for x in list(v)]
+        out: List[str] = []
+        for x in list(v):
+            if not isinstance(x, str):
+                raise ValueError("invalid chain body")
+            out.append(x)
+        return out
 
     @field_validator("witness_segments", mode="before")
     @classmethod
     def _wit(cls, v: Any) -> Any:
         if v is None:
             return None
-        if not isinstance(v, (tuple, list)) or len(v) != 3:
-            raise ValueError("witness_segments must be triple")
-        out: List[List[int]] = []
-        for seg in v:
-            if not isinstance(seg, (list, tuple)):
-                raise ValueError("witness_segments must be triple")
-            xs: List[int] = []
-            for item in list(seg):
-                iv = _coerce_int(item)
-                if iv is None:
-                    raise ValueError("witness segment values must be ints")
-                xs.append(int(iv))
-            out.append(xs)
-        return (out[0], out[1], out[2])
+        if not isinstance(v, (tuple, list)):
+            raise ValueError("witness_segments must be list")
+        out: List[Dict[str, Any]] = []
+        for item in list(v)[:512]:
+            if not isinstance(item, Mapping):
+                raise ValueError("witness segment must be mapping")
+            out.append(_sanitize_json_mapping(dict(item), max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000))
+        return out
 
-    @field_validator("pq_required", mode="before")
+    @field_validator(
+        "expected_policy_ref",
+        "expected_policyset_ref",
+        "expected_policy_digest",
+        "expected_cfg_fp",
+        "expected_build_id",
+        "expected_image_digest",
+        mode="before",
+    )
+    @classmethod
+    def _exp(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        return _safe_text(v, max_len=256)
+
+    @field_validator("pq_required", "require_signature", mode="before")
     @classmethod
     def _pq(cls, v: Any) -> Any:
         if v is None:
@@ -1561,6 +1753,7 @@ class VerifyResponse(_Model):
     ok: bool
     request_id: Optional[str] = None
     reason: Optional[str] = None
+    report: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("request_id", "reason", mode="before")
     @classmethod
@@ -1569,11 +1762,15 @@ class VerifyResponse(_Model):
             return None
         return _safe_text(v, max_len=256)
 
+    @field_validator("report", mode="before")
+    @classmethod
+    def _report(cls, v: Any) -> Dict[str, Any]:
+        return _sanitize_json_mapping(v or {}, max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=64_000)
+
 
 # ---------------------------------------------------------------------------
 # Metrics and runtime helpers
 # ---------------------------------------------------------------------------
-
 
 _REQ_COUNTER = Counter("tcd_http_requests_total", "HTTP requests", ["route", "status"])
 _REQ_LATENCY = Histogram(
@@ -1668,10 +1865,6 @@ class SubjectPolicyManager:
 
 
 class SubjectLimiterPool:
-    """
-    Avoid mutating a shared limiter instance per request.
-    """
-
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._cache: Dict[Tuple[float, float], Any] = {}
@@ -1751,13 +1944,6 @@ class EdgeLimiter:
 
 
 class _DetectorRuntimeUnavailable:
-    """
-    Formal-detector-shaped fail-closed placeholder.
-
-    This avoids accidentally routing through TraceCollapseDetector legacy shim
-    while still preserving a deterministic detector contract for HTTP.
-    """
-
     def __init__(self, *, reason: str = "formal_detector_unavailable") -> None:
         self.reason = _safe_text(reason, max_len=128) or "formal_detector_unavailable"
 
@@ -1765,19 +1951,14 @@ class _DetectorRuntimeUnavailable:
         return {
             "ok": False,
             "decision": "block",
-            "decision_legacy": "block",
             "action_hint": "BLOCK",
-            "reason_code": "FAIL_CLOSED_DETECTOR_UNAVAILABLE",
+            "reason_code": "FORMAL_DETECTOR_UNAVAILABLE",
             "error_code": "INTERNAL_ERROR",
             "score_raw": 1.0,
             "p_value": 1e-12,
             "risk": 1.0,
             "latency_ms": 0.0,
             "budget_left_ms": 0.0,
-            "thresholds": {"risk_low": 0.2, "risk_high": 0.8},
-            "calibrator": {"mode": "unavailable"},
-            "calibrator_state": {"mode": "unavailable", "state_digest": f"det-unavailable:{self.reason}"},
-            "model": {"name": "unavailable", "version": "0"},
             "engine_version": "detector_unavailable",
             "config_hash": f"detcfg:{_hash_hex(ctx='tcd:http:det_unavailable_cfg', payload={'reason': self.reason}, out_hex=32)}",
             "policy_digest": f"detpol:{_hash_hex(ctx='tcd:http:det_unavailable_policy', payload={'reason': self.reason}, out_hex=32)}",
@@ -1788,11 +1969,7 @@ class _DetectorRuntimeUnavailable:
         }
 
     def state_snapshot(self) -> Dict[str, Any]:
-        return {
-            "mode": "unavailable",
-            "reason": self.reason,
-            "state_digest": f"detstate:{_hash_hex(ctx='tcd:http:det_unavailable_state', payload={'reason': self.reason}, out_hex=32)}",
-        }
+        return {"mode": "unavailable", "reason": self.reason}
 
     def snapshot_state(self) -> Dict[str, Any]:
         return self.state_snapshot()
@@ -1811,7 +1988,7 @@ class DetectorRegistry:
     av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = field(default_factory=dict)
     mv_by_model: Dict[str, MultiVarDetector] = field(default_factory=dict)
 
-    def get_trace_detector(self, key: Tuple[str, str, str, str]) -> Any:
+    def get_detector_runtime(self, key: Tuple[str, str, str, str]) -> Any:
         with self.det_lock:
             inst = self.detectors.get(key)
             if inst is None:
@@ -1823,9 +2000,6 @@ class DetectorRegistry:
                     inst = _DetectorRuntimeUnavailable(reason="formal_detector_build_failed")
                 self.detectors[key] = inst
             return inst
-
-    def get_detector_runtime(self, key: Tuple[str, str, str, str]) -> Any:
-        return self.get_trace_detector(key)
 
     def get_alpha_controller(self, subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
         with self.av_lock:
@@ -1856,6 +2030,7 @@ class RiskBudgetEnvelope:
     controller_mode: Optional[str] = None
     statistical_guarantee_scope: Optional[str] = None
     state_domain_id: Optional[str] = None
+    adapter_registry_fp: Optional[str] = None
 
     @classmethod
     def from_av_out(cls, av_out: Mapping[str, Any]) -> "RiskBudgetEnvelope":
@@ -1870,6 +2045,7 @@ class RiskBudgetEnvelope:
         if guarantee_scope is None and isinstance(validity, Mapping):
             guarantee_scope = _safe_text(validity.get("statistical_guarantee_scope", ""), max_len=128) or None
         state_domain_id = _safe_text(controller.get("state_domain_id", ""), max_len=128) or None if isinstance(controller, Mapping) else None
+        adapter_registry_fp = _safe_text(controller.get("adapter_registry_fp", ""), max_len=128) or None if isinstance(controller, Mapping) else None
         return cls(
             e_value=float(_coerce_float(av_out.get("e_value")) or 1.0),
             alpha_alloc=float(_coerce_float(av_out.get("alpha_alloc")) or 0.0),
@@ -1880,6 +2056,7 @@ class RiskBudgetEnvelope:
             controller_mode=controller_mode,
             statistical_guarantee_scope=guarantee_scope,
             state_domain_id=state_domain_id,
+            adapter_registry_fp=adapter_registry_fp,
         )
 
     def is_budget_exhausted(self, floor: float) -> bool:
@@ -1887,58 +2064,70 @@ class RiskBudgetEnvelope:
 
 
 @dataclass
+class ReceiptBundle:
+    raw: Dict[str, Any]
+    public: Dict[str, Any]
+    verification: Optional[Dict[str, Any]]
+    self_check_ok: Optional[bool]
+
+
+@dataclass
 class ReceiptManager:
     attestor: Optional[Any]
     hash_alg: str
     expose_verify_key_public: bool
-    expose_receipt_body_public: bool
+    expose_verification_bundle_public: bool
 
-    def issue(
+    def issue_local_final(
         self,
         *,
-        trace: List[float],
-        spectrum: List[float],
-        features: List[float],
+        trace: Sequence[float],
+        spectrum: Sequence[float],
+        features: Sequence[float],
         req: DiagnoseRequest,
         request_id: str,
         event_id: str,
         body_digest: str,
-        verdict_pack: Mapping[str, Any],
-        mv_info: Mapping[str, Any],
-        budget: RiskBudgetEnvelope,
-        route: Any,
+        score: float,
         p_final: float,
-    ) -> Dict[str, Any]:
+        route_info: Mapping[str, Any],
+        final_action: str,
+        required_action: str,
+        enforcement_mode: str,
+        allowed: bool,
+        cause: str,
+        policy_ref: Optional[str],
+        policyset_ref: Optional[str],
+        policy_digest: Optional[str],
+        cfg_fp: str,
+        decision_id: str,
+        route_plan_id: str,
+        audit_ref: Optional[str],
+        state_domain_id: Optional[str],
+        adapter_registry_fp: Optional[str],
+        budget: RiskBudgetEnvelope,
+        detector_components: Mapping[str, Any],
+        mv_info: Mapping[str, Any],
+        security_block: Mapping[str, Any],
+        artifacts: Mapping[str, Any],
+        evidence_identity: Mapping[str, Any],
+        pq_ok: Optional[bool],
+    ) -> ReceiptBundle:
         if self.attestor is None:
-            return {}
+            return ReceiptBundle(raw={}, public={}, verification=None, self_check_ok=None)
 
-        w_trace = _quantize_to_u32(trace)
-        w_spec = _quantize_to_u32(spectrum)
-        w_feat = _quantize_to_u32(features)
-
-        kvh = RollingHasher(alg=self.hash_alg, ctx="tcd:kv")
-        kvh.update_ints(w_trace)
-        kvh.update_ints(w_spec)
-        kvh.update_ints(w_feat)
-        kv_digest = kvh.hex()
-
-        route_dict = _extract_route_dict(route)
-        route_receipt = None
-        if route is not None and hasattr(route, "to_receipt_dict"):
-            with contextlib.suppress(Exception):
-                route_receipt = route.to_receipt_dict()
-
+        array_digest = _compute_array_digest(trace, spectrum, features, alg=self.hash_alg)
         meta_v2 = build_v2_body(
             model_hash=f"unknown:{req.model_id}",
             tokenizer_hash=f"unknown:{req.model_id}",
             sampler_cfg={
-                "temperature": float(_coerce_float(route_dict.get("temperature")) or req.base_temp),
-                "top_p": float(_coerce_float(route_dict.get("top_p")) or req.base_top_p),
-                "decoder": _safe_text(route_dict.get("decoder", req.context.get("decoder", "default")), max_len=64) or "default",
+                "temperature": float(_coerce_float(route_info.get("temperature")) or req.base_temp),
+                "top_p": float(_coerce_float(route_info.get("top_p")) or req.base_top_p),
+                "decoder": _safe_text(route_info.get("decoder", req.context.get("decoder", "default")), max_len=64) or "default",
                 "seed": None,
             },
             context_len=len(trace),
-            kv_digest=kv_digest,
+            kv_digest=array_digest,
             rng_seed=None,
             latency_ms=None,
             throughput_tok_s=None,
@@ -1972,18 +2161,32 @@ class ReceiptManager:
             "pq_required": req.pq_required,
             "context": _safe_context_subset(req.context),
             "tokens_delta": int(req.tokens_delta),
-            "step": int(_coerce_int(verdict_pack.get("step")) or 0),
             "body_digest": body_digest,
         }
+
         comp_obj = {
-            "score": float(_coerce_float(verdict_pack.get("score")) or 0.0),
+            "score": float(score),
             "p_final": float(p_final),
-            "drift_score": float(req.drift_score or 0.0),
-            "verdict": bool(_coerce_bool(verdict_pack.get("verdict"), default=False)),
-            "route": route_receipt if route_receipt is not None else route_dict,
-            "components": _sanitize_json_mapping(verdict_pack.get("components", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000),
-            "mv": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
+            "allowed": bool(allowed),
+            "action": final_action,
+            "required_action": required_action,
+            "enforcement_mode": enforcement_mode,
+            "cause": cause,
+            "decision_id": decision_id,
+            "route_plan_id": route_plan_id,
+            "policy_ref": policy_ref,
+            "policyset_ref": policyset_ref,
+            "cfg_fp": cfg_fp,
+            "policy_digest": policy_digest,
+            "audit_ref": audit_ref,
+            "route": dict(route_info),
+            "security": dict(security_block),
+            "artifacts": dict(artifacts),
+            "evidence_identity": dict(evidence_identity),
+            "detector": _sanitize_json_mapping(dict(detector_components), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000),
+            "multivariate": _sanitize_json_mapping(dict(mv_info), max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
         }
+
         e_obj = {
             "e_value": budget.e_value,
             "alpha_alloc": budget.alpha_alloc,
@@ -1994,55 +2197,161 @@ class ReceiptManager:
             "controller_mode": budget.controller_mode,
             "statistical_guarantee_scope": budget.statistical_guarantee_scope,
             "state_domain_id": budget.state_domain_id,
+            "adapter_registry_fp": budget.adapter_registry_fp,
         }
+
+        witness_segments = [
+            {
+                "kind": "external",
+                "id": "http_array_digest",
+                "digest": array_digest,
+                "meta": {
+                    "trace_len": len(trace),
+                    "spectrum_len": len(spectrum),
+                    "feature_len": len(features),
+                },
+            },
+            {
+                "kind": "external",
+                "id": "route_plan",
+                "digest": route_plan_id,
+                "meta": {"decision_id": decision_id, "policy_ref": policy_ref},
+            },
+        ]
+        if policy_digest:
+            witness_segments.append(
+                {
+                    "kind": "external",
+                    "id": "policy_digest",
+                    "digest": policy_digest,
+                    "meta": {"policy_ref": policy_ref, "policyset_ref": policyset_ref},
+                }
+            )
+
+        witness_tags = ["service_http", required_action, final_action]
 
         issue_fn = getattr(self.attestor, "issue", None)
         if not callable(issue_fn):
-            return {}
+            return ReceiptBundle(raw={}, public={}, verification=None, self_check_ok=None)
+
         kwargs = {
             "req_obj": req_obj,
             "comp_obj": comp_obj,
             "e_obj": e_obj,
-            "witness_segments": (w_trace, w_spec, w_feat),
-            "witness_tags": ("trace", "spectrum", "feat"),
-            "meta": meta_v2,
+            "witness_segments": witness_segments,
+            "witness_tags": witness_tags,
+            "meta": {
+                **meta_v2,
+                "event_type": "service_http.final_decision",
+                "event_id": event_id,
+                "request_id": request_id,
+                "decision_id": decision_id,
+                "route_plan_id": route_plan_id,
+                "policy_ref": policy_ref,
+                "policyset_ref": policyset_ref,
+                "policy_digest": policy_digest,
+                "config_fingerprint": cfg_fp,
+                "audit_ref": audit_ref,
+            },
         }
+
         try:
-            rcpt = issue_fn(**_filtered_kwargs_for(issue_fn, kwargs))
+            raw = issue_fn(**_filtered_kwargs_for(issue_fn, kwargs))
         except Exception:
-            return {}
-        if not isinstance(rcpt, Mapping):
-            return {}
-        out = dict(rcpt)
+            return ReceiptBundle(raw={}, public={}, verification=None, self_check_ok=None)
+
+        if not isinstance(raw, Mapping):
+            return ReceiptBundle(raw={}, public={}, verification=None, self_check_ok=None)
+
+        raw_bundle = dict(raw)
+        head = _opaque_handle(raw_bundle.get("receipt"), max_len=1024)
+        body = _opaque_text(raw_bundle.get("receipt_body"), max_bytes=_DEFAULT_RECEIPT_BODY_LIMIT)
+        sig = _opaque_handle(raw_bundle.get("receipt_sig"), max_len=8192)
+        verify_key = _opaque_handle(raw_bundle.get("verify_key"), max_len=4096)
+        receipt_ref = _opaque_handle(raw_bundle.get("receipt_ref"), max_len=512) or head
+        receipt_integrity = _opaque_handle(raw_bundle.get("receipt_integrity"), max_len=256)
 
         self_check_ok: Optional[bool] = None
-        if out.get("receipt") and out.get("receipt_body"):
+        verify_report: Any = None
+        if head and body:
             with contextlib.suppress(Exception):
-                self_check_ok = bool(
-                    verify_receipt(
-                        receipt_head_hex=_safe_text(out.get("receipt"), max_len=8192),
-                        receipt_body_json=_safe_text(out.get("receipt_body"), max_len=256_000),
-                        verify_key_hex=_safe_text(out.get("verify_key"), max_len=8192) or None,
-                        receipt_sig_hex=_safe_text(out.get("receipt_sig"), max_len=8192) or None,
-                        strict=True,
-                    )
+                verify_report = verify_receipt_ex(
+                    receipt_head_hex=head,
+                    receipt_body_json=body,
+                    verify_key_hex=verify_key,
+                    receipt_sig_hex=sig,
+                    req_obj=req_obj,
+                    comp_obj=comp_obj,
+                    e_obj=e_obj,
+                    witness_segments=witness_segments,
+                    strict=True,
+                    expected_policy_ref=policy_ref,
+                    expected_policyset_ref=policyset_ref,
+                    expected_policy_digest=policy_digest,
+                    expected_cfg_fp=cfg_fp,
+                    expected_build_id=req.build_id,
+                    expected_image_digest=req.image_digest,
                 )
+                self_check_ok = bool(getattr(verify_report, "ok", False))
 
-        receipt_body = out.get("receipt_body")
-        verify_key = out.get("verify_key")
-        if isinstance(receipt_body, str) and not self.expose_receipt_body_public:
-            receipt_body = None
-        if isinstance(verify_key, str) and not self.expose_verify_key_public:
-            verify_key = None
-        return {
-            "receipt": _safe_text(out.get("receipt"), max_len=512) or None,
-            "receipt_body": _safe_text(receipt_body, max_len=64_000) if receipt_body is not None else None,
-            "receipt_sig": _safe_text(out.get("receipt_sig"), max_len=8192) or None,
-            "verify_key": _safe_text(verify_key, max_len=8192) if verify_key is not None else None,
-            "receipt_ref": _safe_text(out.get("receipt_ref"), max_len=512) or None,
-            "audit_ref": _safe_text(out.get("audit_ref"), max_len=512) or None,
-            "receipt_self_check_ok": self_check_ok,
+        enriched = {
+            "schema": "tcd.receipt.http.v1",
+            "receipt_kind": "inference_decision",
+            "event_type": "service_http.final_decision",
+            "receipt": head,
+            "receipt_body": body,
+            "receipt_sig": sig,
+            "verify_key": verify_key,
+            "verify_key_id": verify_key if (verify_key and _safe_id(verify_key, default=None, max_len=256)) else None,
+            "verify_key_fp": _hash_handle_public(verify_key),
+            "receipt_ref": receipt_ref,
+            "audit_ref": audit_ref,
+            "receipt_integrity": receipt_integrity,
+            "event_id": event_id,
+            "decision_id": decision_id,
+            "route_plan_id": route_plan_id,
+            "policy_ref": policy_ref,
+            "policyset_ref": policyset_ref,
+            "policy_digest": policy_digest,
+            "cfg_fp": cfg_fp,
+            "state_domain_id": state_domain_id,
+            "adapter_registry_fp": adapter_registry_fp,
+            "build_id": req.build_id,
+            "image_digest": req.image_digest,
+            "pq_required": req.pq_required,
+            "pq_ok": pq_ok,
+            "body_kind": "canonical_json" if body else None,
+            "body_digest": ("sha256:" + hashlib.sha256(body.encode("utf-8", errors="strict")).hexdigest()) if body else None,
+            "head_verified": getattr(verify_report, "head_verified", None),
+            "body_canonical_verified": getattr(verify_report, "body_canonical_verified", None),
+            "integrity_hash_verified": getattr(verify_report, "integrity_hash_verified", None),
+            "signature_verified": getattr(verify_report, "signature_verified", None),
+            "verify_key_allowed": getattr(verify_report, "verify_key_allowed", None),
+            "policy_binding_verified": getattr(verify_report, "policy_binding_verified", None),
+            "cfg_binding_verified": getattr(verify_report, "cfg_binding_verified", None),
+            "integrity_ok": bool(self_check_ok) if self_check_ok is not None else True,
+            "integrity_errors": list(getattr(verify_report, "errors", []) or []),
+            "meta": {
+                "request_id": request_id,
+                "event_id": event_id,
+                "decision_id": decision_id,
+                "route_plan_id": route_plan_id,
+                "cause": cause,
+            },
         }
+
+        public_view, verification_view = _build_receipt_surfaces(
+            enriched,
+            expose_verification_bundle_public=self.expose_verification_bundle_public,
+            expose_verify_key_public=self.expose_verify_key_public,
+        )
+
+        return ReceiptBundle(
+            raw=enriched,
+            public=public_view,
+            verification=verification_view,
+            self_check_ok=self_check_ok,
+        )
 
 
 @dataclass
@@ -2076,7 +2385,6 @@ class ServiceTokenAuth:
     ) -> None:
         request.state.auth_mode = "none"
         request.state.auth_trusted = False
-
         if not self.cfg.require_service_token:
             request.state.auth_mode = "disabled"
             request.state.auth_trusted = True
@@ -2092,7 +2400,6 @@ class ServiceTokenAuth:
 
         if not x_token or len(x_token) != len(target):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
-
         if not hmac.compare_digest(x_token, target):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
 
@@ -2135,22 +2442,10 @@ class _AuthProjection:
         key_id = _safe_text(getattr(ctx, "key_id", None), max_len=128) or None
         policy_digest = _safe_text(getattr(ctx, "policy_digest", None), max_len=128) or None
         authn_strength = _safe_text(getattr(ctx, "authn_strength", None), max_len=64) or None
-        return _AuthProjection(
-            True,
-            mode,
-            principal,
-            tuple(scopes),
-            key_id,
-            policy_digest,
-            authn_strength,
-            None,
-        )
+        return _AuthProjection(True, mode, principal, tuple(scopes), key_id, policy_digest, authn_strength, None)
 
     def public_view(self, *, expose_principal: bool = False) -> Dict[str, Any]:
-        out: Dict[str, Any] = {
-            "mode": self.mode,
-            "trusted": bool(self.ok),
-        }
+        out: Dict[str, Any] = {"mode": self.mode, "trusted": bool(self.ok)}
         if self.principal:
             out["principal_hash"] = f"ap1:{_hash_hex(ctx='tcd:http:principal', payload={'principal': self.principal}, out_hex=24)}"
             if expose_principal:
@@ -2340,7 +2635,7 @@ def create_http_runtime(
         attestor=attestor,
         hash_alg=cfg_norm.hash_alg,
         expose_verify_key_public=cfg_norm.expose_verify_key_public,
-        expose_receipt_body_public=cfg_norm.expose_receipt_body_public,
+        expose_verification_bundle_public=cfg_norm.expose_verification_bundle_public,
     )
 
     spm = subject_policy_mgr or SubjectPolicyManager(
@@ -2365,7 +2660,7 @@ def create_http_runtime(
             strategy_router=router,
         )
 
-    runtime = _Runtime(
+    return _Runtime(
         bundle=bundle,
         settings_provider=settings_provider,
         settings=settings,
@@ -2391,7 +2686,6 @@ def create_http_runtime(
             model_id=req.model_id,
         ),
     )
-    return runtime
 
 
 def _get_singleton_runtime() -> _Runtime:
@@ -2446,7 +2740,6 @@ def _build_auth_dependency(rt: _Runtime, cfgb: ServiceHttpConfig):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
 
         token_guard(request, x_token)
-
         if auth_proj is not None:
             request.state.auth_reason = auth_proj.reason
             request.state.auth_projection = auth_proj
@@ -2457,7 +2750,6 @@ def _build_auth_dependency(rt: _Runtime, cfgb: ServiceHttpConfig):
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
-
 
 def create_app(
     *,
@@ -2547,40 +2839,19 @@ def create_app(
                 _REQ_REJECTED.labels(route_path, "headers_too_large").inc()
                 return JSONResponse(
                     status_code=status.HTTP_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
-                    content={
-                        "detail": "headers too large",
-                        "request_id": request_id,
-                        "config_fingerprint": rt.bundle.cfg_fp,
-                        "bundle_version": rt.bundle.version,
-                    },
-                    headers={
-                        "X-Request-Id": request_id,
-                        "X-TCD-Http-Version": cfgb.api_version,
-                        "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                        "X-TCD-Bundle-Version": str(rt.bundle.version),
-                    },
+                    content={"detail": "headers too large", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                    headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                 )
 
             need_body = request.method.upper() in {"POST", "PUT", "PATCH"} and route_path in {"/diagnose", "/v1/diagnose", "/verify", "/v1/verify", "/state/load"}
-            body = b""
             if need_body:
                 ct = _safe_text(request.headers.get("content-type"), max_len=256).lower()
                 if ct and ("application/json" not in ct and not ct.endswith("+json")):
                     _REQ_REJECTED.labels(route_path, "unsupported_media_type").inc()
                     return JSONResponse(
                         status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                        content={
-                            "detail": "unsupported media type",
-                            "request_id": request_id,
-                            "config_fingerprint": rt.bundle.cfg_fp,
-                            "bundle_version": rt.bundle.version,
-                        },
-                        headers={
-                            "X-Request-Id": request_id,
-                            "X-TCD-Http-Version": cfgb.api_version,
-                            "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                            "X-TCD-Bundle-Version": str(rt.bundle.version),
-                        },
+                        content={"detail": "unsupported media type", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                        headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                     )
 
                 cl = request.headers.get("content-length")
@@ -2591,72 +2862,32 @@ def create_app(
                         _REQ_REJECTED.labels(route_path, "invalid_content_length").inc()
                         return JSONResponse(
                             status_code=status.HTTP_400_BAD_REQUEST,
-                            content={
-                                "detail": "invalid content-length",
-                                "request_id": request_id,
-                                "config_fingerprint": rt.bundle.cfg_fp,
-                                "bundle_version": rt.bundle.version,
-                            },
-                            headers={
-                                "X-Request-Id": request_id,
-                                "X-TCD-Http-Version": cfgb.api_version,
-                                "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                                "X-TCD-Bundle-Version": str(rt.bundle.version),
-                            },
+                            content={"detail": "invalid content-length", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                            headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                         )
                     if cl_v > cfgb.max_body_bytes:
                         _REQ_REJECTED.labels(route_path, "body_too_large").inc()
                         return JSONResponse(
                             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                            content={
-                                "detail": "body too large",
-                                "request_id": request_id,
-                                "config_fingerprint": rt.bundle.cfg_fp,
-                                "bundle_version": rt.bundle.version,
-                            },
-                            headers={
-                                "X-Request-Id": request_id,
-                                "X-TCD-Http-Version": cfgb.api_version,
-                                "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                                "X-TCD-Bundle-Version": str(rt.bundle.version),
-                            },
+                            content={"detail": "body too large", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                            headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                         )
+
                 body = await request.body()
                 if len(body) > cfgb.max_body_bytes:
                     _REQ_REJECTED.labels(route_path, "body_too_large").inc()
                     return JSONResponse(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        content={
-                            "detail": "body too large",
-                            "request_id": request_id,
-                            "config_fingerprint": rt.bundle.cfg_fp,
-                            "bundle_version": rt.bundle.version,
-                        },
-                        headers={
-                            "X-Request-Id": request_id,
-                            "X-TCD-Http-Version": cfgb.api_version,
-                            "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                            "X-TCD-Bundle-Version": str(rt.bundle.version),
-                        },
+                        content={"detail": "body too large", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                        headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                     )
                 if _json_depth_exceeds(body, max_depth=cfgb.max_inbound_json_depth):
                     _REQ_REJECTED.labels(route_path, "json_too_deep").inc()
                     return JSONResponse(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        content={
-                            "detail": "json too deep",
-                            "request_id": request_id,
-                            "config_fingerprint": rt.bundle.cfg_fp,
-                            "bundle_version": rt.bundle.version,
-                        },
-                        headers={
-                            "X-Request-Id": request_id,
-                            "X-TCD-Http-Version": cfgb.api_version,
-                            "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                            "X-TCD-Bundle-Version": str(rt.bundle.version),
-                        },
+                        content={"detail": "json too deep", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                        headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                     )
-
                 request.state.body_bytes = body
                 request.state.body_digest = _body_digest(body, alg=cfgb.hash_alg)
                 _REQ_BODY_BYTES.labels(route_path).observe(float(len(body)))
@@ -2669,18 +2900,8 @@ def create_app(
                     _REQ_REJECTED.labels(route_path, "edge_rate_limited").inc()
                     return JSONResponse(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        content={
-                            "detail": "rate limited",
-                            "request_id": request_id,
-                            "config_fingerprint": rt.bundle.cfg_fp,
-                            "bundle_version": rt.bundle.version,
-                        },
-                        headers={
-                            "X-Request-Id": request_id,
-                            "X-TCD-Http-Version": cfgb.api_version,
-                            "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                            "X-TCD-Bundle-Version": str(rt.bundle.version),
-                        },
+                        content={"detail": "rate limited", "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+                        headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
                     )
 
             response = await call_next(request)
@@ -2704,21 +2925,10 @@ def create_app(
     @app.exception_handler(HTTPException)
     async def _http_exc_handler(request: Request, exc: HTTPException):
         request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or uuid.uuid4().hex[:16]
-        status_code = int(exc.status_code)
         return JSONResponse(
-            status_code=status_code,
-            content={
-                "detail": exc.detail,
-                "request_id": request_id,
-                "config_fingerprint": rt.bundle.cfg_fp,
-                "bundle_version": rt.bundle.version,
-            },
-            headers={
-                "X-Request-Id": request_id,
-                "X-TCD-Http-Version": cfgb.api_version,
-                "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                "X-TCD-Bundle-Version": str(rt.bundle.version),
-            },
+            status_code=int(exc.status_code),
+            content={"detail": exc.detail, "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+            headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
         )
 
     @app.exception_handler(RequestValidationError)
@@ -2726,19 +2936,8 @@ def create_app(
         request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or uuid.uuid4().hex[:16]
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "detail": "validation error",
-                "errors": exc.errors(),
-                "request_id": request_id,
-                "config_fingerprint": rt.bundle.cfg_fp,
-                "bundle_version": rt.bundle.version,
-            },
-            headers={
-                "X-Request-Id": request_id,
-                "X-TCD-Http-Version": cfgb.api_version,
-                "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
-                "X-TCD-Bundle-Version": str(rt.bundle.version),
-            },
+            content={"detail": "validation error", "errors": exc.errors(), "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
+            headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
         )
 
     @app.get("/metrics")
@@ -2798,7 +2997,7 @@ def create_app(
                 "input_contract": "DiagnoseRequest/VerifyRequest strict",
                 "response_contract": "RiskResponse/VerifyResponse bounded",
                 "evidence_contract": "request_id,event_id,decision_id,route_plan_id,receipt_ref,audit_ref",
-                "receipt_surface": "public",
+                "receipt_surface": "public+optional_verification_bundle",
             },
             "limits": {
                 "max_body_bytes": cfgb.max_body_bytes,
@@ -2812,7 +3011,7 @@ def create_app(
             "consistency": {
                 "event_identity": "deterministic_per_request",
                 "rate_limit_scope": "local_or_backend_dependent",
-                "receipt_delivery": "inline_best_effort_or_required_by_policy",
+                "receipt_delivery": "security_router_finalized_when_available__local_attestation_only_when_explicitly_degraded",
                 "security_router_required_when_strict": cfgb.require_security_router_when_strict,
             },
             "dependencies": {
@@ -2932,13 +3131,14 @@ def create_app(
         trace_vec: Sequence[float],
         spectrum: Sequence[float],
         features: Sequence[float],
-    ) -> str:
+    ) -> Optional[str]:
         raw_text = ""
         if isinstance(req.context, Mapping):
             raw_text = _safe_text(req.context.get("detector_text"), max_len=16_384)
         if raw_text:
             return raw_text
-
+        if not cfgb.allow_detector_text_synthesis_for_compat:
+            return None
         payload = {
             "trace_vector": [round(float(x), 6) for x in list(trace_vec)[:256]],
             "entropy": _coerce_float(req.entropy),
@@ -2951,7 +3151,7 @@ def create_app(
             "context": _safe_context_subset(dict(req.context or {})),
         }
         txt = _compact_json(payload, max_bytes=16_384)
-        return txt or "{}"
+        return txt or None
 
     def _make_detector_request(
         req: DiagnoseRequest,
@@ -2961,6 +3161,9 @@ def create_app(
         features: Sequence[float],
     ) -> Any:
         if DetectRequest is None:
+            return None
+        detector_text = _build_detector_compat_text(req, trace_vec=trace_vec, spectrum=spectrum, features=features)
+        if not detector_text:
             return None
         meta = {
             "entropy": _coerce_float(req.entropy),
@@ -2983,7 +3186,7 @@ def create_app(
             "model_id": req.model_id,
             "lang": req.lang,
             "kind": "completion",
-            "text": _build_detector_compat_text(req, trace_vec=trace_vec, spectrum=spectrum, features=features),
+            "text": detector_text,
             "meta": meta,
         }
         with contextlib.suppress(Exception):
@@ -3087,6 +3290,16 @@ def create_app(
             if dreq is not None:
                 with contextlib.suppress(Exception):
                     return _detector_runtime_to_verdict_pack(detect_fn(dreq), step_id=req.step_id)
+            return {
+                "verdict": True,
+                "score": 1.0,
+                "p_value": 1e-12,
+                "decision": "block",
+                "action": "block",
+                "step": int(req.step_id or 0),
+                "reason_code": "FORMAL_DETECTOR_INPUT_UNAVAILABLE",
+                "components": {"reason": "formal_detector_input_unavailable"},
+            }
 
         diagnose_fn = getattr(det, "diagnose", None)
         if callable(diagnose_fn):
@@ -3106,7 +3319,6 @@ def create_app(
     def _extract_detector_signal(verdict_pack: Mapping[str, Any]) -> Dict[str, Any]:
         decision = _safe_text(verdict_pack.get("decision"), max_len=32).lower()
         action = _safe_text(verdict_pack.get("action"), max_len=32).lower()
-
         if decision not in {"allow", "throttle", "block"}:
             decision = ""
         if action not in {"allow", "degrade", "block", "deny", "advisory"}:
@@ -3342,23 +3554,29 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="security router failure") from e
             return None
 
-    def _sanitize_receipt_public(receipt_data: Mapping[str, Any]) -> Dict[str, Any]:
-        if not isinstance(receipt_data, Mapping):
-            return {}
-        receipt_body = receipt_data.get("receipt_body") if cfgb.expose_receipt_body_public else None
-        verify_key = receipt_data.get("verify_key") if cfgb.expose_verify_key_public else None
-        out = {
-            "receipt": _safe_text(receipt_data.get("receipt"), max_len=512) or None,
-            "receipt_body": _safe_text(receipt_body, max_len=64_000) if receipt_body is not None else None,
-            "receipt_sig": _safe_text(receipt_data.get("receipt_sig"), max_len=8192) or None,
-            "verify_key": _safe_text(verify_key, max_len=8192) if verify_key is not None else None,
-            "receipt_ref": _safe_text(receipt_data.get("receipt_ref"), max_len=256) or None,
-            "audit_ref": _safe_text(receipt_data.get("audit_ref"), max_len=256) or None,
-            "receipt_self_check_ok": _coerce_bool(receipt_data.get("receipt_self_check_ok"), default=False) if receipt_data.get("receipt_self_check_ok") is not None else None,
-        }
-        if isinstance(out["receipt_body"], str) and len(out["receipt_body"].encode("utf-8", errors="strict")) > verify_limits.max_receipt_body_bytes:
-            out["receipt_body"] = None
-        return out
+    def _verify_pq_from_body_and_request(req: VerifyRequest) -> None:
+        if not req.receipt_body_json:
+            return
+        try:
+            body_obj = json.loads(req.receipt_body_json)
+        except Exception:
+            return
+        if not isinstance(body_obj, dict):
+            return
+
+        sec_block: Dict[str, Any] = {}
+        comps = body_obj.get("components")
+        if isinstance(comps, dict):
+            sec_candidate = comps.get("security")
+            if isinstance(sec_candidate, dict):
+                sec_block = sec_candidate
+        if not sec_block and isinstance(body_obj.get("security"), dict):
+            sec_block = body_obj["security"]
+
+        pq_required_eff = bool(sec_block.get("pq_required") or body_obj.get("pq_required") or bool(req.pq_required))
+        pq_ok_eff = sec_block.get("pq_ok")
+        if pq_required_eff and (pq_ok_eff is False or pq_ok_eff is None):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="pq_violation")
 
     @app.post("/diagnose", response_model=RiskResponse)
     def diagnose(
@@ -3406,13 +3624,7 @@ def create_app(
 
         det_key = (req.model_id, req.gpu_id, req.task, req.lang)
         det = rt.detector_registry.get_detector_runtime(det_key)
-        verdict_pack = _run_detector_runtime(
-            det,
-            req=req,
-            trace_vec=trace_vec,
-            spectrum=spectrum,
-            features=features,
-        )
+        verdict_pack = _run_detector_runtime(det, req=req, trace_vec=trace_vec, spectrum=spectrum, features=features)
         if not isinstance(verdict_pack, Mapping):
             verdict_pack = {"verdict": True, "score": 1.0, "p_value": 1e-12, "decision": "block", "action": "block", "components": {"reason": "detector_runtime_invalid"}, "step": int(req.step_id or 0)}
         verdict_pack = dict(verdict_pack)
@@ -3517,14 +3729,12 @@ def create_app(
                 av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
                 threat_kind=req.threat_kind,
             )
+
         allowed = True
-        required_action = _route_required_action(route)
-        enforcement_mode = _route_enforcement_mode(route)
+        required_action = _route_required_action(route_info)
+        enforcement_mode = _route_enforcement_mode(route_info)
         action_str = "none"
         cause = _safe_text(det_signal.get("reason_code") or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")), max_len=128) or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
-        receipt_data: Dict[str, Any] = {}
-        audit_ref: Optional[str] = None
-        receipt_ref: Optional[str] = None
         policy_ref: Optional[str] = _safe_text(route_info.get("policy_ref"), max_len=128) or None
         policyset_ref: Optional[str] = _safe_text(route_info.get("policyset_ref"), max_len=128) or None
         config_fingerprint: Optional[str] = _safe_text(route_info.get("config_fingerprint"), max_len=128) or None
@@ -3538,6 +3748,9 @@ def create_app(
         security_public: Dict[str, Any] = {}
         evidence_identity: Dict[str, Any] = {}
         artifacts: Dict[str, Any] = {}
+        audit_ref: Optional[str] = None
+        receipt_ref: Optional[str] = None
+        raw_receipt_payload: Dict[str, Any] = {}
 
         if security_decision is not None:
             security_public = _extract_security_public(security_decision)
@@ -3553,7 +3766,6 @@ def create_app(
 
             route_obj = getattr(security_decision, "route", None)
             route_info = _extract_route_dict(route_obj) if route_obj is not None else route_info
-            route = route_obj or route
 
             policy_ref = _safe_text(getattr(security_decision, "policy_ref", policy_ref), max_len=128) or policy_ref
             policyset_ref = _safe_text(getattr(security_decision, "policyset_ref", policyset_ref), max_len=128) or policyset_ref
@@ -3568,7 +3780,7 @@ def create_app(
             audit_ref = _safe_text(getattr(security_decision, "audit_ref", None), max_len=256) or None
             receipt_ref = _safe_text(getattr(security_decision, "receipt_ref", None), max_len=256) or None
 
-            receipt_data = _sanitize_receipt_public(_extract_receipt_like(getattr(security_decision, "receipt", None)))
+            raw_receipt_payload = _extract_receipt_like(getattr(security_decision, "receipt", None))
             security_block = _sanitize_json_mapping(getattr(security_decision, "security", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000)
             evidence_identity = _sanitize_json_mapping(getattr(security_decision, "evidence_identity", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
             artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
@@ -3601,6 +3813,7 @@ def create_app(
             enforcement_mode = _safe_text(route_info.get("enforcement_mode"), max_len=32).lower() or (
                 "fail_closed" if (required_action == "block" and cfgb.strict_mode) else ("must_enforce" if (required_action != "allow" and cfgb.strict_mode) else "advisory")
             )
+
             security_block = {
                 "trust_zone": req.trust_zone,
                 "route_profile": req.route_profile,
@@ -3617,20 +3830,49 @@ def create_app(
                 "request_id": request_id,
                 "event_id": event_id,
                 "body_digest": body_digest,
+                "surface_kind": "local_http_fallback",
+            }
+            artifacts = {
+                "receipt_required": bool(cfgb.receipts_enable_default or (cfgb.require_receipts_on_fail and required_action == "block") or (cfgb.require_receipts_when_pq and bool(req.pq_required))),
+                "ledger_required": False,
+                "attestation_required": bool(cfgb.require_attestor_when_receipt_required),
+                "ledger_stage": "skipped",
+                "outbox_status": "none",
+                "receipt_surface_kind": "local_attestation",
+                "durability": "ephemeral_local_only",
+            }
+            evidence_identity = {
+                "request_id": request_id,
+                "event_id": event_id,
+                "decision_id": decision_id,
+                "route_plan_id": route_plan_id,
+                "config_fingerprint": config_fingerprint or rt.bundle.cfg_fp,
+                "policy_ref": policy_ref,
+                "policyset_ref": policyset_ref,
+                "state_domain_id": state_domain_id,
+                "controller_mode": controller_mode,
+                "statistical_guarantee_scope": guarantee_scope,
+                "receipt_ref": receipt_ref,
+                "audit_ref": audit_ref,
+                "produced_by": "service_http.local",
             }
 
-        need_local_receipt = (
-            rt.receipt_mgr.attestor is not None
-            and not receipt_data
-            and (
-                cfgb.receipts_enable_default
-                or (cfgb.require_receipts_on_fail and required_action == "block")
-                or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+        if cfgb.strict_mode and cfgb.require_finalized_receipt_surface_when_strict:
+            receipt_needed_strict = bool(cfgb.receipts_enable_default or (cfgb.require_receipts_on_fail and required_action == "block") or (cfgb.require_receipts_when_pq and bool(req.pq_required)))
+            if receipt_needed_strict and rt.security_router is None and raw_receipt_payload == {}:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
+
+        if not raw_receipt_payload:
+            need_local_receipt = (
+                rt.receipt_mgr.attestor is not None
+                and (
+                    cfgb.receipts_enable_default
+                    or (cfgb.require_receipts_on_fail and required_action == "block")
+                    or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+                )
             )
-        )
-        if need_local_receipt:
-            receipt_data = _sanitize_receipt_public(
-                rt.receipt_mgr.issue(
+            if need_local_receipt:
+                rb = rt.receipt_mgr.issue_local_final(
                     trace=trace_vec,
                     spectrum=spectrum,
                     features=features,
@@ -3638,27 +3880,73 @@ def create_app(
                     request_id=request_id,
                     event_id=event_id,
                     body_digest=body_digest,
-                    verdict_pack=verdict_pack,
-                    mv_info=mv_info,
-                    budget=budget,
-                    route=route or route_info,
+                    score=score,
                     p_final=p_final,
+                    route_info=route_info,
+                    final_action=action_str,
+                    required_action=required_action,
+                    enforcement_mode=enforcement_mode,
+                    allowed=allowed,
+                    cause=cause,
+                    policy_ref=policy_ref,
+                    policyset_ref=policyset_ref,
+                    policy_digest=det_signal.get("policy_digest"),
+                    cfg_fp=config_fingerprint or rt.bundle.cfg_fp,
+                    decision_id=decision_id or "",
+                    route_plan_id=route_plan_id or "",
+                    audit_ref=audit_ref,
+                    state_domain_id=state_domain_id,
+                    adapter_registry_fp=budget.adapter_registry_fp,
+                    budget=budget,
+                    detector_components=dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {},
+                    mv_info=mv_info,
+                    security_block=security_block,
+                    artifacts=artifacts,
+                    evidence_identity=evidence_identity,
+                    pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
                 )
-            )
-            receipt_ref = _safe_text(receipt_data.get("receipt_ref"), max_len=256) or receipt_ref
-            audit_ref = _safe_text(receipt_data.get("audit_ref"), max_len=256) or audit_ref
+                raw_receipt_payload = dict(rb.raw)
+                receipt_ref = _safe_text(raw_receipt_payload.get("receipt_ref"), max_len=256) or receipt_ref
+                if receipt_ref is None:
+                    receipt_ref = _safe_text(raw_receipt_payload.get("receipt"), max_len=256) or None
+                evidence_identity["receipt_ref"] = receipt_ref
+                evidence_identity["audit_ref"] = audit_ref
 
         if cfgb.strict_mode and cfgb.require_attestor_when_receipt_required and (
             (cfgb.require_receipts_on_fail and required_action == "block")
             or (cfgb.require_receipts_when_pq and bool(req.pq_required))
         ):
-            if not receipt_data:
+            if not raw_receipt_payload:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="receipt unavailable")
 
         decision_id = decision_id or f"hd1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:decision', payload={'event_id': event_id, 'request_id': request_id, 'required_action': required_action, 'route_plan_id': route_plan_id, 'subject': [req.tenant, req.user, req.session]}, out_hex=32)}"
         route_plan_id = route_plan_id or f"hr1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:route_plan', payload={'risk_label': req.risk_label, 'trust_zone': req.trust_zone, 'route_profile': req.route_profile, 'score': _stable_float(score), 'required_action': required_action}, out_hex=32)}"
         request.state.decision_id = decision_id
         request.state.route_plan_id = route_plan_id
+
+        raw_receipt_payload = {
+            **raw_receipt_payload,
+            "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
+            "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
+            "event_id": raw_receipt_payload.get("event_id") or event_id,
+            "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
+            "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
+            "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
+            "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
+            "cfg_fp": raw_receipt_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
+            "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
+            "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+            "build_id": raw_receipt_payload.get("build_id") or req.build_id,
+            "image_digest": raw_receipt_payload.get("image_digest") or req.image_digest,
+            "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
+            "pq_ok": raw_receipt_payload.get("pq_ok") if raw_receipt_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+        }
+
+        receipt_public, receipt_verification = _build_receipt_surfaces(
+            raw_receipt_payload,
+            expose_verification_bundle_public=cfgb.expose_verification_bundle_public,
+            expose_verify_key_public=cfgb.expose_verify_key_public,
+        )
 
         identity_status = "ok"
         if req.tenant == "tenant0" or req.user == "user0" or req.session == "sess0":
@@ -3682,7 +3970,7 @@ def create_app(
             "bundle_version": bundle_version or rt.bundle.version,
             "state_domain_id": state_domain_id,
             "audit_ref": audit_ref,
-            "receipt_ref": receipt_ref,
+            "receipt_ref": receipt_public.get("receipt_ref") or receipt_ref,
             "controller_mode": controller_mode,
             "statistical_guarantee_scope": guarantee_scope,
         }
@@ -3712,8 +4000,8 @@ def create_app(
             "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
             "security": _sanitize_json_mapping(security_block, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
             "security_router": _sanitize_json_mapping(security_public, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
-            "artifacts": artifacts,
-            "receipt": _sanitize_json_mapping(receipt_data, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
+            "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+            "receipt": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
             "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
             "auth": _sanitize_json_mapping(auth_public, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
             "identity": {
@@ -3734,6 +4022,8 @@ def create_app(
                 "lang": req.lang,
             },
         }
+        if receipt_verification is not None:
+            components["receipt_verification_exposed"] = True
 
         latency_s = max(0.0, time.perf_counter() - t_start)
         http_metrics.observe_core_latency(latency_s)
@@ -3803,6 +4093,11 @@ def create_app(
 
         decision_label = "block" if action_str == "block" else ("degrade" if action_str in {"degrade", "advisory"} or required_action == "degrade" else "allow")
 
+        legacy_receipt = receipt_public.get("head") if cfgb.expose_legacy_receipt_aliases else None
+        legacy_body = receipt_verification.get("body") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+        legacy_sig = receipt_verification.get("sig") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+        legacy_vk = receipt_verification.get("verify_key") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+
         return RiskResponse(
             verdict=bool(required_action != "allow"),
             allowed=bool(allowed),
@@ -3837,16 +4132,20 @@ def create_app(
             controller_mode=controller_mode,
             statistical_guarantee_scope=guarantee_scope,
             audit_ref=audit_ref,
-            receipt_ref=receipt_ref,
+            receipt_ref=receipt_public.get("receipt_ref") or receipt_ref,
             trust_zone=req.trust_zone,
             route_profile=req.route_profile,
             threat_kind=req.threat_kind,
             pq_required=req.pq_required,
             pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
-            receipt=_safe_text(receipt_data.get("receipt"), max_len=512) or None,
-            receipt_body=_safe_text(receipt_data.get("receipt_body"), max_len=64_000) if receipt_data.get("receipt_body") is not None else None,
-            receipt_sig=_safe_text(receipt_data.get("receipt_sig"), max_len=8192) or None,
-            verify_key=_safe_text(receipt_data.get("verify_key"), max_len=8192) or None,
+            receipt_public=receipt_public,
+            receipt_verification=receipt_verification,
+            evidence_identity=evidence_identity,
+            artifacts=artifacts,
+            receipt=legacy_receipt,
+            receipt_body=legacy_body,
+            receipt_sig=legacy_sig,
+            verify_key=legacy_vk,
         )
 
     @app.post("/v1/diagnose", response_model=RiskResponse)
@@ -3859,12 +4158,7 @@ def create_app(
         return diagnose(req, request, response, _auth=_auth)
 
     def _validate_chain_mode(req: VerifyRequest) -> None:
-        if (
-            not isinstance(req.heads, list)
-            or not isinstance(req.bodies, list)
-            or len(req.heads) != len(req.bodies)
-            or len(req.heads) == 0
-        ):
+        if not isinstance(req.heads, list) or not isinstance(req.bodies, list) or len(req.heads) != len(req.bodies) or len(req.heads) == 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="heads/bodies invalid")
         if len(req.heads) > verify_limits.max_window:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="window too large")
@@ -3878,46 +4172,9 @@ def create_app(
         body_bytes = len(req.receipt_body_json.encode("utf-8", errors="strict"))
         if body_bytes > verify_limits.max_receipt_body_bytes:
             raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="receipt body too large")
-        if req.witness_segments is not None:
-            ws = req.witness_segments
-            if len(ws) != 3 or any(not isinstance(seg, list) for seg in ws):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="witness_segments must be triple of int lists")
-            total = len(ws[0]) + len(ws[1]) + len(ws[2])
-            if total > (_MAX_TRACE + _MAX_SPECT + _MAX_FEATS):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="witness too large")
-
-    def _verify_supply_chain_and_pq(req: VerifyRequest) -> None:
-        if not req.receipt_body_json:
-            return
-        try:
-            body_obj = json.loads(req.receipt_body_json)
-        except Exception:
-            body_obj = None
-        if not isinstance(body_obj, dict):
-            return
-
-        sec_block: Dict[str, Any] = {}
-        comps = body_obj.get("components")
-        if isinstance(comps, dict):
-            sec_candidate = comps.get("security")
-            if isinstance(sec_candidate, dict):
-                sec_block = sec_candidate
-        if not sec_block and isinstance(body_obj.get("security"), dict):
-            sec_block = body_obj["security"]
-
-        pq_required_eff = bool(sec_block.get("pq_required") or body_obj.get("pq_required") or bool(req.pq_required))
-        pq_ok_eff = sec_block.get("pq_ok")
-        if pq_required_eff and (pq_ok_eff is False or pq_ok_eff is None):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="pq_violation")
-
-        runtime_build_id = cfgb.build_id or None
-        runtime_image_digest = cfgb.image_digest or None
-        rec_build = _safe_text(sec_block.get("build_id"), max_len=128) if isinstance(sec_block, dict) else None
-        rec_image = _safe_text(sec_block.get("image_digest"), max_len=256) if isinstance(sec_block, dict) else None
-        if runtime_build_id and rec_build and rec_build != runtime_build_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="supply_chain_mismatch_build")
-        if runtime_image_digest and rec_image and rec_image != runtime_image_digest:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="supply_chain_mismatch_image")
+        verify_key = req.verify_key or req.verify_key_hex
+        if verify_key is not None and len(verify_key) > verify_limits.max_verify_key_len:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="verify key too large")
 
     @app.post("/verify", response_model=VerifyResponse)
     def verify(
@@ -3937,6 +4194,7 @@ def create_app(
         t0 = time.perf_counter()
         ok = False
         reason = "verify_fail"
+        report_dict: Dict[str, Any] = {}
         try:
             if req.heads is not None or req.bodies is not None:
                 _validate_chain_mode(req)
@@ -3944,33 +4202,48 @@ def create_app(
                 reason = "chain"
             else:
                 _validate_single_mode(req)
-                ws: Optional[Tuple[List[int], List[int], List[int]]] = None
-                if req.witness_segments is not None:
-                    ws = (req.witness_segments[0], req.witness_segments[1], req.witness_segments[2])
-
-                ok = bool(
-                    verify_receipt(
-                        receipt_head_hex=req.receipt_head_hex,
-                        receipt_body_json=req.receipt_body_json,
-                        verify_key_hex=req.verify_key_hex,
-                        receipt_sig_hex=req.receipt_sig_hex,
-                        req_obj=req.req_obj,
-                        comp_obj=req.comp_obj,
-                        e_obj=req.e_obj,
-                        witness_segments=ws,
-                        strict=True,
-                    )
+                verify_key = req.verify_key or req.verify_key_hex
+                report = verify_receipt_ex(
+                    receipt_head_hex=req.receipt_head_hex or "",
+                    receipt_body_json=req.receipt_body_json or "",
+                    verify_key_hex=verify_key,
+                    receipt_sig_hex=req.receipt_sig_hex,
+                    req_obj=req.req_obj,
+                    comp_obj=req.comp_obj,
+                    e_obj=req.e_obj,
+                    witness_segments=req.witness_segments,
+                    strict=True,
+                    expected_policy_ref=req.expected_policy_ref,
+                    expected_policyset_ref=req.expected_policyset_ref,
+                    expected_policy_digest=req.expected_policy_digest,
+                    expected_cfg_fp=req.expected_cfg_fp,
+                    expected_build_id=req.expected_build_id,
+                    expected_image_digest=req.expected_image_digest,
+                    require_signature=req.require_signature,
                 )
-                if ok:
-                    _verify_supply_chain_and_pq(req)
+                ok = bool(getattr(report, "ok", False))
                 reason = "receipt"
+                report_dict = {
+                    "head_verified": getattr(report, "head_verified", None),
+                    "body_canonical_verified": getattr(report, "body_canonical_verified", None),
+                    "integrity_hash_verified": getattr(report, "integrity_hash_verified", None),
+                    "signature_verified": getattr(report, "signature_verified", None),
+                    "verify_key_allowed": getattr(report, "verify_key_allowed", None),
+                    "policy_binding_verified": getattr(report, "policy_binding_verified", None),
+                    "cfg_binding_verified": getattr(report, "cfg_binding_verified", None),
+                    "integrity_ok": getattr(report, "ok", None),
+                    "errors": list(getattr(report, "errors", []) or []),
+                    "warnings": list(getattr(report, "warnings", []) or []),
+                }
+                if ok:
+                    _verify_pq_from_body_and_request(req)
         finally:
             latency = max(0.0, time.perf_counter() - t0)
             http_metrics.observe_core_latency(latency)
             if not ok:
                 http_metrics.record_verify_fail()
 
-        return VerifyResponse(ok=ok, request_id=request_id, reason=reason)
+        return VerifyResponse(ok=ok, request_id=request_id, reason=reason, report=report_dict)
 
     @app.post("/v1/verify", response_model=VerifyResponse)
     def verify_v1(
