@@ -134,8 +134,6 @@ Use whichever matches your serving stack.
 
 ### 3. Send a request through TCD
 
-A minimal HTTP-style example:
-
 ```bash
 curl -i \
   -X POST http://localhost:8080/diagnose \
