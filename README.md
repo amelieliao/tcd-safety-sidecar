@@ -139,15 +139,29 @@ A minimal HTTP-style example:
 ```bash
 curl -i \
   -X POST http://localhost:8080/diagnose \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: demo-1' \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-3" \
   -d '{
-    "input_kind": "request",
-    "input_json": {
-      "tenant": "demo",
-      "route": "/chat",
-      "model_id": "model-a"
-    }
+    "tenant": "demo",
+    "user": "user1",
+    "session": "sess1",
+    "model_id": "model-a",
+    "gpu_id": "gpu0",
+    "task": "chat",
+    "lang": "en",
+    "trace_vector": [0.1, 0.2, 0.3],
+    "spectrum": [0.4, 0.5],
+    "features": [0.6, 0.7],
+    "entropy": 0.42,
+    "step_id": 1,
+    "context": {},
+    "tokens_delta": 50,
+    "drift_score": 0.0,
+    "trust_zone": "internet",
+    "route_profile": "inference",
+    "risk_label": "normal",
+    "base_temp": 0.7,
+    "base_top_p": 0.9
   }'
 ```
 
