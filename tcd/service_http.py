@@ -1234,6 +1234,19 @@ def _receipt_surfaces_from_sources(
     return {}, None, prv
 
 
+
+@dataclass(frozen=True)
+class _CompatDetectRequest:
+    tenant: str = "*"
+    user: str = "*"
+    session: str = "*"
+    model_id: str = "*"
+    lang: str = "*"
+    kind: str = "completion"
+    text: str = ""
+    meta: Optional[Dict[str, Any]] = None
+
+
 def _compute_array_digest(trace: Sequence[float], spectrum: Sequence[float], features: Sequence[float], *, alg: str) -> str:
     if RollingHasher is not None:
         with contextlib.suppress(Exception):
@@ -3440,26 +3453,95 @@ def create_app(
         spectrum: Sequence[float],
         features: Sequence[float],
     ) -> Optional[str]:
-        raw_text = ""
-        if isinstance(req.context, Mapping):
-            raw_text = _safe_text(req.context.get("detector_text"), max_len=16_384)
-        if raw_text:
-            return raw_text
-        if not cfgb.allow_detector_text_synthesis_for_compat:
-            return None
+        ctx = req.context if isinstance(req.context, Mapping) else {}
+
+        explicit_text = _safe_text(ctx.get("detector_text"), max_len=16_384)
+        if explicit_text:
+            return explicit_text
+
+        for key in ("text", "input_text", "input", "query", "prompt", "instruction", "instructions", "content", "message"):
+            candidate = _safe_text(ctx.get(key), max_len=16_384)
+            if candidate:
+                return candidate
+
+        messages_obj = ctx.get("messages")
+        if isinstance(messages_obj, (list, tuple)):
+            msg_parts: List[str] = []
+            for item in list(messages_obj)[:16]:
+                if isinstance(item, Mapping):
+                    role = _safe_text(item.get("role"), max_len=32)
+                    content = _safe_text(item.get("content"), max_len=1024) or _safe_text(item.get("text"), max_len=1024)
+                    if content:
+                        msg_parts.append(f"{role}: {content}" if role else content)
+                else:
+                    content = _safe_text(item, max_len=1024)
+                    if content:
+                        msg_parts.append(content)
+            joined = "\n".join(msg_parts).strip()
+            if joined:
+                return joined[:16_384]
+
+        def _summary(values: Sequence[float]) -> Dict[str, Any]:
+            xs = [float(x) for x in list(values)[:256]]
+            if not xs:
+                return {"len": 0}
+            n = len(xs)
+            mean = sum(xs) / float(n)
+            var = sum((x - mean) * (x - mean) for x in xs) / float(n)
+            return {
+                "len": n,
+                "min": round(min(xs), 6),
+                "max": round(max(xs), 6),
+                "mean": round(mean, 6),
+                "std": round(math.sqrt(max(0.0, var)), 6),
+            }
+
         payload = {
-            "trace_vector": [round(float(x), 6) for x in list(trace_vec)[:256]],
-            "entropy": _coerce_float(req.entropy),
-            "spectrum": [round(float(x), 6) for x in list(spectrum)[:256]],
-            "features": [round(float(x), 6) for x in list(features)[:256]],
-            "task": req.task,
-            "gpu_id": req.gpu_id,
-            "drift_score": _coerce_float(req.drift_score),
-            "step_id": _coerce_int(req.step_id) if req.step_id is not None else None,
-            "context": _safe_context_subset(dict(req.context or {})),
+            "schema": "tcd.detector.compat_input.v2",
+            "subject": {
+                "tenant": req.tenant,
+                "user": req.user,
+                "session": req.session,
+            },
+            "runtime": {
+                "model_id": req.model_id,
+                "gpu_id": req.gpu_id,
+                "task": req.task,
+                "lang": req.lang,
+                "trust_zone": req.trust_zone,
+                "route_profile": req.route_profile,
+                "risk_label": req.risk_label,
+                "threat_kind": req.threat_kind,
+            },
+            "signals": {
+                "entropy": _coerce_float(req.entropy),
+                "step_id": _coerce_int(req.step_id) if req.step_id is not None else None,
+                "tokens_delta": int(req.tokens_delta),
+                "drift_score": _coerce_float(req.drift_score),
+            },
+            "trace_summary": _summary(trace_vec),
+            "spectrum_summary": _summary(spectrum),
+            "feature_summary": _summary(features),
+            "context": {
+                k: v
+                for k, v in _safe_context_subset(dict(ctx)).items()
+                if k != "detector_text"
+            },
         }
+
         txt = _compact_json(payload, max_bytes=16_384)
-        return txt or None
+        if txt and txt != "{}":
+            return txt
+
+        fallback = (
+            f"task={req.task} model_id={req.model_id} gpu_id={req.gpu_id} "
+            f"lang={req.lang} trust_zone={req.trust_zone} route_profile={req.route_profile} "
+            f"risk_label={req.risk_label} threat_kind={req.threat_kind or 'none'} "
+            f"trace_len={len(trace_vec)} spectrum_len={len(spectrum)} feature_len={len(features)} "
+            f"entropy={_coerce_float(req.entropy)} drift_score={_coerce_float(req.drift_score)} "
+            f"tokens_delta={int(req.tokens_delta)}"
+        )
+        return _safe_text(fallback, max_len=16_384) or None
 
     def _make_detector_request(
         req: DiagnoseRequest,
@@ -3468,11 +3550,59 @@ def create_app(
         spectrum: Sequence[float],
         features: Sequence[float],
     ) -> Any:
-        if DetectRequest is None:
-            return None
         detector_text = _build_detector_compat_text(req, trace_vec=trace_vec, spectrum=spectrum, features=features)
         if not detector_text:
-            return None
+            detector_text = (
+                f"task={req.task} model_id={req.model_id} gpu_id={req.gpu_id} "
+                f"trace_len={len(trace_vec)} spectrum_len={len(spectrum)} feature_len={len(features)}"
+            )
+
+        ctx = req.context if isinstance(req.context, Mapping) else {}
+
+        def _summary(values: Sequence[float]) -> Dict[str, Any]:
+            xs = [float(x) for x in list(values)[:256]]
+            if not xs:
+                return {"len": 0}
+            n = len(xs)
+            mean = sum(xs) / float(n)
+            var = sum((x - mean) * (x - mean) for x in xs) / float(n)
+            return {
+                "len": n,
+                "min": round(min(xs), 6),
+                "max": round(max(xs), 6),
+                "mean": round(mean, 6),
+                "std": round(math.sqrt(max(0.0, var)), 6),
+            }
+
+        extra_keywords: List[str] = []
+        seen_keywords: set[str] = set()
+
+        def _add_keyword(v: Any) -> None:
+            s = _safe_text(v, max_len=64).lower().strip()
+            s = re.sub(r"[^a-z0-9 _:\-]+", " ", s).strip()
+            if not s:
+                return
+            if len(s) > 64:
+                s = s[:64].strip()
+            if s and s not in seen_keywords:
+                seen_keywords.add(s)
+                extra_keywords.append(s)
+
+        for item in (req.task, req.threat_kind, req.risk_label, req.route_profile, req.trust_zone, req.lang):
+            _add_keyword(item)
+
+        extra_from_context = ctx.get("extra_keywords")
+        if isinstance(extra_from_context, str):
+            for part in re.split(r"[\n,;|]+", extra_from_context):
+                _add_keyword(part)
+        elif isinstance(extra_from_context, (list, tuple, set, frozenset)):
+            for part in list(extra_from_context)[:32]:
+                _add_keyword(part)
+
+        kind = _safe_label(ctx.get("detector_kind") or ctx.get("kind"), default="")
+        if kind not in {"prompt", "completion", "system", "tool"}:
+            kind = "tool" if req.task == "tool" else "completion"
+
         meta = {
             "entropy": _coerce_float(req.entropy),
             "step_id": _coerce_int(req.step_id) if req.step_id is not None else None,
@@ -3481,25 +3611,48 @@ def create_app(
             "trust_zone": req.trust_zone,
             "route_profile": req.route_profile,
             "risk_label": req.risk_label,
+            "threat_kind": req.threat_kind,
             "drift_score": _coerce_float(req.drift_score),
+            "tokens_delta": int(req.tokens_delta),
             "trace_len": len(trace_vec),
             "spectrum_len": len(spectrum),
             "feature_len": len(features),
-            "context": _safe_context_subset(dict(req.context or {})),
+            "trace_summary": _summary(trace_vec),
+            "spectrum_summary": _summary(spectrum),
+            "feature_summary": _summary(features),
+            "context": {
+                k: v
+                for k, v in _safe_context_subset(dict(ctx)).items()
+                if k != "detector_text"
+            },
         }
+        if extra_keywords:
+            meta["extra_keywords"] = extra_keywords[:64]
+
         kwargs = {
             "tenant": req.tenant,
             "user": req.user,
             "session": req.session,
             "model_id": req.model_id,
             "lang": req.lang,
-            "kind": "completion",
+            "kind": kind,
             "text": detector_text,
             "meta": meta,
         }
-        with contextlib.suppress(Exception):
-            return DetectRequest(**kwargs)
-        return None
+
+        ctor = DetectRequest
+        if ctor is not None and hasattr(ctor, "model_validate"):
+            with contextlib.suppress(Exception):
+                return ctor.model_validate(kwargs)
+
+        if ctor is not None:
+            with contextlib.suppress(Exception):
+                return ctor(**kwargs)
+            with contextlib.suppress(Exception):
+                filtered = _filtered_kwargs_for(ctor, kwargs)
+                return ctor(**filtered)
+
+        return _CompatDetectRequest(**kwargs)
 
     def _normalize_detector_runtime_out(out: Any) -> Dict[str, Any]:
         if out is None:
@@ -3595,19 +3748,30 @@ def create_app(
         detect_fn = getattr(det, "detect", None)
         if callable(detect_fn):
             dreq = _make_detector_request(req, trace_vec=trace_vec, spectrum=spectrum, features=features)
-            if dreq is not None:
-                with contextlib.suppress(Exception):
-                    return _detector_runtime_to_verdict_pack(detect_fn(dreq), step_id=req.step_id)
-            return {
-                "verdict": True,
-                "score": 1.0,
-                "p_value": 1e-12,
-                "decision": "block",
-                "action": "block",
-                "step": int(req.step_id or 0),
-                "reason_code": "FORMAL_DETECTOR_INPUT_UNAVAILABLE",
-                "components": {"reason": "formal_detector_input_unavailable"},
-            }
+            if dreq is None:
+                return {
+                    "verdict": True,
+                    "score": 1.0,
+                    "p_value": 1e-12,
+                    "decision": "block",
+                    "action": "block",
+                    "step": int(req.step_id or 0),
+                    "reason_code": "FORMAL_DETECTOR_REQUEST_BUILD_FAILED",
+                    "components": {"reason": "formal_detector_request_build_failed"},
+                }
+            try:
+                return _detector_runtime_to_verdict_pack(detect_fn(dreq), step_id=req.step_id)
+            except Exception:
+                return {
+                    "verdict": True,
+                    "score": 1.0,
+                    "p_value": 1e-12,
+                    "decision": "block",
+                    "action": "block",
+                    "step": int(req.step_id or 0),
+                    "reason_code": "FORMAL_DETECTOR_EXECUTION_FAILED",
+                    "components": {"reason": "formal_detector_execution_failed"},
+                }
 
         diagnose_fn = getattr(det, "diagnose", None)
         if callable(diagnose_fn):
