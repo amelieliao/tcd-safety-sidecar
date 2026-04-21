@@ -1011,6 +1011,8 @@ def _build_receipt_surfaces(
     expose_verification_bundle_public: bool,
     expose_verify_key_public: bool,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    if not isinstance(payload, Mapping) or not payload:
+        return {}, None
     rv = _receipt_view_model(payload)
     if rv is not None:
         with contextlib.suppress(Exception):
@@ -1020,6 +1022,216 @@ def _build_receipt_surfaces(
     pub2 = _fallback_receipt_public(payload)
     ver2 = _fallback_receipt_verification(payload, include_verify_key=bool(expose_verify_key_public))
     return pub2, (ver2 if expose_verification_bundle_public else None)
+
+
+def _first_text(*values: Any, max_len: int = 256) -> Optional[str]:
+    for v in values:
+        s = _safe_text(v, max_len=max_len)
+        if s:
+            return s
+    return None
+
+
+def _first_float(*values: Any, default: float = 0.0) -> float:
+    for v in values:
+        x = _coerce_float(v)
+        if x is not None:
+            return float(x)
+    return float(default)
+
+
+def _first_bool(*values: Any, default: bool = False) -> bool:
+    for v in values:
+        if v is None:
+            continue
+        return bool(_coerce_bool(v, default=default))
+    return bool(default)
+
+
+def _receipt_payload_has_material(payload: Mapping[str, Any]) -> bool:
+    if not isinstance(payload, Mapping) or not payload:
+        return False
+    material_keys = (
+        "receipt",
+        "head",
+        "receipt_body",
+        "body",
+        "receipt_sig",
+        "sig",
+        "verify_key",
+        "verify_key_id",
+        "verify_key_fp",
+        "receipt_integrity",
+        "head_verified",
+        "signature_verified",
+        "integrity_ok",
+    )
+    for key in material_keys:
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+        if isinstance(val, (int, float, bool)) and val is not None:
+            return True
+    return False
+
+
+def _sanitize_receipt_public_surface(obj: Any) -> Dict[str, Any]:
+    data = _extract_receipt_like(obj)
+    if not data:
+        return {}
+    return _sanitize_json_mapping(
+        data,
+        max_depth=6,
+        max_items=128,
+        max_str_len=2048,
+        max_total_bytes=_DEFAULT_RECEIPT_BODY_LIMIT,
+    )
+
+
+def _sanitize_receipt_verification_surface(obj: Any) -> Optional[Dict[str, Any]]:
+    data = _extract_receipt_like(obj)
+    if not data:
+        return None
+    out = _sanitize_json_mapping(
+        data,
+        max_depth=6,
+        max_items=128,
+        max_str_len=4096,
+        max_total_bytes=_DEFAULT_RECEIPT_BODY_LIMIT,
+    )
+    return out or None
+
+
+def _derive_receipt_ref(
+    *,
+    receipt_public: Optional[Mapping[str, Any]] = None,
+    receipt_verification: Optional[Mapping[str, Any]] = None,
+    receipt_private: Optional[Mapping[str, Any]] = None,
+    raw_receipt: Optional[Mapping[str, Any]] = None,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    pub = receipt_public or {}
+    ver = receipt_verification or {}
+    prv = receipt_private or {}
+    raw = raw_receipt or {}
+    return _first_text(
+        pub.get("receipt_ref"),
+        pub.get("head"),
+        ver.get("head"),
+        prv.get("receipt_ref"),
+        prv.get("receipt"),
+        raw.get("receipt_ref"),
+        raw.get("receipt"),
+        fallback,
+        max_len=512,
+    )
+
+
+def _derive_audit_ref(
+    *,
+    receipt_public: Optional[Mapping[str, Any]] = None,
+    receipt_private: Optional[Mapping[str, Any]] = None,
+    raw_receipt: Optional[Mapping[str, Any]] = None,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    pub = receipt_public or {}
+    prv = receipt_private or {}
+    raw = raw_receipt or {}
+    return _first_text(
+        pub.get("audit_ref"),
+        prv.get("audit_ref"),
+        raw.get("audit_ref"),
+        fallback,
+        max_len=512,
+    )
+
+
+def _normalize_artifact_refs(
+    artifacts: Mapping[str, Any],
+    *,
+    audit_ref: Optional[str],
+    receipt_ref: Optional[str],
+    body_digest: Optional[str],
+) -> Dict[str, Any]:
+    src = dict(artifacts or {})
+    prepare_ref = _first_text(src.get("prepare_ref"), src.get("ledger_prepare_ref"), max_len=256)
+    commit_ref = _first_text(src.get("commit_ref"), src.get("ledger_commit_ref"), max_len=256)
+    ledger_ref = _first_text(src.get("ledger_ref"), commit_ref, prepare_ref, max_len=256)
+
+    produced_by_raw = src.get("produced_by")
+    if isinstance(produced_by_raw, (list, tuple, set, frozenset)):
+        produced_by = [
+            _safe_text(x, max_len=128)
+            for x in list(produced_by_raw)[:16]
+            if _safe_text(x, max_len=128)
+        ]
+    else:
+        produced_by = []
+
+    normalized = {
+        **src,
+        "audit_ref": _first_text(src.get("audit_ref"), audit_ref, max_len=256),
+        "receipt_ref": _first_text(src.get("receipt_ref"), receipt_ref, max_len=256),
+        "ledger_ref": ledger_ref,
+        "attestation_ref": _first_text(src.get("attestation_ref"), max_len=256),
+        "prepare_ref": prepare_ref,
+        "commit_ref": commit_ref,
+        "ledger_stage": _first_text(src.get("ledger_stage"), max_len=64),
+        "outbox_ref": _first_text(src.get("outbox_ref"), max_len=256),
+        "outbox_status": _first_text(src.get("outbox_status"), max_len=64),
+        "outbox_dedupe_key": _first_text(src.get("outbox_dedupe_key"), max_len=256),
+        "delivery_attempts": max(0, _coerce_int(src.get("delivery_attempts")) or 0) or None,
+        "body_digest": _first_text(src.get("body_digest"), body_digest, max_len=128),
+        "event_digest": _first_text(src.get("event_digest"), max_len=128),
+        "payload_digest": _first_text(src.get("payload_digest"), max_len=128),
+        "chain_id": _first_text(src.get("chain_id"), max_len=128),
+        "chain_head": _first_text(src.get("chain_head"), max_len=256),
+        "produced_by": produced_by,
+        "provenance_path_digest": _first_text(src.get("provenance_path_digest"), max_len=128),
+    }
+    return _sanitize_json_mapping(
+        normalized,
+        max_depth=4,
+        max_items=64,
+        max_str_len=512,
+        max_total_bytes=32_000,
+    )
+
+
+def _receipt_surfaces_from_sources(
+    *,
+    explicit_public: Optional[Mapping[str, Any]],
+    explicit_verification: Optional[Mapping[str, Any]],
+    explicit_private: Optional[Mapping[str, Any]],
+    raw_payload: Optional[Mapping[str, Any]],
+    expose_verification_bundle_public: bool,
+    expose_verify_key_public: bool,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
+    pub = dict(explicit_public or {})
+    ver = dict(explicit_verification or {}) if explicit_verification is not None else None
+    prv = dict(explicit_private or {})
+
+    if pub or ver is not None:
+        return pub, ver, prv
+
+    raw = dict(raw_payload or {})
+    if raw and _receipt_payload_has_material(raw):
+        pub2, ver2 = _build_receipt_surfaces(
+            raw,
+            expose_verification_bundle_public=expose_verification_bundle_public,
+            expose_verify_key_public=expose_verify_key_public,
+        )
+        return pub2, ver2, prv
+
+    if prv and _receipt_payload_has_material(prv):
+        pub3, ver3 = _build_receipt_surfaces(
+            prv,
+            expose_verification_bundle_public=expose_verification_bundle_public,
+            expose_verify_key_public=expose_verify_key_public,
+        )
+        return pub3, ver3, prv
+
+    return {}, None, prv
 
 
 def _compute_array_digest(trace: Sequence[float], spectrum: Sequence[float], features: Sequence[float], *, alg: str) -> str:
@@ -1540,6 +1752,13 @@ class RiskResponse(_Model):
     statistical_guarantee_scope: Optional[str] = None
     audit_ref: Optional[str] = None
     receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_status: Optional[str] = None
+    ledger_stage: Optional[str] = None
 
     trust_zone: Optional[str] = None
     route_profile: Optional[str] = None
@@ -1576,6 +1795,13 @@ class RiskResponse(_Model):
         "statistical_guarantee_scope",
         "audit_ref",
         "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
+        "outbox_status",
+        "ledger_stage",
         "trust_zone",
         "route_profile",
         "threat_kind",
@@ -2047,24 +2273,67 @@ class RiskBudgetEnvelope:
     @classmethod
     def from_av_out(cls, av_out: Mapping[str, Any]) -> "RiskBudgetEnvelope":
         e_state = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
-        controller = e_state.get("controller") if isinstance(e_state, Mapping) and isinstance(e_state.get("controller"), Mapping) else {}
-        validity = e_state.get("validity") if isinstance(e_state, Mapping) and isinstance(e_state.get("validity"), Mapping) else {}
+        controller = e_state.get("controller") if isinstance(e_state.get("controller"), Mapping) else {}
+        process = e_state.get("process") if isinstance(e_state.get("process"), Mapping) else {}
+        validity = e_state.get("validity") if isinstance(e_state.get("validity"), Mapping) else {}
         security = av_out.get("security") if isinstance(av_out.get("security"), Mapping) else {}
-        controller_mode = _safe_text(security.get("controller_mode", ""), max_len=64) or None
-        if controller_mode is None and isinstance(controller, Mapping):
-            controller_mode = _safe_text(controller.get("controller_mode", ""), max_len=64) or None
-        guarantee_scope = _safe_text(security.get("statistical_guarantee_scope", ""), max_len=128) or None
-        if guarantee_scope is None and isinstance(validity, Mapping):
-            guarantee_scope = _safe_text(validity.get("statistical_guarantee_scope", ""), max_len=128) or None
-        state_domain_id = _safe_text(controller.get("state_domain_id", ""), max_len=128) or None if isinstance(controller, Mapping) else None
-        adapter_registry_fp = _safe_text(controller.get("adapter_registry_fp", ""), max_len=128) or None if isinstance(controller, Mapping) else None
+
+        controller_mode = _first_text(
+            security.get("controller_mode"),
+            controller.get("controller_mode"),
+            av_out.get("controller_mode"),
+            max_len=64,
+        )
+        guarantee_scope = _first_text(
+            security.get("statistical_guarantee_scope"),
+            validity.get("statistical_guarantee_scope"),
+            process.get("guarantee_scope"),
+            av_out.get("statistical_guarantee_scope"),
+            max_len=128,
+        )
+        state_domain_id = _first_text(
+            controller.get("state_domain_id"),
+            security.get("state_domain_id"),
+            av_out.get("state_domain_id"),
+            max_len=128,
+        )
+        adapter_registry_fp = _first_text(
+            controller.get("adapter_registry_fp"),
+            security.get("adapter_registry_fp"),
+            av_out.get("adapter_registry_fp"),
+            max_len=128,
+        )
+
         return cls(
-            e_value=float(_coerce_float(av_out.get("e_value")) or 1.0),
-            alpha_alloc=float(_coerce_float(av_out.get("alpha_alloc")) or 0.0),
-            alpha_wealth=float(_coerce_float(av_out.get("alpha_wealth")) or 0.0),
-            alpha_spent=float(_coerce_float(av_out.get("alpha_spent")) or 0.0),
-            threshold=float(_coerce_float(av_out.get("threshold")) or 0.0),
-            triggered=bool(_coerce_bool(av_out.get("trigger"), default=False)),
+            e_value=_first_float(
+                process.get("selected_e_value"),
+                process.get("e_value"),
+                default=1.0,
+            ),
+            alpha_alloc=_first_float(
+                process.get("alpha_alloc"),
+                security.get("alpha_alloc"),
+                default=0.0,
+            ),
+            alpha_wealth=_first_float(
+                process.get("alpha_wealth"),
+                default=0.0,
+            ),
+            alpha_spent=_first_float(
+                process.get("alpha_spent"),
+                security.get("alpha_spent"),
+                default=0.0,
+            ),
+            threshold=_first_float(
+                process.get("threshold_e_value"),
+                process.get("threshold"),
+                default=0.0,
+            ),
+            triggered=_first_bool(
+                process.get("trigger"),
+                process.get("active"),
+                default=False,
+            ),
             controller_mode=controller_mode,
             statistical_guarantee_scope=guarantee_scope,
             state_domain_id=state_domain_id,
@@ -3495,21 +3764,46 @@ def create_app(
         body_digest: str,
     ) -> Dict[str, Any]:
         e_state = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
+        controller = e_state.get("controller") if isinstance(e_state.get("controller"), Mapping) else {}
+        process = e_state.get("process") if isinstance(e_state.get("process"), Mapping) else {}
+        validity = e_state.get("validity") if isinstance(e_state.get("validity"), Mapping) else {}
         security = av_out.get("security") if isinstance(av_out.get("security"), Mapping) else {}
+
         det_signal = _extract_detector_signal(verdict_pack)
         action = det_signal.get("action") or ("block" if decision_fail and req.risk_label == "critical" else ("degrade" if decision_fail else "allow"))
         if action == "deny":
             action = "block"
+
+        controller_mode = _first_text(
+            security.get("controller_mode"),
+            controller.get("controller_mode"),
+            av_out.get("controller_mode"),
+            max_len=64,
+        )
+        guarantee_scope = _first_text(
+            security.get("statistical_guarantee_scope"),
+            validity.get("statistical_guarantee_scope"),
+            process.get("guarantee_scope"),
+            av_out.get("statistical_guarantee_scope"),
+            max_len=128,
+        )
+        av_trigger = _first_bool(
+            process.get("trigger"),
+            process.get("active"),
+            av_out.get("trigger"),
+            default=False,
+        )
+
         return {
             "risk_score": float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else score),
             "risk_label": req.risk_label,
             "action": action,
             "trigger": bool(decision_fail),
             "reason": _safe_text(det_signal.get("reason_code") or verdict_pack.get("reason_code"), max_len=128) or None,
-            "controller_mode": _safe_text(security.get("controller_mode", ""), max_len=64) or None,
-            "guarantee_scope": _safe_text(security.get("statistical_guarantee_scope", ""), max_len=128) or None,
+            "controller_mode": controller_mode,
+            "guarantee_scope": guarantee_scope,
             "av_label": _safe_text(getattr(getattr(rt.detector_registry.get_alpha_controller((req.tenant, req.user, req.session)), "config", None), "label", None), max_len=64) or None,
-            "av_trigger": bool(av_out.get("trigger", False)),
+            "av_trigger": av_trigger,
             "threat_tags": [threat_kind] if threat_kind else [],
             "decision_id": det_signal.get("decision_id"),
             "config_hash": det_signal.get("config_hash"),
@@ -3707,6 +4001,10 @@ def create_app(
         budget = _alpha_budget_or_fail(av_out, tenant=req.tenant, user=req.user, session=req.session)
         decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
 
+        e_state_block = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
+        process_block = e_state_block.get("process") if isinstance(e_state_block.get("process"), Mapping) else {}
+        selected_source = _first_text(process_block.get("selected_source"), max_len=128)
+
         route = _route_decide_compat(
             rt.router,
             decision_fail=decision_fail,
@@ -3789,7 +4087,11 @@ def create_app(
         artifacts: Dict[str, Any] = {}
         audit_ref: Optional[str] = None
         receipt_ref: Optional[str] = None
+
         raw_receipt_payload: Dict[str, Any] = {}
+        receipt_public_explicit: Dict[str, Any] = {}
+        receipt_verification_explicit: Optional[Dict[str, Any]] = None
+        receipt_private_payload: Dict[str, Any] = {}
 
         if security_decision is not None:
             security_public = _extract_security_public(security_decision)
@@ -3820,9 +4122,27 @@ def create_app(
             receipt_ref = _safe_text(getattr(security_decision, "receipt_ref", None), max_len=256) or None
 
             raw_receipt_payload = _extract_receipt_like(getattr(security_decision, "receipt", None))
+            receipt_public_explicit = _sanitize_receipt_public_surface(getattr(security_decision, "receipt_public", None))
+            receipt_verification_explicit = _sanitize_receipt_verification_surface(getattr(security_decision, "receipt_verification", None))
+            receipt_private_payload = _extract_receipt_like(getattr(security_decision, "receipt_private", None))
+
+            audit_ref = _derive_audit_ref(
+                receipt_public=receipt_public_explicit,
+                receipt_private=receipt_private_payload,
+                raw_receipt=raw_receipt_payload,
+                fallback=audit_ref,
+            )
+            receipt_ref = _derive_receipt_ref(
+                receipt_public=receipt_public_explicit,
+                receipt_verification=receipt_verification_explicit,
+                receipt_private=receipt_private_payload,
+                raw_receipt=raw_receipt_payload,
+                fallback=receipt_ref,
+            )
+
             security_block = _sanitize_json_mapping(getattr(security_decision, "security", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000)
             evidence_identity = _sanitize_json_mapping(getattr(security_decision, "evidence_identity", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
-            artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
+            artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=64, max_str_len=512, max_total_bytes=32_000)
         else:
             required_action = required_action if required_action in {"allow", "degrade", "block"} else (
                 "block" if (cfgb.strict_mode and req.risk_label == "critical" and decision_fail) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
@@ -3896,12 +4216,23 @@ def create_app(
                 "produced_by": "service_http.local",
             }
 
+        receipt_surface_available = bool(
+            receipt_public_explicit
+            or receipt_verification_explicit is not None
+            or (receipt_private_payload and _receipt_payload_has_material(receipt_private_payload))
+            or (raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload))
+        )
+
         if cfgb.strict_mode and cfgb.require_finalized_receipt_surface_when_strict:
-            receipt_needed_strict = bool(cfgb.receipts_enable_default or (cfgb.require_receipts_on_fail and required_action == "block") or (cfgb.require_receipts_when_pq and bool(req.pq_required)))
-            if receipt_needed_strict and rt.security_router is None and raw_receipt_payload == {}:
+            receipt_needed_strict = bool(
+                cfgb.receipts_enable_default
+                or (cfgb.require_receipts_on_fail and required_action == "block")
+                or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+            )
+            if receipt_needed_strict and rt.security_router is None and not receipt_surface_available:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
 
-        if not raw_receipt_payload:
+        if not receipt_surface_available:
             need_local_receipt = (
                 rt.receipt_mgr.attestor is not None
                 and (
@@ -3944,18 +4275,40 @@ def create_app(
                     evidence_identity=evidence_identity,
                     pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
                 )
-                raw_receipt_payload = dict(rb.raw)
-                receipt_ref = _safe_text(raw_receipt_payload.get("receipt_ref"), max_len=256) or receipt_ref
-                if receipt_ref is None:
-                    receipt_ref = _safe_text(raw_receipt_payload.get("receipt"), max_len=256) or None
+                raw_receipt_payload = dict(rb.raw or {})
+                receipt_public_explicit = dict(rb.public or {})
+                receipt_verification_explicit = dict(rb.verification or {}) if rb.verification is not None else None
+                if not receipt_private_payload and raw_receipt_payload:
+                    receipt_private_payload = dict(raw_receipt_payload)
+
+                receipt_ref = _derive_receipt_ref(
+                    receipt_public=receipt_public_explicit,
+                    receipt_verification=receipt_verification_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                    fallback=receipt_ref,
+                )
+                audit_ref = _derive_audit_ref(
+                    receipt_public=receipt_public_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                    fallback=audit_ref,
+                )
                 evidence_identity["receipt_ref"] = receipt_ref
                 evidence_identity["audit_ref"] = audit_ref
+
+        receipt_surface_available = bool(
+            receipt_public_explicit
+            or receipt_verification_explicit is not None
+            or (receipt_private_payload and _receipt_payload_has_material(receipt_private_payload))
+            or (raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload))
+        )
 
         if cfgb.strict_mode and cfgb.require_attestor_when_receipt_required and (
             (cfgb.require_receipts_on_fail and required_action == "block")
             or (cfgb.require_receipts_when_pq and bool(req.pq_required))
         ):
-            if not raw_receipt_payload:
+            if not receipt_surface_available:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="receipt unavailable")
 
         decision_id = decision_id or f"hd1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:decision', payload={'event_id': event_id, 'request_id': request_id, 'required_action': required_action, 'route_plan_id': route_plan_id, 'subject': [req.tenant, req.user, req.session]}, out_hex=32)}"
@@ -3963,28 +4316,85 @@ def create_app(
         request.state.decision_id = decision_id
         request.state.route_plan_id = route_plan_id
 
-        raw_receipt_payload = {
-            **raw_receipt_payload,
-            "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
-            "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
-            "event_id": raw_receipt_payload.get("event_id") or event_id,
-            "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
-            "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
-            "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
-            "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
-            "cfg_fp": raw_receipt_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
-            "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
-            "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
-            "build_id": raw_receipt_payload.get("build_id") or req.build_id,
-            "image_digest": raw_receipt_payload.get("image_digest") or req.image_digest,
-            "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
-            "pq_ok": raw_receipt_payload.get("pq_ok") if raw_receipt_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
-        }
+        if receipt_public_explicit:
+            receipt_public_explicit = {
+                **receipt_public_explicit,
+                "receipt_ref": receipt_public_explicit.get("receipt_ref") or receipt_ref or receipt_public_explicit.get("head"),
+                "audit_ref": receipt_public_explicit.get("audit_ref") or audit_ref,
+                "event_id": receipt_public_explicit.get("event_id") or event_id,
+                "decision_id": receipt_public_explicit.get("decision_id") or decision_id,
+                "route_plan_id": receipt_public_explicit.get("route_plan_id") or route_plan_id,
+                "policy_ref": receipt_public_explicit.get("policy_ref") or policy_ref,
+                "policyset_ref": receipt_public_explicit.get("policyset_ref") or policyset_ref,
+                "cfg_fp": receipt_public_explicit.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
+            }
 
-        receipt_public, receipt_verification = _build_receipt_surfaces(
-            raw_receipt_payload,
+        if raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload):
+            raw_receipt_payload = {
+                **raw_receipt_payload,
+                "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
+                "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
+                "event_id": raw_receipt_payload.get("event_id") or event_id,
+                "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
+                "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
+                "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
+                "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
+                "cfg_fp": raw_receipt_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
+                "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
+                "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+                "build_id": raw_receipt_payload.get("build_id") or req.build_id,
+                "image_digest": raw_receipt_payload.get("image_digest") or req.image_digest,
+                "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
+                "pq_ok": raw_receipt_payload.get("pq_ok") if raw_receipt_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+            }
+
+        if receipt_private_payload and _receipt_payload_has_material(receipt_private_payload):
+            receipt_private_payload = {
+                **receipt_private_payload,
+                "receipt_ref": receipt_private_payload.get("receipt_ref") or receipt_ref or receipt_private_payload.get("receipt"),
+                "audit_ref": receipt_private_payload.get("audit_ref") or audit_ref,
+                "event_id": receipt_private_payload.get("event_id") or event_id,
+                "decision_id": receipt_private_payload.get("decision_id") or decision_id,
+                "route_plan_id": receipt_private_payload.get("route_plan_id") or route_plan_id,
+                "policy_ref": receipt_private_payload.get("policy_ref") or policy_ref,
+                "policyset_ref": receipt_private_payload.get("policyset_ref") or policyset_ref,
+                "cfg_fp": receipt_private_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
+                "state_domain_id": receipt_private_payload.get("state_domain_id") or state_domain_id,
+                "adapter_registry_fp": receipt_private_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+                "build_id": receipt_private_payload.get("build_id") or req.build_id,
+                "image_digest": receipt_private_payload.get("image_digest") or req.image_digest,
+                "pq_required": receipt_private_payload.get("pq_required") if receipt_private_payload.get("pq_required") is not None else req.pq_required,
+                "pq_ok": receipt_private_payload.get("pq_ok") if receipt_private_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+            }
+
+        receipt_public, receipt_verification, receipt_private_payload = _receipt_surfaces_from_sources(
+            explicit_public=receipt_public_explicit,
+            explicit_verification=receipt_verification_explicit,
+            explicit_private=receipt_private_payload,
+            raw_payload=raw_receipt_payload,
             expose_verification_bundle_public=cfgb.expose_verification_bundle_public,
             expose_verify_key_public=cfgb.expose_verify_key_public,
+        )
+
+        receipt_ref = _derive_receipt_ref(
+            receipt_public=receipt_public,
+            receipt_verification=receipt_verification,
+            receipt_private=receipt_private_payload,
+            raw_receipt=raw_receipt_payload,
+            fallback=receipt_ref,
+        )
+        audit_ref = _derive_audit_ref(
+            receipt_public=receipt_public,
+            receipt_private=receipt_private_payload,
+            raw_receipt=raw_receipt_payload,
+            fallback=audit_ref,
+        )
+
+        artifacts = _normalize_artifact_refs(
+            artifacts,
+            audit_ref=audit_ref,
+            receipt_ref=receipt_ref,
+            body_digest=body_digest,
         )
 
         identity_status = "ok"
@@ -4008,10 +4418,19 @@ def create_app(
             "config_fingerprint": config_fingerprint or rt.bundle.cfg_fp,
             "bundle_version": bundle_version or rt.bundle.version,
             "state_domain_id": state_domain_id,
-            "audit_ref": audit_ref,
-            "receipt_ref": receipt_public.get("receipt_ref") or receipt_ref,
             "controller_mode": controller_mode,
             "statistical_guarantee_scope": guarantee_scope,
+            "adapter_registry_fp": budget.adapter_registry_fp,
+            "selected_source": selected_source,
+            "audit_ref": artifacts.get("audit_ref") or audit_ref,
+            "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
+            "ledger_ref": artifacts.get("ledger_ref"),
+            "attestation_ref": artifacts.get("attestation_ref"),
+            "prepare_ref": artifacts.get("prepare_ref"),
+            "commit_ref": artifacts.get("commit_ref"),
+            "outbox_ref": artifacts.get("outbox_ref"),
+            "outbox_status": artifacts.get("outbox_status"),
+            "ledger_stage": artifacts.get("ledger_stage"),
         }
 
         components: Dict[str, Any] = {
@@ -4039,9 +4458,9 @@ def create_app(
             "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
             "security": _sanitize_json_mapping(security_block, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
             "security_router": _sanitize_json_mapping(security_public, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
-            "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+            "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=32_000),
             "receipt": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
-            "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+            "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=64, max_str_len=256, max_total_bytes=24_000),
             "auth": _sanitize_json_mapping(auth_public, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
             "identity": {
                 "status": identity_status,
@@ -4170,8 +4589,15 @@ def create_app(
             state_domain_id=state_domain_id,
             controller_mode=controller_mode,
             statistical_guarantee_scope=guarantee_scope,
-            audit_ref=audit_ref,
-            receipt_ref=receipt_public.get("receipt_ref") or receipt_ref,
+            audit_ref=artifacts.get("audit_ref") or audit_ref,
+            receipt_ref=artifacts.get("receipt_ref") or receipt_ref,
+            ledger_ref=artifacts.get("ledger_ref"),
+            attestation_ref=artifacts.get("attestation_ref"),
+            prepare_ref=artifacts.get("prepare_ref"),
+            commit_ref=artifacts.get("commit_ref"),
+            outbox_ref=artifacts.get("outbox_ref"),
+            outbox_status=artifacts.get("outbox_status"),
+            ledger_stage=artifacts.get("ledger_stage"),
             trust_zone=req.trust_zone,
             route_profile=req.route_profile,
             threat_kind=req.threat_kind,
