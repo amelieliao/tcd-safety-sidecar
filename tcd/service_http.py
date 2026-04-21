@@ -2244,12 +2244,19 @@ class DetectorRegistry:
             inst = self.detectors.get(key)
             if inst is None:
                 inst = None
+
                 if callable(build_default_detector):
-                    with contextlib.suppress(Exception):
+                    try:
                         inst = build_default_detector()
+                    except Exception:
+                        _LOG.exception("build_default_detector failed")
+
                 if inst is None:
+                    _LOG.error("Falling back to _DetectorRuntimeUnavailable")
                     inst = _DetectorRuntimeUnavailable(reason="formal_detector_build_failed")
+
                 self.detectors[key] = inst
+
             return inst
 
     def get_alpha_controller(self, subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
@@ -2268,7 +2275,6 @@ class DetectorRegistry:
                 inst = MultiVarDetector(MultiVarConfig(estimator="lw", alpha=0.01))
                 self.mv_by_model[model_id] = inst
             return inst
-
 
 @dataclass(frozen=True)
 class RiskBudgetEnvelope:
