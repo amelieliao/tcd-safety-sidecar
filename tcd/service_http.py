@@ -1482,16 +1482,28 @@ class DiagnoseRequest(_Model):
 
     @model_validator(mode="after")
     def _normalize_ranges(self) -> "DiagnoseRequest":
-        if self.base_temp is None or not math.isfinite(self.base_temp):
-            self.base_temp = 0.7
-        self.base_temp = max(0.0, min(10.0, float(self.base_temp)))
-        if self.base_top_p is None or not math.isfinite(self.base_top_p):
-            self.base_top_p = 0.9
-        self.base_top_p = max(0.0, min(1.0, float(self.base_top_p)))
-        if self.base_max_tokens is not None:
-            self.base_max_tokens = max(1, min(int(self.base_max_tokens), 10_000_000))
-        if self.threat_confidence is not None:
-            self.threat_confidence = max(0.0, min(1.0, float(self.threat_confidence)))
+        base_temp = self.base_temp
+        if base_temp is None or not math.isfinite(base_temp):
+            base_temp = 0.7
+        base_temp = max(0.0, min(10.0, float(base_temp)))
+
+        base_top_p = self.base_top_p
+        if base_top_p is None or not math.isfinite(base_top_p):
+            base_top_p = 0.9
+        base_top_p = max(0.0, min(1.0, float(base_top_p)))
+
+        base_max_tokens = self.base_max_tokens
+        if base_max_tokens is not None:
+            base_max_tokens = max(1, min(int(base_max_tokens), 10_000_000))
+
+        threat_confidence = self.threat_confidence
+        if threat_confidence is not None:
+            threat_confidence = max(0.0, min(1.0, float(threat_confidence)))
+
+        object.__setattr__(self, "base_temp", base_temp)
+        object.__setattr__(self, "base_top_p", base_top_p)
+        object.__setattr__(self, "base_max_tokens", base_max_tokens)
+        object.__setattr__(self, "threat_confidence", threat_confidence)
         return self
 
 
@@ -2938,6 +2950,33 @@ def create_app(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"detail": "validation error", "errors": exc.errors(), "request_id": request_id, "config_fingerprint": rt.bundle.cfg_fp, "bundle_version": rt.bundle.version},
             headers={"X-Request-Id": request_id, "X-TCD-Http-Version": cfgb.api_version, "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp, "X-TCD-Bundle-Version": str(rt.bundle.version)},
+        )
+
+    @app.exception_handler(Exception)
+    async def _generic_exc_handler(request: Request, exc: Exception):
+        request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or uuid.uuid4().hex[:16]
+        with contextlib.suppress(Exception):
+            _LOG.error(
+                "unhandled_exception request_id=%s path=%s exc_type=%s",
+                request_id,
+                _safe_text(getattr(getattr(request, "url", None), "path", ""), max_len=128) or "unknown",
+                type(exc).__name__,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "internal server error",
+                "request_id": request_id,
+                "config_fingerprint": rt.bundle.cfg_fp,
+                "bundle_version": rt.bundle.version,
+            },
+            headers={
+                "X-Request-Id": request_id,
+                "X-TCD-Http-Version": cfgb.api_version,
+                "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                "X-TCD-Bundle-Version": str(rt.bundle.version),
+            },
         )
 
     @app.get("/metrics")
