@@ -4157,7 +4157,7 @@ def create_app(
         if pq_required_eff and (pq_ok_eff is False or pq_ok_eff is None):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="pq_violation")
 
-    @app.post("/diagnose", response_model=RiskResponse)
+        @app.post("/diagnose", response_model=RiskResponse)
     def diagnose(
         req: DiagnoseRequest,
         request: Request,
@@ -4166,6 +4166,11 @@ def create_app(
     ) -> RiskResponse:
         t_start = time.perf_counter()
         request_id, body_digest, event_id = _request_identity(request, req)
+        _LOG.error(
+            "DIAG STAGE 1 after _request_identity request_id=%s event_id=%s",
+            request_id,
+            event_id,
+        )
 
         if cfgb.strict_mode and (req.tenant == "tenant0" or req.user == "user0" or req.session == "sess0"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="subject identity required")
@@ -4192,6 +4197,10 @@ def create_app(
 
         subject = (req.tenant, req.user, req.session)
         _subject_cost, rate_decision = _apply_subject_policy_and_charge(req)
+        _LOG.error(
+            "DIAG STAGE 2 after _apply_subject_policy_and_charge request_id=%s",
+            request_id,
+        )
 
         if rt.gpu_sampler is not None:
             with contextlib.suppress(Exception):
@@ -4203,9 +4212,26 @@ def create_app(
 
         det_key = (req.model_id, req.gpu_id, req.task, req.lang)
         det = rt.detector_registry.get_detector_runtime(det_key)
+        _LOG.error(
+            "DIAG STAGE 3 before _run_detector_runtime request_id=%s",
+            request_id,
+        )
         verdict_pack = _run_detector_runtime(det, req=req, trace_vec=trace_vec, spectrum=spectrum, features=features)
+        _LOG.error(
+            "DIAG STAGE 4 after _run_detector_runtime request_id=%s",
+            request_id,
+        )
+
         if not isinstance(verdict_pack, Mapping):
-            verdict_pack = {"verdict": True, "score": 1.0, "p_value": 1e-12, "decision": "block", "action": "block", "components": {"reason": "detector_runtime_invalid"}, "step": int(req.step_id or 0)}
+            verdict_pack = {
+                "verdict": True,
+                "score": 1.0,
+                "p_value": 1e-12,
+                "decision": "block",
+                "action": "block",
+                "components": {"reason": "detector_runtime_invalid"},
+                "step": int(req.step_id or 0),
+            }
         verdict_pack = dict(verdict_pack)
         det_signal = _extract_detector_signal(verdict_pack)
 
@@ -4218,7 +4244,11 @@ def create_app(
                     mv_info = {}
 
         score = float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else 0.0)
-        p_final = float(det_signal.get("p_value") if det_signal.get("p_value") is not None else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score)))))
+        p_final = float(
+            det_signal.get("p_value")
+            if det_signal.get("p_value") is not None
+            else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score))))
+        )
         drift_w = max(0.0, min(2.0, 1.0 + 0.5 * float(req.drift_score or 0.0)))
 
         av = rt.detector_registry.get_alpha_controller(subject)
@@ -4245,6 +4275,11 @@ def create_app(
             },
         )
         budget = _alpha_budget_or_fail(av_out, tenant=req.tenant, user=req.user, session=req.session)
+        _LOG.error(
+            "DIAG STAGE 5 after _av_step_compat/_alpha_budget_or_fail request_id=%s",
+            request_id,
+        )
+
         decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
 
         e_state_block = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
@@ -4284,6 +4319,10 @@ def create_app(
                 "auth_mode": _safe_text(getattr(request.state, "auth_mode", None), max_len=64) or None,
             },
         )
+        _LOG.error(
+            "DIAG STAGE 6 after _route_decide_compat request_id=%s",
+            request_id,
+        )
 
         security_decision = _security_router_decision(
             req=req,
@@ -4296,6 +4335,11 @@ def create_app(
             verdict_pack=verdict_pack,
             av_out=av_out,
             threat_kind=req.threat_kind,
+        )
+        _LOG.error(
+            "DIAG STAGE 7 after _security_router_decision request_id=%s has_security_decision=%s",
+            request_id,
+            security_decision is not None,
         )
 
         route_info = _extract_route_dict(route)
@@ -4317,7 +4361,14 @@ def create_app(
         required_action = _route_required_action(route_info)
         enforcement_mode = _route_enforcement_mode(route_info)
         action_str = "none"
-        cause = _safe_text(det_signal.get("reason_code") or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")), max_len=128) or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
+        cause = (
+            _safe_text(
+                det_signal.get("reason_code")
+                or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")),
+                max_len=128,
+            )
+            or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
+        )
         policy_ref: Optional[str] = _safe_text(route_info.get("policy_ref"), max_len=128) or None
         policyset_ref: Optional[str] = _safe_text(route_info.get("policyset_ref"), max_len=128) or None
         config_fingerprint: Optional[str] = _safe_text(route_info.get("config_fingerprint"), max_len=128) or None
@@ -4386,9 +4437,27 @@ def create_app(
                 fallback=receipt_ref,
             )
 
-            security_block = _sanitize_json_mapping(getattr(security_decision, "security", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000)
-            evidence_identity = _sanitize_json_mapping(getattr(security_decision, "evidence_identity", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
-            artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=64, max_str_len=512, max_total_bytes=32_000)
+            security_block = _sanitize_json_mapping(
+                getattr(security_decision, "security", {}),
+                max_depth=5,
+                max_items=64,
+                max_str_len=512,
+                max_total_bytes=64_000,
+            )
+            evidence_identity = _sanitize_json_mapping(
+                getattr(security_decision, "evidence_identity", {}),
+                max_depth=4,
+                max_items=32,
+                max_str_len=256,
+                max_total_bytes=16_000,
+            )
+            artifacts = _sanitize_json_mapping(
+                getattr(security_decision, "artifacts", {}),
+                max_depth=4,
+                max_items=64,
+                max_str_len=512,
+                max_total_bytes=32_000,
+            )
         else:
             required_action = required_action if required_action in {"allow", "degrade", "block"} else (
                 "block" if (cfgb.strict_mode and req.risk_label == "critical" and decision_fail) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
@@ -4438,7 +4507,11 @@ def create_app(
                 "surface_kind": "local_http_fallback",
             }
             artifacts = {
-                "receipt_required": bool(cfgb.receipts_enable_default or (cfgb.require_receipts_on_fail and required_action == "block") or (cfgb.require_receipts_when_pq and bool(req.pq_required))),
+                "receipt_required": bool(
+                    cfgb.receipts_enable_default
+                    or (cfgb.require_receipts_on_fail and required_action == "block")
+                    or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+                ),
                 "ledger_required": False,
                 "attestation_required": bool(cfgb.require_attestor_when_receipt_required),
                 "ledger_stage": "skipped",
@@ -4485,6 +4558,12 @@ def create_app(
 
         if not receipt_surface_available:
             need_local_receipt = bool(receipt_required and rt.receipt_mgr.attestor is not None)
+            _LOG.error(
+                "DIAG STAGE 8 before issue_local_final request_id=%s receipt_required=%s need_local_receipt=%s",
+                request_id,
+                receipt_required,
+                need_local_receipt,
+            )
             if need_local_receipt:
                 rb = rt.receipt_mgr.issue_local_final(
                     trace=trace_vec,
@@ -4512,12 +4591,23 @@ def create_app(
                     state_domain_id=state_domain_id,
                     adapter_registry_fp=budget.adapter_registry_fp,
                     budget=budget,
-                    detector_components=dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {},
+                    detector_components=dict(verdict_pack.get("components", {}))
+                    if isinstance(verdict_pack.get("components"), Mapping)
+                    else {},
                     mv_info=mv_info,
                     security_block=security_block,
                     artifacts=artifacts,
                     evidence_identity=evidence_identity,
-                    pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
+                    pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False)
+                    if route_info.get("pq_ok") is not None
+                    else None,
+                )
+                _LOG.error(
+                    "DIAG STAGE 9 after issue_local_final request_id=%s raw_nonempty=%s public_nonempty=%s verification_present=%s",
+                    request_id,
+                    bool(rb.raw),
+                    bool(rb.public),
+                    rb.verification is not None,
                 )
                 raw_receipt_payload = dict(rb.raw or {})
                 receipt_public_explicit = dict(rb.public or {})
@@ -4585,7 +4675,9 @@ def create_app(
                 "build_id": raw_receipt_payload.get("build_id") or req.build_id,
                 "image_digest": raw_receipt_payload.get("image_digest") or req.image_digest,
                 "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
-                "pq_ok": raw_receipt_payload.get("pq_ok") if raw_receipt_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+                "pq_ok": raw_receipt_payload.get("pq_ok")
+                if raw_receipt_payload.get("pq_ok") is not None
+                else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
             }
 
         if receipt_private_payload and _receipt_payload_has_material(receipt_private_payload):
@@ -4604,7 +4696,9 @@ def create_app(
                 "build_id": receipt_private_payload.get("build_id") or req.build_id,
                 "image_digest": receipt_private_payload.get("image_digest") or req.image_digest,
                 "pq_required": receipt_private_payload.get("pq_required") if receipt_private_payload.get("pq_required") is not None else req.pq_required,
-                "pq_ok": receipt_private_payload.get("pq_ok") if receipt_private_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+                "pq_ok": receipt_private_payload.get("pq_ok")
+                if receipt_private_payload.get("pq_ok") is not None
+                else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
             }
 
         receipt_public, receipt_verification, receipt_private_payload = _receipt_surfaces_from_sources(
@@ -4808,6 +4902,14 @@ def create_app(
         legacy_body = receipt_verification.get("body") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
         legacy_sig = receipt_verification.get("sig") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
         legacy_vk = receipt_verification.get("verify_key") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+
+        _LOG.error(
+            "DIAG STAGE 10 before RiskResponse request_id=%s decision=%s required_action=%s allowed=%s",
+            request_id,
+            decision_label,
+            required_action,
+            allowed,
+        )
 
         return RiskResponse(
             verdict=final_verdict,
