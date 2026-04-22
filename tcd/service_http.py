@@ -3860,6 +3860,79 @@ def create_app(
             return "degrade"
         return "none"
 
+    def _normalize_terminal_required_action(value: Any, *, default: str = "allow") -> str:
+        s = _safe_text(value, max_len=32).lower()
+        if s in {"deny", "reject"}:
+            return "block"
+        if s in {"throttle", "advisory"}:
+            return "degrade"
+        if s in {"allow", "degrade", "block"}:
+            return s
+        return default if default in {"allow", "degrade", "block"} else "allow"
+
+    def _normalize_terminal_action(value: Any, *, default: str = "none") -> str:
+        s = _safe_text(value, max_len=32).lower()
+        if s in {"deny", "reject"}:
+            return "block"
+        if s in {"throttle", "advisory"}:
+            return "degrade"
+        if s in {"allow", "degrade", "block", "none"}:
+            return s
+        return default if default in {"allow", "degrade", "block", "none"} else "none"
+
+    def _normalize_terminal_enforcement_mode(value: Any, *, decision: str) -> str:
+        s = _safe_text(value, max_len=32).lower()
+        if s not in {"advisory", "must_enforce", "fail_closed"}:
+            s = ""
+        if decision == "block":
+            return s or ("fail_closed" if cfgb.strict_mode else "must_enforce")
+        if decision == "degrade":
+            return s or ("must_enforce" if cfgb.strict_mode else "advisory")
+        return "advisory" if s == "fail_closed" else (s or "advisory")
+
+    def _resolve_terminal_contract(
+        *,
+        required_action: Any,
+        action: Any,
+        allowed: Optional[bool],
+        enforcement_mode: Any,
+    ) -> Dict[str, Any]:
+        req = _normalize_terminal_required_action(required_action, default="allow")
+        act = _normalize_terminal_action(action, default="none")
+        allowed_bool = None if allowed is None else bool(_coerce_bool(allowed, default=False))
+
+        if req == "block" or act == "block" or allowed_bool is False:
+            decision = "block"
+            final_allowed = False
+            final_action = "block"
+            final_required_action = "block"
+        elif req == "degrade" or act == "degrade":
+            decision = "degrade"
+            final_allowed = True
+            final_action = "degrade"
+            final_required_action = "degrade"
+        else:
+            decision = "allow"
+            final_allowed = True
+            final_action = "none"
+            final_required_action = "allow"
+
+        return {
+            "decision": decision,
+            "required_action": final_required_action,
+            "action": final_action,
+            "allowed": final_allowed,
+            "verdict": bool(decision != "allow"),
+            "enforcement_mode": _normalize_terminal_enforcement_mode(enforcement_mode, decision=decision),
+        }
+
+    def _receipt_required_for_request(req: DiagnoseRequest, *, decision: str) -> bool:
+        return bool(
+            cfgb.receipts_enable_default
+            or (cfgb.require_receipts_on_fail and decision == "block")
+            or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+        )
+
     def _build_synthetic_route_contract(
         *,
         req: DiagnoseRequest,
@@ -3880,17 +3953,19 @@ def create_app(
                 or (threat_kind in {"apt", "supply_chain"} and (_coerce_float(req.threat_confidence) or 0.0) >= 0.9)
             )
         ) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
+        local_reason = "local_route_fallback"
+        local_reason_code = "LOCAL_ROUTE_FALLBACK"
         return {
-            "schema": "tcd.route.synthetic.v1",
-            "router": "tcd.service_http",
+            "schema": "tcd.route.local.v1",
+            "router": "tcd.service_http.local",
             "version": "1.0.0",
             "config_fingerprint": rt.bundle.cfg_fp,
             "bundle_version": rt.bundle.version,
-            "router_mode": "degraded",
+            "router_mode": "local_fallback",
             "route_id_kind": "plan",
-            "route_plan_id": "rp1:sha256:" + _hash_hex(ctx="tcd:http:route_plan", payload={"event_id": event_id, "reason": "route_unavailable"}, out_hex=32),
+            "route_plan_id": "rp1:sha256:" + _hash_hex(ctx="tcd:http:route_plan", payload={"event_id": event_id, "reason": local_reason}, out_hex=32),
             "route_id": None,
-            "decision_id": "rd1:sha256:" + _hash_hex(ctx="tcd:http:route_decision", payload={"event_id": event_id, "reason": "route_unavailable"}, out_hex=32),
+            "decision_id": "rd1:sha256:" + _hash_hex(ctx="tcd:http:route_decision", payload={"event_id": event_id, "reason": local_reason}, out_hex=32),
             "decision_ts_unix_ns": time.time_ns(),
             "decision_ts_mono_ns": time.monotonic_ns(),
             "safety_tier": "strict" if required_action == "block" else ("elevated" if required_action == "degrade" else "normal"),
@@ -3915,10 +3990,11 @@ def create_app(
             "guarantee_scope": guarantee_scope,
             "signal_digest": "sg1:sha256:" + _hash_hex(ctx="tcd:http:signal", payload={"score": score, "decision_fail": decision_fail, "e_triggered": av_trigger, "threat_kind": threat_kind}, out_hex=32),
             "context_digest": "cx1:sha256:" + _hash_hex(ctx="tcd:http:context", payload={"trust_zone": req.trust_zone, "route_profile": req.route_profile, "request_id": request_id}, out_hex=32),
-            "primary_reason_code": "ROUTE_UNAVAILABLE",
-            "reason_codes": ["ROUTE_UNAVAILABLE"],
-            "degraded_reason_codes": ["ROUTE_UNAVAILABLE"],
-            "reason": "route_unavailable",
+            "primary_reason_code": local_reason_code,
+            "reason_codes": [local_reason_code],
+            "degraded_reason_codes": ([local_reason_code] if required_action != "allow" else []),
+            "reason": local_reason,
+            "decision_source": "service_http_local",
         }
 
     def _build_detector_payload(
@@ -4386,6 +4462,20 @@ def create_app(
                 "produced_by": "service_http.local",
             }
 
+        terminal_contract = _resolve_terminal_contract(
+            required_action=required_action,
+            action=action_str,
+            allowed=allowed,
+            enforcement_mode=enforcement_mode,
+        )
+        required_action = terminal_contract["required_action"]
+        action_str = terminal_contract["action"]
+        allowed = terminal_contract["allowed"]
+        enforcement_mode = terminal_contract["enforcement_mode"]
+        final_verdict = bool(terminal_contract["verdict"])
+        decision_label = str(terminal_contract["decision"])
+        receipt_required = _receipt_required_for_request(req, decision=decision_label)
+
         receipt_surface_available = bool(
             receipt_public_explicit
             or receipt_verification_explicit is not None
@@ -4393,24 +4483,8 @@ def create_app(
             or (raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload))
         )
 
-        if cfgb.strict_mode and cfgb.require_finalized_receipt_surface_when_strict:
-            receipt_needed_strict = bool(
-                cfgb.receipts_enable_default
-                or (cfgb.require_receipts_on_fail and required_action == "block")
-                or (cfgb.require_receipts_when_pq and bool(req.pq_required))
-            )
-            if receipt_needed_strict and rt.security_router is None and not receipt_surface_available:
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
-
         if not receipt_surface_available:
-            need_local_receipt = (
-                rt.receipt_mgr.attestor is not None
-                and (
-                    cfgb.receipts_enable_default
-                    or (cfgb.require_receipts_on_fail and required_action == "block")
-                    or (cfgb.require_receipts_when_pq and bool(req.pq_required))
-                )
-            )
+            need_local_receipt = bool(receipt_required and rt.receipt_mgr.attestor is not None)
             if need_local_receipt:
                 rb = rt.receipt_mgr.issue_local_final(
                     trace=trace_vec,
@@ -4474,12 +4548,8 @@ def create_app(
             or (raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload))
         )
 
-        if cfgb.strict_mode and cfgb.require_attestor_when_receipt_required and (
-            (cfgb.require_receipts_on_fail and required_action == "block")
-            or (cfgb.require_receipts_when_pq and bool(req.pq_required))
-        ):
-            if not receipt_surface_available:
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="receipt unavailable")
+        if receipt_required and not receipt_surface_available:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
 
         decision_id = decision_id or f"hd1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:decision', payload={'event_id': event_id, 'request_id': request_id, 'required_action': required_action, 'route_plan_id': route_plan_id, 'subject': [req.tenant, req.user, req.session]}, out_hex=32)}"
         route_plan_id = route_plan_id or f"hr1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:route_plan', payload={'risk_label': req.risk_label, 'trust_zone': req.trust_zone, 'route_profile': req.route_profile, 'score': _stable_float(score), 'required_action': required_action}, out_hex=32)}"
@@ -4623,6 +4693,21 @@ def create_app(
                 max_str_len=512,
                 max_total_bytes=64_000,
             ),
+            "terminal": _sanitize_json_mapping(
+                {
+                    "decision": decision_label,
+                    "required_action": required_action,
+                    "action": action_str,
+                    "allowed": allowed,
+                    "verdict": final_verdict,
+                    "enforcement_mode": enforcement_mode,
+                    "source": "service_http_terminal_contract",
+                },
+                max_depth=4,
+                max_items=16,
+                max_str_len=128,
+                max_total_bytes=8_000,
+            ),
             "multivariate": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
             "e_process": _sanitize_json_mapping(av_out.get("e_state", {}), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=96_000),
             "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
@@ -4697,7 +4782,7 @@ def create_app(
             with contextlib.suppress(Exception):
                 log_decision(
                     rt.logger,
-                    verdict=bool(required_action != "allow"),
+                    verdict=final_verdict,
                     score=score,
                     e_value=budget.e_value,
                     alpha_alloc=budget.alpha_alloc,
@@ -4719,15 +4804,13 @@ def create_app(
         response.headers["X-TCD-Decision-Id"] = decision_id
         response.headers["X-TCD-Route-Plan-Id"] = route_plan_id
 
-        decision_label = "block" if action_str == "block" else ("degrade" if action_str in {"degrade", "advisory"} or required_action == "degrade" else "allow")
-
         legacy_receipt = receipt_public.get("head") if cfgb.expose_legacy_receipt_aliases else None
         legacy_body = receipt_verification.get("body") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
         legacy_sig = receipt_verification.get("sig") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
         legacy_vk = receipt_verification.get("verify_key") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
 
         return RiskResponse(
-            verdict=bool(required_action != "allow"),
+            verdict=final_verdict,
             allowed=bool(allowed),
             decision=decision_label,
             required_action=required_action,
@@ -4900,4 +4983,5 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=8000,
         reload=True,
+
     )
