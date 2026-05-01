@@ -1,0 +1,128 @@
+{
+    "checks": {
+        "duplicate_put_ignored": true,
+        "flush_committed": true,
+        "flush_verified": true,
+        "ledger_restored": true,
+        "ledger_unavailable_forced": true,
+        "no_duplicate_outbox_rows": true,
+        "outbox_empty_after_flush": true,
+        "outbox_put_completed": true,
+        "outbox_put_status_queued": true,
+        "outbox_status_flushed_or_committed": true,
+        "outbox_status_queued": true,
+        "payload_digest_stable": true,
+        "receipt_ref_present": true,
+        "receipt_verified_after_flush": true,
+        "receipt_verified_at_issue": true,
+        "same_receipt_ref": true
+    },
+    "dedupe_key": "ledger:idem-outbox-failure-retry",
+    "event_id": "evt:0a9a5bbe3104d461996c4b8d18cc086a",
+    "failed_checks": [],
+    "flush_result": {
+        "committed": 1,
+        "errors": [],
+        "flushed": 1,
+        "ledger_heads": [
+            "3ae52321031c83ffa111af175e11b6f48bd27379f110d6fc300f463f3b50bd97"
+        ],
+        "receipt_refs": [
+            "9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2"
+        ],
+        "remaining_rows": 0,
+        "verified": 1
+    },
+    "idempotency_key": "idem-outbox-failure-retry",
+    "ledger_rows_after_flush": [
+        {
+            "action": "reload_config",
+            "created_ts": 1777598514.749036,
+            "delivery_attempts": 1,
+            "event_id": "evt:0a9a5bbe3104d461996c4b8d18cc086a",
+            "idempotency_key": "idem-outbox-failure-retry",
+            "ledger_head": "3ae52321031c83ffa111af175e11b6f48bd27379f110d6fc300f463f3b50bd97",
+            "ledger_stage": "committed",
+            "outbox_dedupe_key": "ledger:idem-outbox-failure-retry",
+            "outbox_status": "flushed",
+            "receipt_pack": {
+                "audit_ref": null,
+                "comp_obj": {
+                    "action": "reload_config",
+                    "ok": true,
+                    "test": "outbox_failure_retry"
+                },
+                "e_obj": {
+                    "alpha_alloc": 0.0,
+                    "alpha_spent": 0.0,
+                    "e_value": 1.0
+                },
+                "receipt": "9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2",
+                "receipt_body": "{\"attestor\":{\"build_digest\":null,\"deployment_tier\":null,\"digest_size\":32,\"engine_version\":\"attest_v2\",\"hash_alg\":\"sha256\",\"hash_ctx\":\"tcd:attest\",\"hw_root_id\":null,\"id\":\"tcd-attestor\",\"policy_digest\":\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\",\"proc_id\":null,\"runtime_env_digest\":null,\"strict\":false,\"tpm_quote_digest\":null},\"claims\":{\"action\":\"reload_config\",\"adapter_registry_fp\":null,\"allowed\":null,\"attestation_id\":null,\"attestation_ref\":null,\"audit_ref\":null,\"build_id\":null,\"cfg_fp\":null,\"chain_id\":null,\"chain_namespace\":null,\"chain_seq\":null,\"commit_ref\":null,\"config_hash\":\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\",\"decision_id\":null,\"delivery_attempts\":null,\"env_fingerprint\":null,\"event_digest\":null,\"event_id\":\"evt:0a9a5bbe3104d461996c4b8d18cc086a\",\"event_type\":\"attestation\",\"evidence_durable\":false,\"evidence_storage_ready\":false,\"image_digest\":null,\"ledger_ref\":null,\"ledger_stage\":\"skipped\",\"ledger_stage_defaulted\":true,\"outbox_dedupe_key\":null,\"outbox_ref\":null,\"outbox_status\":\"none\",\"payload_digest\":null,\"policy_digest\":\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\",\"policy_ref\":null,\"policyset_ref\":null,\"pq_ok\":null,\"pq_required\":null,\"pq_signature_ok\":null,\"pq_signature_required\":null,\"prepare_ref\":null,\"prev_head_hex\":null,\"produced_by\":[\"tcd.attest\",\"tcd-attestor\"],\"reason\":null,\"receipt_delivery_state\":\"issued_only\",\"receipt_kind\":\"attestation\",\"receipt_ref\":null,\"receipt_surface_kind\":\"ephemeral_attestation\",\"route_id\":null,\"route_plan_id\":null,\"selected_source\":null,\"state_domain_id\":null,\"statistical_guarantee_scope\":null,\"stream_hash\":null,\"trigger\":null},\"comp\":{\"action\":\"reload_config\",\"ok\":true,\"test\":\"outbox_failure_retry\"},\"e\":{\"alpha_alloc\":{\"_tcd_float\":\"0\"},\"alpha_spent\":{\"_tcd_float\":\"0\"},\"e_value\":{\"_tcd_float\":\"1\"}},\"meta\":{\"event_id\":\"evt:0a9a5bbe3104d461996c4b8d18cc086a\",\"request_id\":\"outbox-failure-retry\",\"test\":\"outbox_failure_retry\"},\"nonce\":\"43f7d9f02a1fe3c229bec686eac6fab4\",\"req\":{\"event_id\":\"evt:0a9a5bbe3104d461996c4b8d18cc086a\",\"request_id\":\"outbox-failure-retry\",\"session\":\"[REDACTED]\",\"tenant\":\"tenant-a\",\"user\":\"user-a\"},\"schema\":\"tcd.attest.body.v2\",\"ts_ns\":1777598514733169000,\"v\":2,\"witness\":{\"digest\":\"f8eb0e576c6dde80964b47696413cf5f9c4c8851c08b9dc570f0ace6ccfa661b\",\"segments\":[{\"digest\":\"79d3e7df62f16ed517038309afe1cf1f980449ed913f1c24fb9d547a9578353c\",\"id\":\"witness:trace\",\"kind\":\"external\",\"meta\":{\"count\":3,\"format\":\"legacy_index_array_v1\",\"label\":\"trace\"}},{\"digest\":\"f0462a706440b3e8cad03547c04ca29b16af704a36bc14312c7bdc485236788f\",\"id\":\"witness:spectrum\",\"kind\":\"external\",\"meta\":{\"count\":3,\"format\":\"legacy_index_array_v1\",\"label\":\"spectrum\"}},{\"digest\":\"bdc1f56f10e9ea400a054f162809da90d7e76f454a5446e2a74aca7ca61cd9c3\",\"id\":\"witness:features\",\"kind\":\"external\",\"meta\":{\"count\":3,\"format\":\"legacy_index_array_v1\",\"label\":\"features\"}}],\"tags\":[\"comp\",\"e\",\"req\"]}}",
+                "receipt_ref": "9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2",
+                "receipt_sig": "e8f59b7720cdb8be0b799813f9c2375c5ac5e2ebecdc00a986a4056e707e064f",
+                "receipt_verified": true,
+                "req_obj": {
+                    "event_id": "evt:0a9a5bbe3104d461996c4b8d18cc086a",
+                    "request_id": "outbox-failure-retry",
+                    "session": "sess-a",
+                    "tenant": "tenant-a",
+                    "user": "user-a"
+                },
+                "verify_key": "tcd-attestor:hash-only",
+                "witness_segments": [
+                    [
+                        1,
+                        2,
+                        3
+                    ],
+                    [
+                        4,
+                        5,
+                        6
+                    ],
+                    [
+                        7,
+                        8,
+                        9
+                    ]
+                ]
+            },
+            "receipt_ref": "9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2",
+            "request_id": "outbox-failure-retry",
+            "schema": "tcd.test.outbox_failure_retry.v1",
+            "tenant": "tenant-a",
+            "user": "user-a"
+        }
+    ],
+    "ok": true,
+    "outbox_path": "/var/folders/c8/wnjg2tts1xvbfg4r7w_n8twr0000gn/T/tcd-outbox-failure-retry-bco6ec_f/outbox.sqlite3",
+    "outbox_rows_after_flush": [],
+    "outbox_rows_after_queue": [
+        {
+            "attempts": 0,
+            "dedupe_key": "ledger:idem-outbox-failure-retry",
+            "id": 1,
+            "kind": "ledger",
+            "payload_digest": "bd16a5436280e115947a09e9b41be81e7ec2bd22848dc97d59430c1c86b9c497",
+            "payload_json": "{\"action\":\"reload_config\",\"created_ts\":1777598514.749036,\"delivery_attempts\":0,\"event_id\":\"evt:0a9a5bbe3104d461996c4b8d18cc086a\",\"idempotency_key\":\"idem-outbox-failure-retry\",\"ledger_stage\":\"outboxed\",\"outbox_dedupe_key\":\"ledger:idem-outbox-failure-retry\",\"outbox_status\":\"queued\",\"receipt_pack\":{\"audit_ref\":null,\"comp_obj\":{\"action\":\"reload_config\",\"ok\":true,\"test\":\"outbox_failure_retry\"},\"e_obj\":{\"alpha_alloc\":0.0,\"alpha_spent\":0.0,\"e_value\":1.0},\"receipt\":\"9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2\",\"receipt_body\":\"{\\\"attestor\\\":{\\\"build_digest\\\":null,\\\"deployment_tier\\\":null,\\\"digest_size\\\":32,\\\"engine_version\\\":\\\"attest_v2\\\",\\\"hash_alg\\\":\\\"sha256\\\",\\\"hash_ctx\\\":\\\"tcd:attest\\\",\\\"hw_root_id\\\":null,\\\"id\\\":\\\"tcd-attestor\\\",\\\"policy_digest\\\":\\\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\\\",\\\"proc_id\\\":null,\\\"runtime_env_digest\\\":null,\\\"strict\\\":false,\\\"tpm_quote_digest\\\":null},\\\"claims\\\":{\\\"action\\\":\\\"reload_config\\\",\\\"adapter_registry_fp\\\":null,\\\"allowed\\\":null,\\\"attestation_id\\\":null,\\\"attestation_ref\\\":null,\\\"audit_ref\\\":null,\\\"build_id\\\":null,\\\"cfg_fp\\\":null,\\\"chain_id\\\":null,\\\"chain_namespace\\\":null,\\\"chain_seq\\\":null,\\\"commit_ref\\\":null,\\\"config_hash\\\":\\\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\\\",\\\"decision_id\\\":null,\\\"delivery_attempts\\\":null,\\\"env_fingerprint\\\":null,\\\"event_digest\\\":null,\\\"event_id\\\":\\\"evt:0a9a5bbe3104d461996c4b8d18cc086a\\\",\\\"event_type\\\":\\\"attestation\\\",\\\"evidence_durable\\\":false,\\\"evidence_storage_ready\\\":false,\\\"image_digest\\\":null,\\\"ledger_ref\\\":null,\\\"ledger_stage\\\":\\\"skipped\\\",\\\"ledger_stage_defaulted\\\":true,\\\"outbox_dedupe_key\\\":null,\\\"outbox_ref\\\":null,\\\"outbox_status\\\":\\\"none\\\",\\\"payload_digest\\\":null,\\\"policy_digest\\\":\\\"38dfe40497aa77e026a6aea37b876bb18949871ba20849186db45f776ce59925\\\",\\\"policy_ref\\\":null,\\\"policyset_ref\\\":null,\\\"pq_ok\\\":null,\\\"pq_required\\\":null,\\\"pq_signature_ok\\\":null,\\\"pq_signature_required\\\":null,\\\"prepare_ref\\\":null,\\\"prev_head_hex\\\":null,\\\"produced_by\\\":[\\\"tcd.attest\\\",\\\"tcd-attestor\\\"],\\\"reason\\\":null,\\\"receipt_delivery_state\\\":\\\"issued_only\\\",\\\"receipt_kind\\\":\\\"attestation\\\",\\\"receipt_ref\\\":null,\\\"receipt_surface_kind\\\":\\\"ephemeral_attestation\\\",\\\"route_id\\\":null,\\\"route_plan_id\\\":null,\\\"selected_source\\\":null,\\\"state_domain_id\\\":null,\\\"statistical_guarantee_scope\\\":null,\\\"stream_hash\\\":null,\\\"trigger\\\":null},\\\"comp\\\":{\\\"action\\\":\\\"reload_config\\\",\\\"ok\\\":true,\\\"test\\\":\\\"outbox_failure_retry\\\"},\\\"e\\\":{\\\"alpha_alloc\\\":{\\\"_tcd_float\\\":\\\"0\\\"},\\\"alpha_spent\\\":{\\\"_tcd_float\\\":\\\"0\\\"},\\\"e_value\\\":{\\\"_tcd_float\\\":\\\"1\\\"}},\\\"meta\\\":{\\\"event_id\\\":\\\"evt:0a9a5bbe3104d461996c4b8d18cc086a\\\",\\\"request_id\\\":\\\"outbox-failure-retry\\\",\\\"test\\\":\\\"outbox_failure_retry\\\"},\\\"nonce\\\":\\\"43f7d9f02a1fe3c229bec686eac6fab4\\\",\\\"req\\\":{\\\"event_id\\\":\\\"evt:0a9a5bbe3104d461996c4b8d18cc086a\\\",\\\"request_id\\\":\\\"outbox-failure-retry\\\",\\\"session\\\":\\\"[REDACTED]\\\",\\\"tenant\\\":\\\"tenant-a\\\",\\\"user\\\":\\\"user-a\\\"},\\\"schema\\\":\\\"tcd.attest.body.v2\\\",\\\"ts_ns\\\":1777598514733169000,\\\"v\\\":2,\\\"witness\\\":{\\\"digest\\\":\\\"f8eb0e576c6dde80964b47696413cf5f9c4c8851c08b9dc570f0ace6ccfa661b\\\",\\\"segments\\\":[{\\\"digest\\\":\\\"79d3e7df62f16ed517038309afe1cf1f980449ed913f1c24fb9d547a9578353c\\\",\\\"id\\\":\\\"witness:trace\\\",\\\"kind\\\":\\\"external\\\",\\\"meta\\\":{\\\"count\\\":3,\\\"format\\\":\\\"legacy_index_array_v1\\\",\\\"label\\\":\\\"trace\\\"}},{\\\"digest\\\":\\\"f0462a706440b3e8cad03547c04ca29b16af704a36bc14312c7bdc485236788f\\\",\\\"id\\\":\\\"witness:spectrum\\\",\\\"kind\\\":\\\"external\\\",\\\"meta\\\":{\\\"count\\\":3,\\\"format\\\":\\\"legacy_index_array_v1\\\",\\\"label\\\":\\\"spectrum\\\"}},{\\\"digest\\\":\\\"bdc1f56f10e9ea400a054f162809da90d7e76f454a5446e2a74aca7ca61cd9c3\\\",\\\"id\\\":\\\"witness:features\\\",\\\"kind\\\":\\\"external\\\",\\\"meta\\\":{\\\"count\\\":3,\\\"format\\\":\\\"legacy_index_array_v1\\\",\\\"label\\\":\\\"features\\\"}}],\\\"tags\\\":[\\\"comp\\\",\\\"e\\\",\\\"req\\\"]}}\",\"receipt_ref\":\"9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2\",\"receipt_sig\":\"e8f59b7720cdb8be0b799813f9c2375c5ac5e2ebecdc00a986a4056e707e064f\",\"receipt_verified\":true,\"req_obj\":{\"event_id\":\"evt:0a9a5bbe3104d461996c4b8d18cc086a\",\"request_id\":\"outbox-failure-retry\",\"session\":\"sess-a\",\"tenant\":\"tenant-a\",\"user\":\"user-a\"},\"verify_key\":\"tcd-attestor:hash-only\",\"witness_segments\":[[1,2,3],[4,5,6],[7,8,9]]},\"receipt_ref\":\"9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2\",\"request_id\":\"outbox-failure-retry\",\"schema\":\"tcd.test.outbox_failure_retry.v1\",\"tenant\":\"tenant-a\",\"user\":\"user-a\"}"
+        }
+    ],
+    "put_result_1": {
+        "error": null,
+        "ok": true,
+        "returncode": 0,
+        "status": "queued"
+    },
+    "put_result_2": {
+        "error": null,
+        "ok": true,
+        "returncode": 0,
+        "status": "ignored"
+    },
+    "receipt_ref": "9aa16d93397a6e573a39e8465c3e105ddcc82de4a5b9fe9939f63964b3c4adc2",
+    "receipt_verified_after_flush": true,
+    "receipt_verified_at_issue": true,
+    "request_id": "outbox-failure-retry",
+    "root": "/var/folders/c8/wnjg2tts1xvbfg4r7w_n8twr0000gn/T/tcd-outbox-failure-retry-bco6ec_f"
+}
