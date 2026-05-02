@@ -122,6 +122,20 @@ from .utils import (  # noqa: E402
     blake2s_hex,
 )
 
+# Optional attestation receipt verifier.
+# This lets ledger strict mode validate Attestor.issue() heads without confusing
+# them with ledger storage-chain heads.
+try:  # pragma: no cover
+    from .attest import verify_attestation_record_ex as _attest_verify_record_ex  # type: ignore
+except Exception:  # pragma: no cover
+    _attest_verify_record_ex = None  # type: ignore[assignment]
+
+try:  # pragma: no cover
+    from .attest import _compute_head_from_body as _attest_compute_head_from_body  # type: ignore
+except Exception:  # pragma: no cover
+    _attest_compute_head_from_body = None  # type: ignore[assignment]
+
+
 # ---------------------------------------------------------------------------
 # Config snapshot
 # ---------------------------------------------------------------------------
@@ -377,6 +391,14 @@ class LedgerConfig:
     # verbosity (avoid leaking identifiers into errors by default)
     verbose_errors: bool
 
+    # Receipt head semantics:
+    # - auto: detect Attestor.issue() body and verify with attest.py semantics.
+    # - attestation_v2: force attest.py receipt head verification.
+    # - storage_chain_v1: legacy ledger chain-head verification.
+    receipt_head_semantics: Literal["auto", "attestation_v2", "storage_chain_v1"] = "auto"
+    allow_attestation_receipt_head: bool = True
+    validate_attestation_body_lenient: bool = True
+
     @staticmethod
     def from_env() -> "LedgerConfig":
         prof_raw = _env_str("TCD_LEDGER_PROFILE", "internal").lower()
@@ -475,7 +497,7 @@ class LedgerConfig:
         strict_chain_id_taglike = _env_bool("TCD_LEDGER_STRICT_CHAIN_ID_TAGLIKE", strict_chain_id_default)
 
         max_receipt_body_bytes = _env_int(
-            "TCD_LEDGER_MAX_RECEIPT_BODY_BYTES", 16_384, min_v=1024, max_v=1_000_000
+            "TCD_LEDGER_MAX_RECEIPT_BODY_BYTES", 512_000, min_v=1024, max_v=1_000_000
         )
         max_receipt_head_len = _env_int("TCD_LEDGER_MAX_RECEIPT_HEAD_LEN", 256, min_v=32, max_v=4096)
         max_receipt_sig_len = _env_int("TCD_LEDGER_MAX_RECEIPT_SIG_LEN", 4096, min_v=0, max_v=1_000_000)
@@ -487,6 +509,11 @@ class LedgerConfig:
             "TCD_LEDGER_RECEIPT_JSON_TAGLIKE_STRINGS_EXTERNAL", receipt_json_taglike_strings_external_default
         )
         verify_receipt_head = _env_bool("TCD_LEDGER_VERIFY_RECEIPT_HEAD", verify_receipt_head_default)
+        receipt_head_semantics = _env_str("TCD_LEDGER_RECEIPT_HEAD_SEMANTICS", "auto").strip().lower()
+        if receipt_head_semantics not in {"auto", "attestation_v2", "storage_chain_v1"}:
+            receipt_head_semantics = "auto"
+        allow_attestation_receipt_head = _env_bool("TCD_LEDGER_ALLOW_ATTESTATION_RECEIPT_HEAD", True)
+        validate_attestation_body_lenient = _env_bool("TCD_LEDGER_VALIDATE_ATTESTATION_BODY_LENIENT", True)
         fail_closed_on_receipt_integrity_external = _env_bool(
             "TCD_LEDGER_FAIL_CLOSED_RECEIPT_INTEGRITY_EXTERNAL", fail_closed_receipts_default
         )
@@ -498,10 +525,10 @@ class LedgerConfig:
             "TCD_LEDGER_ENFORCE_MONOTONIC_RECEIPT_TS", enforce_monotonic_ts_default
         )
 
-        max_receipt_json_depth = _env_int("TCD_LEDGER_MAX_RECEIPT_JSON_DEPTH", 8, min_v=4, max_v=64)
+        max_receipt_json_depth = _env_int("TCD_LEDGER_MAX_RECEIPT_JSON_DEPTH", 64, min_v=4, max_v=64)
         max_receipt_json_nodes = _env_int("TCD_LEDGER_MAX_RECEIPT_JSON_NODES", 4096, min_v=256, max_v=1_000_000)
         max_receipt_json_string_bytes = _env_int(
-            "TCD_LEDGER_MAX_RECEIPT_JSON_STRING_BYTES", 256 if profile == "external" else 1024, min_v=32, max_v=1_000_000
+            "TCD_LEDGER_MAX_RECEIPT_JSON_STRING_BYTES", 4096 if profile == "external" else 4096, min_v=32, max_v=1_000_000
         )
         max_receipt_json_int_bits = _env_int("TCD_LEDGER_MAX_RECEIPT_JSON_INT_BITS", 256, min_v=64, max_v=4096)
 
@@ -591,6 +618,9 @@ class LedgerConfig:
             sqlite_wal_autocheckpoint=sqlite_wal_autocheckpoint,
             sqlite_journal_size_limit=sqlite_journal_size_limit,
             verbose_errors=verbose_errors,
+            receipt_head_semantics=receipt_head_semantics,  # type: ignore[arg-type]
+            allow_attestation_receipt_head=allow_attestation_receipt_head,
+            validate_attestation_body_lenient=validate_attestation_body_lenient,
         )
 
 
@@ -1273,6 +1303,179 @@ def _compute_receipt_head(chain_id: str, prev: Optional[str], body_canon: str, s
     return h.hexdigest()
 
 
+
+# ---------------------------------------------------------------------------
+# Attestation receipt compatibility
+# ---------------------------------------------------------------------------
+
+_ATTESTATION_BODY_SCHEMAS = frozenset({"tcd.attest.body.v2", "tcd.attest.body.v1"})
+
+
+def _is_attestation_receipt_body_obj(obj: Any) -> bool:
+    """
+    Detect Attestor.issue() canonical body.
+
+    Important:
+      Attestor receipt head is _compute_head_from_body(body_obj).
+      It is NOT the same as ledger storage-chain head.
+    """
+    if not isinstance(obj, dict):
+        return False
+    schema = obj.get("schema")
+    if isinstance(schema, str) and schema in _ATTESTATION_BODY_SCHEMAS:
+        return True
+    return bool(
+        isinstance(obj.get("attestor"), dict)
+        and isinstance(obj.get("witness"), dict)
+        and ("claims" in obj or "req" in obj or "comp" in obj)
+    )
+
+
+def _validate_attestation_receipt_json_tree(
+    obj: Any,
+    cfg: LedgerConfig,
+    *,
+    depth: int = 0,
+    nodes: int = 0,
+) -> int:
+    """
+    Bounded JSON validation for Attestor.issue() bodies.
+
+    This is intentionally more lenient than ledger external meta validation:
+    attest.py already redacts/sanitizes/normalizes the evidence body, and
+    receipt bodies legitimately contain structural keys such as body_digest,
+    req, comp, witness, claims, etc. Rejecting those as "content keys" makes
+    ledger incompatible with attest.py.
+    """
+    nodes += 1
+    if nodes > cfg.max_receipt_json_nodes:
+        raise LedgerError("attestation receipt json too large", code="RECEIPT_JSON_TOO_LARGE")
+    if depth > cfg.max_receipt_json_depth:
+        raise LedgerError("attestation receipt json too deep", code="RECEIPT_JSON_TOO_DEEP")
+
+    if isinstance(obj, dict):
+        if len(obj) > 4096:
+            raise LedgerError("attestation receipt json too wide", code="RECEIPT_JSON_TOO_LARGE")
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise LedgerError("attestation receipt json keys must be strings", code="RECEIPT_JSON_INVALID")
+            if _has_surrogate(k):
+                raise LedgerError("attestation receipt key invalid unicode", code="RECEIPT_JSON_INVALID")
+            _reject_unsafe_text(k, allow_whitespace=False)
+            kb = _encode_utf8_strict(k)
+            if len(kb) > max(256, cfg.max_meta_key_bytes):
+                raise LedgerError("attestation receipt key too long", code="RECEIPT_JSON_INVALID")
+            nodes = _validate_attestation_receipt_json_tree(v, cfg, depth=depth + 1, nodes=nodes)
+        return nodes
+
+    if isinstance(obj, list):
+        if len(obj) > 4096:
+            raise LedgerError("attestation receipt json list too large", code="RECEIPT_JSON_TOO_LARGE")
+        for it in obj:
+            nodes = _validate_attestation_receipt_json_tree(it, cfg, depth=depth + 1, nodes=nodes)
+        return nodes
+
+    if obj is None or isinstance(obj, bool):
+        return nodes
+
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        if obj.bit_length() > cfg.max_receipt_json_int_bits:
+            raise LedgerError("attestation receipt json int too large", code="RECEIPT_JSON_INVALID")
+        return nodes
+
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise LedgerError("attestation receipt json float non-finite", code="RECEIPT_JSON_INVALID")
+        return nodes
+
+    if isinstance(obj, str):
+        if _has_surrogate(obj):
+            raise LedgerError("attestation receipt json string invalid unicode", code="RECEIPT_JSON_INVALID")
+        _reject_unsafe_text(obj, allow_whitespace=True)
+        b = _encode_utf8_strict(obj)
+        if len(b) > max(4096, cfg.max_receipt_json_string_bytes):
+            raise LedgerError("attestation receipt json string too long", code="RECEIPT_JSON_INVALID")
+        return nodes
+
+    raise LedgerError("attestation receipt json invalid type", code="RECEIPT_JSON_INVALID")
+
+
+def _resolve_receipt_head_semantics(cfg: LedgerConfig, body_obj: Any) -> str:
+    mode = getattr(cfg, "receipt_head_semantics", "auto")
+    if mode not in {"auto", "attestation_v2", "storage_chain_v1"}:
+        mode = "auto"
+
+    if mode == "attestation_v2":
+        return "attestation_v2"
+
+    if mode == "storage_chain_v1":
+        return "storage_chain_v1"
+
+    if (
+        bool(getattr(cfg, "allow_attestation_receipt_head", True))
+        and _is_attestation_receipt_body_obj(body_obj)
+    ):
+        return "attestation_v2"
+
+    return "storage_chain_v1"
+
+
+def _verify_attestation_receipt_material(
+    *,
+    head: str,
+    body_canon: str,
+    sig: Optional[str],
+    cfg: LedgerConfig,
+) -> Tuple[bool, str]:
+    if not sig:
+        return False, "SIGNATURE_MISSING"
+
+    body_bytes = _encode_utf8_strict(body_canon)
+
+    if _attest_verify_record_ex is not None:
+        try:
+            ok, reason, _details = _attest_verify_record_ex(
+                receipt=head,
+                receipt_body=body_canon,
+                receipt_sig=sig,
+                max_body_bytes=max(int(cfg.max_receipt_body_bytes), len(body_bytes)),
+                max_json_depth=max(96, int(cfg.max_receipt_json_depth)),
+                max_nodes=max(100_000, int(cfg.max_receipt_json_nodes)),
+                max_list_items=max(5_000, int(cfg.max_receipt_json_nodes)),
+                max_dict_items=max(5_000, int(cfg.max_receipt_json_nodes)),
+                max_string_bytes=max(65_536, int(cfg.max_receipt_json_string_bytes)),
+                max_key_bytes=8 * 1024,
+                max_receipt_len=max(256, int(cfg.max_receipt_head_len)),
+                max_receipt_sig_len=max(256, int(cfg.max_receipt_sig_len or 0)),
+                require_witness_digest=False,
+                strict_structure=False,
+                require_canonical_body=True,
+                require_sig=False,
+            )
+            return bool(ok), str(reason)
+        except Exception:
+            return False, "ATTEST_VERIFY_EXCEPTION"
+
+    if _attest_compute_head_from_body is None:
+        return False, "ATTEST_VERIFY_UNAVAILABLE"
+
+    try:
+        body_obj = json.loads(body_canon)
+        computed_head = _attest_compute_head_from_body(body_obj)
+        h = hashlib.sha256()
+        h.update(b"tcd:attest_sig")
+        h.update(str(computed_head).encode("utf-8", errors="strict"))
+        h.update(body_bytes)
+        computed_sig = h.hexdigest()
+        if not hmac.compare_digest(str(computed_head), str(head)):
+            return False, "HEAD_MISMATCH"
+        if not hmac.compare_digest(str(computed_sig), str(sig)):
+            return False, "INTEGRITY_HASH_MISMATCH"
+        return True, "OK"
+    except Exception:
+        return False, "ATTEST_VERIFY_EXCEPTION"
+
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------
@@ -1389,13 +1592,23 @@ def _validate_receipt_record(rec: "ReceiptRecord", cfg: LedgerConfig) -> "Receip
     if _has_surrogate(body):
         raise LedgerError("receipt body invalid unicode", code="RECEIPT_INVALID")
 
-    # If validate_receipt_json OR verify_receipt_head, require strict JSON and canonicalize
+    # If validate_receipt_json OR verify_receipt_head, require strict JSON and canonicalize.
+    # Attestor.issue() bodies are validated with an attest-aware structural validator
+    # because they legitimately contain receipt structural keys such as body_digest,
+    # req, comp, claims, witness, etc.
+    body_obj: Any = None
     body_canon = body
     if cfg.validate_receipt_json or cfg.verify_receipt_head:
         try:
-            obj = _parse_json_strict(body, cfg)
-            _validate_receipt_json_tree(obj, cfg, depth=0, nodes=0)
-            body_canon = _canonicalize_json(obj)
+            body_obj = _parse_json_strict(body, cfg)
+            if (
+                _is_attestation_receipt_body_obj(body_obj)
+                and bool(getattr(cfg, "validate_attestation_body_lenient", True))
+            ):
+                _validate_attestation_receipt_json_tree(body_obj, cfg, depth=0, nodes=0)
+            else:
+                _validate_receipt_json_tree(body_obj, cfg, depth=0, nodes=0)
+            body_canon = _canonicalize_json(body_obj)
         except LedgerError:
             raise
         except Exception as e:
@@ -1405,12 +1618,34 @@ def _validate_receipt_record(rec: "ReceiptRecord", cfg: LedgerConfig) -> "Receip
     if len(body_bytes) > cfg.max_receipt_body_bytes:
         raise LedgerError("receipt body too large for ledger", code="RECEIPT_INVALID")
 
-    # Optional receipt head verification (strict L7+ mode)
-    if cfg.verify_receipt_head and cfg.strict_receipt_head_hex64:
-        expected = _compute_receipt_head(chain_id, prev, body_canon, sig)
-        if head != expected:
-            _RCPT_HEAD_MISMATCH.inc()
-            raise LedgerError("receipt head mismatch", code="RECEIPT_HEAD_MISMATCH")
+    # Optional receipt head verification.
+    #
+    # There are two valid head semantics:
+    #   1) attestation_v2:
+    #        head == attest._compute_head_from_body(body_obj)
+    #        sig  == sha256("tcd:attest_sig" || head || canonical_body)
+    #   2) storage_chain_v1:
+    #        head == ledger._compute_receipt_head(chain_id, prev, canonical_body, sig)
+    #
+    # Strict external mode defaults to auto-detect so Attestor.issue() receipts can
+    # be stored durably without being rewritten into a different ledger-only head.
+    if cfg.verify_receipt_head:
+        semantics = _resolve_receipt_head_semantics(cfg, body_obj)
+        if semantics == "attestation_v2":
+            ok, reason = _verify_attestation_receipt_material(
+                head=head,
+                body_canon=body_canon,
+                sig=sig,
+                cfg=cfg,
+            )
+            if not ok:
+                _RCPT_HEAD_MISMATCH.inc()
+                raise LedgerError("attestation receipt head mismatch", code="RECEIPT_HEAD_MISMATCH")
+        elif cfg.strict_receipt_head_hex64:
+            expected = _compute_receipt_head(chain_id, prev, body_canon, sig)
+            if head != expected:
+                _RCPT_HEAD_MISMATCH.inc()
+                raise LedgerError("receipt head mismatch", code="RECEIPT_HEAD_MISMATCH")
 
     # ts sanity (note: NOT included in head computation; we may adjust for monotonicity)
     ts = float(rec.ts)
@@ -1986,7 +2221,9 @@ END;
 """
 
 _SCHEMA_V3 = """
-CREATE INDEX IF NOT EXISTS idx_events_skey_ts_rowid ON events(skey, ts, rowid);
+-- rowid is a SQLite pseudo-column and cannot be indexed portably.
+-- Use event_id as deterministic replay tie-breaker instead.
+CREATE INDEX IF NOT EXISTS idx_events_skey_ts_eventid ON events(skey, ts, event_id);
 
 CREATE TRIGGER IF NOT EXISTS trg_receipts_prev_not_empty
 BEFORE INSERT ON receipts
@@ -2129,6 +2366,12 @@ CREATE INDEX IF NOT EXISTS idx_receipts_chain_prev_head ON receipts(chain_id, pr
 CREATE INDEX IF NOT EXISTS idx_receipts_chain_ts ON receipts(chain_id, ts);
 """
 
+_SCHEMA_V4_POST_ALTER = (
+    _SCHEMA_V4
+    .replace("ALTER TABLE events ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';\n\n", "")
+    .replace("ALTER TABLE receipts ADD COLUMN chain_id TEXT NOT NULL DEFAULT '';\n\n", "")
+)
+
 
 class SQLiteLedger(Ledger):
     """
@@ -2232,6 +2475,10 @@ class SQLiteLedger(Ledger):
         conn = self._get_conn()
         with self._lock:
             ver = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+            try:
+                conn.execute("DROP INDEX IF EXISTS idx_events_skey_ts_rowid")
+            except Exception:
+                pass
             if ver == 0:
                 conn.executescript(_SCHEMA_V1)
                 conn.execute("PRAGMA user_version=1")
@@ -2263,7 +2510,28 @@ class SQLiteLedger(Ledger):
                     conn.execute("UPDATE receipts SET sig=NULL WHERE sig=''")
                 except Exception:
                     pass
-                conn.executescript(_SCHEMA_V4)
+                try:
+                    event_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+                    if "fingerprint" not in event_cols:
+                        conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+
+                try:
+                    receipt_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+                    if "chain_id" not in receipt_cols:
+                        conn.execute("ALTER TABLE receipts ADD COLUMN chain_id TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+
+                try:
+                    conn.execute("DROP INDEX IF EXISTS idx_events_skey_ts_rowid")
+                except Exception:
+                    pass
+
+                conn.executescript(_SCHEMA_V4_POST_ALTER)
                 conn.execute("PRAGMA user_version=4")
                 ver = 4
 
@@ -2328,7 +2596,7 @@ class SQLiteLedger(Ledger):
         cur = conn.execute(
             "SELECT r.head FROM receipts r "
             "WHERE r.chain_id=? AND NOT EXISTS (SELECT 1 FROM receipts c WHERE c.chain_id=r.chain_id AND c.prev=r.head) "
-            "ORDER BY r.ts DESC, r.rowid DESC LIMIT 2",
+            "ORDER BY r.ts DESC, r.head DESC LIMIT 2",
             (chain_id,),
         )
         return [str(x[0]) for x in cur.fetchall()]
@@ -2549,7 +2817,7 @@ class SQLiteLedger(Ledger):
             # best-effort monotonic ts per chain (non-strict path)
             if self._cfg.enforce_monotonic_receipt_ts:
                 row = conn.execute(
-                    "SELECT ts FROM receipts WHERE chain_id=? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT ts FROM receipts WHERE chain_id=? ORDER BY ts DESC, head DESC LIMIT 1",
                     (r.chain_id,),
                 ).fetchone()
                 if row:
@@ -2595,7 +2863,7 @@ class SQLiteLedger(Ledger):
             # monotonic ts inside txn per chain
             if self._cfg.enforce_monotonic_receipt_ts:
                 row = txn.execute(
-                    "SELECT ts FROM receipts WHERE chain_id=? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT ts FROM receipts WHERE chain_id=? ORDER BY ts DESC, head DESC LIMIT 1",
                     (chain_id,),
                 ).fetchone()
                 if row:
@@ -2842,12 +3110,12 @@ class SQLiteLedger(Ledger):
 
         if cursor_ts is None:
             cur = conn.execute(
-                "SELECT head, body, sig, prev, ts, chain_id FROM receipts WHERE chain_id=? ORDER BY ts ASC, rowid ASC LIMIT ?",
+                "SELECT head, body, sig, prev, ts, chain_id FROM receipts WHERE chain_id=? ORDER BY ts ASC, head ASC LIMIT ?",
                 (chain_id, n),
             )
         else:
             cur = conn.execute(
-                "SELECT head, body, sig, prev, ts, chain_id FROM receipts WHERE chain_id=? AND ts>? ORDER BY ts ASC, rowid ASC LIMIT ?",
+                "SELECT head, body, sig, prev, ts, chain_id FROM receipts WHERE chain_id=? AND ts>? ORDER BY ts ASC, head ASC LIMIT ?",
                 (chain_id, float(cursor_ts), n),
             )
 
@@ -2887,7 +3155,7 @@ class SQLiteLedger(Ledger):
 
         with self._lock, self._txn() as txn:
             keep_row = txn.execute(
-                "SELECT head FROM receipts WHERE chain_id=? AND ts >= ? ORDER BY ts ASC, rowid ASC LIMIT 1",
+                "SELECT head FROM receipts WHERE chain_id=? AND ts >= ? ORDER BY ts ASC, head ASC LIMIT 1",
                 (chain_id, cutoff),
             ).fetchone()
             keep_head = keep_row[0] if keep_row else None

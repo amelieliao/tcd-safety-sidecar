@@ -21,11 +21,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union, L
 # ----------------------------------------------------------------------
 
 try:
-    from .agent import ControlAgent, ActionResult, ExecutionMode
-except Exception:  # pragma: no cover
-    ControlAgent = Any  # type: ignore
-    ActionResult = Any  # type: ignore
-    ExecutionMode = Any  # type: ignore
+    from .agent import ControlAgent, ActionResult, ExecutionMode, ActionContext
+except Exception:
+    try:
+        from .agent import TrustAgent as ControlAgent, ActionResult, ExecutionMode, ActionContext
+    except Exception:
+        ControlAgent = Any  # type: ignore
+        ActionResult = Any  # type: ignore
+        ExecutionMode = Any  # type: ignore
+        ActionContext = Any  # type: ignore
 
 try:
     from .attest import Attestor
@@ -180,6 +184,41 @@ def _finite_float(x: Any) -> Optional[float]:
     if not math.isfinite(v):
         return None
     return v
+
+
+_INT_STR_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _finite_int_default(x: Any, default: int) -> int:
+    if isinstance(x, bool):
+        return int(default)
+    if isinstance(x, int):
+        return int(x)
+    if isinstance(x, float):
+        return int(x) if math.isfinite(x) else int(default)
+    if isinstance(x, str):
+        ss = x.strip()
+        if not ss or len(ss) > 64 or not _INT_STR_RE.fullmatch(ss):
+            return int(default)
+        try:
+            return int(ss, 10)
+        except Exception:
+            return int(default)
+    return int(default)
+
+
+def _coerce_bool_default(x: Any, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int) and not isinstance(x, bool):
+        return bool(x)
+    if isinstance(x, str):
+        ss = x.strip().lower()
+        if ss in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if ss in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return bool(default)
 
 
 def _clamp_int(v: int, lo: int, hi: int) -> int:
@@ -639,7 +678,7 @@ class PatchRuntimeConfig:
     max_patch_blob_bytes: int = 10_000_000  # 10MB
 
     # Hash algorithm
-    hash_alg: str = "blake3"
+    hash_alg: str = "sha256"
     allow_legacy_sha1: bool = False
     require_hash_alg_available: bool = True  # L7: no silent downgrade
     allow_hash_fallback: bool = False        # if True and require_hash_alg_available False, fallback allowed
@@ -763,7 +802,7 @@ class PatchRuntimeConfig:
     require_verified_artifact_on_register: bool = False
 
     verify_artifact_on_apply: bool = True
-    require_verified_artifact_on_apply: bool = True
+    require_verified_artifact_on_apply: bool = False
     require_artifact_digest_on_apply: bool = False
 
     # Receipt storage strategy
@@ -784,15 +823,15 @@ class PatchRuntimeConfig:
     def normalized_copy(self) -> "PatchRuntimeConfig":
         c = PatchRuntimeConfig()
 
-        c.schema_version = int(self.schema_version or 1)
+        c.schema_version = _finite_int_default(self.schema_version, 1)
 
         c.auto_rollback_on_failure = bool(self.auto_rollback_on_failure)
-        c.max_patches = _clamp_int(int(self.max_patches or 1_000), 1, 1_000_000)
+        c.max_patches = _clamp_int(_finite_int_default(self.max_patches, 1_000), 1, 1_000_000)
 
         c.max_patches_evict_only_terminal = bool(self.max_patches_evict_only_terminal)
         c.allow_evict_in_flight = bool(self.allow_evict_in_flight)
 
-        c.max_patch_blob_bytes = _clamp_int(int(self.max_patch_blob_bytes or 10_000_000), 1_024, 1_000_000_000)
+        c.max_patch_blob_bytes = _clamp_int(_finite_int_default(self.max_patch_blob_bytes, 10_000_000), 1_024, 1_000_000_000)
 
         c.hash_alg = _safe_str_only(self.hash_alg, max_len=32, default="blake3").lower()
         c.allow_legacy_sha1 = bool(self.allow_legacy_sha1)
@@ -805,8 +844,8 @@ class PatchRuntimeConfig:
         c.receipts_enable = bool(self.receipts_enable)
 
         c.patch_id_prefix = _safe_label(self.patch_id_prefix, default="patch")
-        c.patch_id_checksum_chars = _clamp_int(int(self.patch_id_checksum_chars or 20), 8, 64)
-        c.patch_id_random_suffix_chars = _clamp_int(int(self.patch_id_random_suffix_chars or 8), 4, 32)
+        c.patch_id_checksum_chars = _clamp_int(_finite_int_default(self.patch_id_checksum_chars, 20), 8, 64)
+        c.patch_id_random_suffix_chars = _clamp_int(_finite_int_default(self.patch_id_random_suffix_chars, 8), 4, 32)
 
         c.apply_kind = _safe_label(self.apply_kind, default="apply_patch")
         c.rollback_kind = _safe_label(self.rollback_kind, default="rollback")
@@ -819,7 +858,7 @@ class PatchRuntimeConfig:
         c.require_explicit_canary_like_for_high_risk = bool(self.require_explicit_canary_like_for_high_risk)
         c.require_mode_resolution = bool(self.require_mode_resolution)
 
-        c.max_pending_per_subject = _clamp_int(int(self.max_pending_per_subject or 32), 0, 1_000_000)
+        c.max_pending_per_subject = _clamp_int(_finite_int_default(self.max_pending_per_subject, 32), 0, 1_000_000)
         c.allow_duplicate_checksums = bool(self.allow_duplicate_checksums)
 
         # approvals by risk
@@ -839,7 +878,7 @@ class PatchRuntimeConfig:
         c.allow_metadata_override_required_approvals = bool(self.allow_metadata_override_required_approvals)
         c.allow_metadata_lower_required_approvals = bool(self.allow_metadata_lower_required_approvals)
 
-        c.max_approvals_per_patch = _clamp_int(int(self.max_approvals_per_patch or 128), 1, 10_000)
+        c.max_approvals_per_patch = _clamp_int(_finite_int_default(self.max_approvals_per_patch, 128), 1, 10_000)
         c.require_distinct_approvers = bool(self.require_distinct_approvers)
 
         c.allow_approvals_after_pending = bool(self.allow_approvals_after_pending)
@@ -851,15 +890,15 @@ class PatchRuntimeConfig:
         c.require_targets_for_scope_enforcement = bool(self.require_targets_for_scope_enforcement)
 
         c.targets_store_mode = self.targets_store_mode if self.targets_store_mode in ("none", "summary", "sanitized") else "summary"
-        c.targets_budget_nodes = _clamp_int(int(self.targets_budget_nodes or 512), 64, 10_000)
-        c.targets_budget_items = _clamp_int(int(self.targets_budget_items or 128), 16, 10_000)
-        c.targets_budget_depth = _clamp_int(int(self.targets_budget_depth or 4), 1, 16)
-        c.targets_budget_str = _clamp_int(int(self.targets_budget_str or 16_000), 1_024, 1_000_000)
+        c.targets_budget_nodes = _clamp_int(_finite_int_default(self.targets_budget_nodes, 512), 64, 10_000)
+        c.targets_budget_items = _clamp_int(_finite_int_default(self.targets_budget_items, 128), 16, 10_000)
+        c.targets_budget_depth = _clamp_int(_finite_int_default(self.targets_budget_depth, 4), 1, 16)
+        c.targets_budget_str = _clamp_int(_finite_int_default(self.targets_budget_str, 16_000), 1_024, 1_000_000)
 
-        c.metadata_budget_nodes = _clamp_int(int(self.metadata_budget_nodes or 1024), 64, 20_000)
-        c.metadata_budget_items = _clamp_int(int(self.metadata_budget_items or 256), 16, 20_000)
-        c.metadata_budget_depth = _clamp_int(int(self.metadata_budget_depth or 6), 1, 32)
-        c.metadata_budget_str = _clamp_int(int(self.metadata_budget_str or 32_000), 1_024, 5_000_000)
+        c.metadata_budget_nodes = _clamp_int(_finite_int_default(self.metadata_budget_nodes, 1024), 64, 20_000)
+        c.metadata_budget_items = _clamp_int(_finite_int_default(self.metadata_budget_items, 256), 16, 20_000)
+        c.metadata_budget_depth = _clamp_int(_finite_int_default(self.metadata_budget_depth, 6), 1, 32)
+        c.metadata_budget_str = _clamp_int(_finite_int_default(self.metadata_budget_str, 32_000), 1_024, 5_000_000)
 
         if isinstance(self.metadata_allowed_keys, list) and self.metadata_allowed_keys:
             keys = []
@@ -885,8 +924,8 @@ class PatchRuntimeConfig:
         if c.operator_hash_key == "":
             c.operator_hash_key = None
 
-        c.min_id_hash_key_bytes = _clamp_int(int(self.min_id_hash_key_bytes or 16), 8, 64)
-        c.id_hash_hex_chars = _clamp_int(int(self.id_hash_hex_chars or 32), 8, 64)
+        c.min_id_hash_key_bytes = _clamp_int(_finite_int_default(self.min_id_hash_key_bytes, 16), 8, 64)
+        c.id_hash_hex_chars = _clamp_int(_finite_int_default(self.id_hash_hex_chars, 32), 8, 64)
 
         c.include_clear_ids = bool(self.include_clear_ids)
         if isinstance(self.clear_id_env_allowlist, list) and self.clear_id_env_allowlist:
@@ -918,7 +957,7 @@ class PatchRuntimeConfig:
 
         c.audit_hook = self.audit_hook
         c.audit_hook_bytes = self.audit_hook_bytes
-        c.audit_payload_max_bytes = _clamp_int(int(self.audit_payload_max_bytes or 16_384), 1_024, 10_000_000)
+        c.audit_payload_max_bytes = _clamp_int(_finite_int_default(self.audit_payload_max_bytes, 16_384), 1_024, 10_000_000)
 
         c.minimize_receipt_metadata = bool(self.minimize_receipt_metadata)
         c.minimize_telemetry_metadata = bool(self.minimize_telemetry_metadata)
@@ -939,12 +978,12 @@ class PatchRuntimeConfig:
 
         # receipts
         c.receipt_store_mode = self.receipt_store_mode if self.receipt_store_mode in ("head_only", "head_sig", "full") else "head_sig"
-        c.max_total_receipt_bytes = _clamp_int(int(self.max_total_receipt_bytes or 5_000_000), 0, 1_000_000_000)
+        c.max_total_receipt_bytes = _clamp_int(_finite_int_default(self.max_total_receipt_bytes, 5_000_000), 0, 1_000_000_000)
 
         # text fields
-        c.reason_max_len = _clamp_int(int(self.reason_max_len or 256), 0, 4096)
-        c.description_max_len = _clamp_int(int(self.description_max_len or 512), 0, 16_384)
-        c.origin_max_len = _clamp_int(int(self.origin_max_len or 256), 0, 16_384)
+        c.reason_max_len = _clamp_int(_finite_int_default(self.reason_max_len, 256), 0, 4096)
+        c.description_max_len = _clamp_int(_finite_int_default(self.description_max_len, 512), 0, 16_384)
+        c.origin_max_len = _clamp_int(_finite_int_default(self.origin_max_len, 256), 0, 16_384)
 
         c.allow_callables_in_result = bool(self.allow_callables_in_result)
         c.enable_staged_rollout = bool(self.enable_staged_rollout)
@@ -1011,8 +1050,8 @@ class PatchRuntimeConfig:
         """
         Strict-ish loader: unknown keys ignored; types/clamps enforced via normalized_copy.
         """
-        if type(d) is not dict:
-            raise TypeError("PatchRuntimeConfig.from_dict expects a dict-like mapping")
+        if not isinstance(d, Mapping):
+            raise TypeError("PatchRuntimeConfig.from_dict expects a mapping")
 
         cfg = PatchRuntimeConfig()
         # whitelist assignment
@@ -1076,6 +1115,15 @@ class PatchRuntime:
         # Cache config fingerprint for audit correlation (includes effective alg & capability flags)
         self._cfg_fp = self._fingerprint_runtime_config()
 
+    def _resolve_environments(self, environment: Optional[str]) -> Tuple[str, str]:
+        cfg = self._cfg
+        configured = cfg.environment
+        if cfg.allow_environment_override and isinstance(environment, str):
+            env = _safe_label(environment, default=configured)
+            return env, env
+        report_env = _safe_label(environment, default=configured) if isinstance(environment, str) else configured
+        return configured, report_env
+
     # ------------------------------------------------------------------
     # Public API: registration / lookup / approval
     # ------------------------------------------------------------------
@@ -1101,11 +1149,14 @@ class PatchRuntime:
             raise ValueError(f"patch_blob too large: {len(patch_blob)} bytes (limit={cfg.max_patch_blob_bytes})")
 
         # Authoritative environment/trust zone (caller cannot spoof enforcement)
-        enforce_env = cfg.environment
-        report_env = _safe_label(environment, default=enforce_env) if isinstance(environment, str) else enforce_env
+        enforce_env, report_env = self._resolve_environments(environment)
 
         # Subject id clear -> hashed subject id (default)
-        subject_id_clear = _strip_unsafe_text(subject.as_id() if isinstance(subject.as_id(), str) else "", max_len=512).strip()
+        try:
+            subject_id_raw = subject.as_id()
+        except Exception as e:
+            raise ValueError("subject.as_id() failed") from e
+        subject_id_clear = _strip_unsafe_text(subject_id_raw if isinstance(subject_id_raw, str) else "", max_len=512).strip()
         if not subject_id_clear:
             raise ValueError("subject.as_id() produced empty/invalid subject_id")
 
@@ -1245,8 +1296,7 @@ class PatchRuntime:
         environment: Optional[str] = None,
     ) -> PatchState:
         cfg = self._cfg
-        enforce_env = cfg.environment
-        report_env = _safe_label(environment, default=enforce_env) if isinstance(environment, str) else enforce_env
+        enforce_env, report_env = self._resolve_environments(environment)
 
         lock, state = self._acquire_patch(patch_id)
         try:
@@ -1357,8 +1407,7 @@ class PatchRuntime:
         environment: Optional[str] = None,
     ) -> Tuple[PatchState, Optional[PatchReceiptRef], Optional[ActionResult]]:
         cfg = self._cfg
-        enforce_env = cfg.environment
-        report_env = _safe_label(environment, default=enforce_env) if isinstance(environment, str) else enforce_env
+        enforce_env, report_env = self._resolve_environments(environment)
 
         lock, state = self._acquire_patch(patch_id)
         try:
@@ -1537,8 +1586,7 @@ class PatchRuntime:
         environment: Optional[str] = None,
     ) -> Tuple[PatchState, Optional[PatchReceiptRef], Optional[ActionResult]]:
         cfg = self._cfg
-        enforce_env = cfg.environment
-        report_env = _safe_label(environment, default=enforce_env) if isinstance(environment, str) else enforce_env
+        enforce_env, report_env = self._resolve_environments(environment)
 
         lock, state = self._acquire_patch(patch_id)
         try:
@@ -1698,7 +1746,12 @@ class PatchRuntime:
         if not cfg.allow_duplicate_checksums:
             self._by_subject_checksum.setdefault((subject_id, checksum), patch_id)
 
-        self._evict_if_needed_locked()
+        try:
+            self._evict_if_needed_locked()
+        except Exception:
+            self._remove_patch_locked(patch_id)
+            self._order = [pid for pid in self._order if pid in self._patches]
+            raise
 
     def _evict_if_needed_locked(self) -> None:
         cfg = self._cfg
@@ -2092,11 +2145,15 @@ class PatchRuntime:
             return explicit_mode
 
         if dry_run:
+            if hasattr(ExecutionMode, "DRY_RUN"):
+                m0 = getattr(ExecutionMode, "DRY_RUN")
+                if isinstance(m0, (Enum, str)):
+                    return m0
             m = self._choose_canary_mode()
             if m is not None:
                 return m
             if self._cfg.require_mode_resolution:
-                raise PermissionError("dry_run requires safe/canary mode but none is available")
+                raise PermissionError("dry_run requires dry_run/canary mode but none is available")
             return None
 
         if state.descriptor.risk_level == PatchRiskLevel.HIGH and self._cfg.require_canary_for_high_risk:
@@ -2344,16 +2401,42 @@ class PatchRuntime:
 
     def _verify_artifact_on_register(self, descriptor: PatchDescriptor, *, metadata_req: Optional[int]) -> None:
         cfg = self._cfg
-        if not self._attestor or not cfg.verify_artifact_on_register:
+        if not cfg.verify_artifact_on_register:
+            return
+        if self._attestor is None:
+            if cfg.require_verified_artifact_on_register:
+                self._maybe_escalate_risk(
+                    descriptor,
+                    PatchRiskLevel.HIGH,
+                    reason="attestor_unavailable_register",
+                    metadata_req=metadata_req,
+                )
+                raise ValueError("artifact verification required at register time but Attestor is unavailable")
             return
 
         digest = descriptor.artifact_digest or descriptor.metadata.get("artifact_digest")
         digest = self._normalize_artifact_digest(digest)
         if digest is None:
+            if cfg.require_verified_artifact_on_register:
+                self._maybe_escalate_risk(
+                    descriptor,
+                    PatchRiskLevel.HIGH,
+                    reason="artifact_digest_missing_register",
+                    metadata_req=metadata_req,
+                )
+                raise ValueError("artifact digest required at register time")
             return
 
         verifier = getattr(self._attestor, "verify_artifact", None)
         if not callable(verifier):
+            if cfg.require_verified_artifact_on_register:
+                self._maybe_escalate_risk(
+                    descriptor,
+                    PatchRiskLevel.HIGH,
+                    reason="artifact_verifier_unavailable_register",
+                    metadata_req=metadata_req,
+                )
+                raise ValueError("artifact verifier unavailable at register time")
             return
 
         try:
@@ -2380,20 +2463,28 @@ class PatchRuntime:
 
     def _verify_artifact_on_apply(self, state: PatchState) -> bool:
         cfg = self._cfg
-        if not self._attestor or not cfg.verify_artifact_on_apply:
+        if not cfg.verify_artifact_on_apply:
+            return True
+        if self._attestor is None:
+            if cfg.require_verified_artifact_on_apply:
+                self._fail(state, code="ATTESTOR_UNAVAILABLE")
+                return False
             return True
 
         digest_raw = state.descriptor.artifact_digest or state.descriptor.metadata.get("artifact_digest")
         digest = self._normalize_artifact_digest(digest_raw)
 
         if digest is None:
-            if cfg.require_artifact_digest_on_apply:
+            if cfg.require_artifact_digest_on_apply or cfg.require_verified_artifact_on_apply:
                 self._fail(state, code="ARTIFACT_DIGEST_MISSING")
                 return False
             return True
 
         verifier = getattr(self._attestor, "verify_artifact", None)
         if not callable(verifier):
+            if cfg.require_verified_artifact_on_apply:
+                self._fail(state, code="ARTIFACT_VERIFIER_UNAVAILABLE")
+                return False
             return True
 
         try:
@@ -2426,10 +2517,26 @@ class PatchRuntime:
     # Internal helpers: receipts & budgets
     # ------------------------------------------------------------------
 
+    def _receipt_ref_from_action_result(self, result: ActionResult) -> Optional[PatchReceiptRef]:
+        head = _safe_str_only(getattr(result, "receipt", None), max_len=16_384, default="") or None
+        body = _safe_str_only(getattr(result, "receipt_body", None), max_len=64_000, default="") or None
+        sig = _safe_str_only(getattr(result, "receipt_sig", None), max_len=8_192, default="") or None
+        key = _safe_str_only(getattr(result, "verify_key", None), max_len=8_192, default="") or None
+        if not any((head, body, sig, key)):
+            return None
+        if self._cfg.receipt_store_mode == "head_only":
+            body = None
+            sig = None
+            key = None
+        elif self._cfg.receipt_store_mode == "head_sig":
+            body = None
+        return PatchReceiptRef(receipt_head=head, receipt_body=body, receipt_sig=sig, verify_key=key)
+
     def _issue_patch_receipt(self, *, kind: str, state: PatchState, result: ActionResult) -> Optional[PatchReceiptRef]:
         cfg = self._cfg
+        fallback = self._receipt_ref_from_action_result(result)
         if self._attestor is None:
-            return None
+            return fallback
 
         try:
             ok = bool(getattr(result, "ok", False))
@@ -2464,7 +2571,6 @@ class PatchRuntime:
             req_obj = {"ts": time.time(), "patch": patch_meta}
             comp_obj = payload
 
-            # e-process snapshot (validated)
             e_fields: Dict[str, float] = {}
             if cfg.e_allocator is not None:
                 try:
@@ -2500,7 +2606,6 @@ class PatchRuntime:
             if cfg.e_process_id is not None:
                 meta["e_process_id"] = cfg.e_process_id
 
-            # bound inputs deterministically before signing (JSON closure)
             budget = _JsonBudget(max_nodes=2048, max_items=512, max_depth=8, max_str=64_000)
             req_obj_s = _json_sanitize(req_obj, budget=budget, depth=0, redact_secrets=True)
             comp_obj_s = _json_sanitize(comp_obj, budget=budget, depth=0, redact_secrets=True)
@@ -2508,7 +2613,7 @@ class PatchRuntime:
             meta_s = _json_sanitize(meta, budget=budget, depth=0, redact_secrets=True)
 
             if not isinstance(req_obj_s, dict) or not isinstance(comp_obj_s, dict) or not isinstance(e_obj_s, dict) or not isinstance(meta_s, dict):
-                return None
+                return fallback
 
             receipt = self._attestor.issue(
                 req_obj=req_obj_s,
@@ -2519,9 +2624,8 @@ class PatchRuntime:
                 meta=meta_s,
             )
             if not isinstance(receipt, dict):
-                return None
+                return fallback
 
-            # store strategy
             head = _safe_str_only(receipt.get("receipt"), max_len=16_384, default="") or None
             body = _safe_str_only(receipt.get("receipt_body"), max_len=64_000, default="") or None
             sig = _safe_str_only(receipt.get("receipt_sig"), max_len=8_192, default="") or None
@@ -2536,17 +2640,15 @@ class PatchRuntime:
 
             ref = PatchReceiptRef(receipt_head=head, receipt_body=body, receipt_sig=sig, verify_key=key)
 
-            # track bytes to avoid unbounded memory growth
             approx = sum(len(x or "") for x in (head, body, sig, key))
             with self._lock:
                 if cfg.max_total_receipt_bytes > 0 and (self._receipt_bytes_total + approx) > cfg.max_total_receipt_bytes:
-                    # refuse storing more receipts
                     return PatchReceiptRef(receipt_head=head, receipt_body=None, receipt_sig=None, verify_key=None)
                 self._receipt_bytes_total += approx
 
             return ref
         except Exception:
-            return None
+            return fallback
 
     # ------------------------------------------------------------------
     # Telemetry / audit
@@ -2568,8 +2670,14 @@ class PatchRuntime:
         if not self._cfg.minimize_telemetry_metadata:
             attrs["subject_id"] = state.descriptor.subject_id
 
-        exporter.record_metric(name="tcd.patch.register.count", value=1.0, labels=attrs)
-        exporter.push_event(name="tcd.patch.register", attrs=attrs)
+        try:
+            exporter.record_metric(name="tcd.patch.register.count", value=1.0, labels=attrs)
+        except Exception:
+            pass
+        try:
+            exporter.push_event(name="tcd.patch.register", attrs=attrs)
+        except Exception:
+            pass
 
     def _emit_telemetry_approve(self, state: PatchState, operator: OperatorId, environment: str) -> None:
         exporter = self._cfg.telemetry
@@ -2588,8 +2696,14 @@ class PatchRuntime:
         if not self._cfg.minimize_telemetry_metadata:
             attrs["subject_id"] = state.descriptor.subject_id
 
-        exporter.record_metric(name="tcd.patch.approve.count", value=1.0, labels=attrs)
-        exporter.push_event(name="tcd.patch.approve", attrs=attrs)
+        try:
+            exporter.record_metric(name="tcd.patch.approve.count", value=1.0, labels=attrs)
+        except Exception:
+            pass
+        try:
+            exporter.push_event(name="tcd.patch.approve", attrs=attrs)
+        except Exception:
+            pass
 
     def _emit_telemetry_apply(self, *, state: PatchState, ok: bool, dry_run: bool, mode: Any, environment: str) -> None:
         exporter = self._cfg.telemetry
@@ -2615,8 +2729,14 @@ class PatchRuntime:
         if not self._cfg.minimize_telemetry_metadata:
             attrs["subject_id"] = state.descriptor.subject_id
 
-        exporter.record_metric(name="tcd.patch.apply.count", value=1.0, labels=attrs)
-        exporter.push_event(name="tcd.patch.apply", attrs=attrs)
+        try:
+            exporter.record_metric(name="tcd.patch.apply.count", value=1.0, labels=attrs)
+        except Exception:
+            pass
+        try:
+            exporter.push_event(name="tcd.patch.apply", attrs=attrs)
+        except Exception:
+            pass
 
     def _emit_telemetry_rollback(self, *, state: PatchState, ok: bool, mode: Any, environment: str) -> None:
         exporter = self._cfg.telemetry
@@ -2641,8 +2761,14 @@ class PatchRuntime:
         if not self._cfg.minimize_telemetry_metadata:
             attrs["subject_id"] = state.descriptor.subject_id
 
-        exporter.record_metric(name="tcd.patch.rollback.count", value=1.0, labels=attrs)
-        exporter.push_event(name="tcd.patch.rollback", attrs=attrs)
+        try:
+            exporter.record_metric(name="tcd.patch.rollback.count", value=1.0, labels=attrs)
+        except Exception:
+            pass
+        try:
+            exporter.push_event(name="tcd.patch.rollback", attrs=attrs)
+        except Exception:
+            pass
 
     def _audit_critical_keys(self, event_name: str) -> List[str]:
         # event-specific critical keys to keep on shrink

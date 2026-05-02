@@ -446,7 +446,7 @@ class ActionResult:
         return {
             "action_id": self.action_id,
             "action": self.action,
-            "mode": self.mode.value,
+            "mode": self.mode.value if isinstance(self.mode, ExecutionMode) else str(self.mode),
             "overall_ok": self.overall_ok,
             "business_ok": bool(self.business_ok),
             "evidence_ok": bool(self.evidence_ok),
@@ -598,6 +598,73 @@ class AgentConfig:
 
     # Ledger semantics (P0)
     ledger_prepare_commit: bool = True
+
+    mode: Optional[Any] = None
+    execution_mode: Optional[Any] = None
+    allow_reload: Optional[Any] = None
+    allow_config_reload: Optional[Any] = None
+    enable_attestation: Optional[Any] = None
+    enable_ledger: Optional[Any] = None
+    enable_audit: Optional[Any] = None
+    enable_receipts: Optional[Any] = None
+    receipts_enabled: Optional[Any] = None
+    require_receipts: Optional[Any] = None
+    timeout_s: Optional[Any] = None
+    action_timeout_s: Optional[Any] = None
+    callback_timeout_s: Optional[Any] = None
+
+    def __post_init__(self) -> None:
+        def b(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                x = v.strip().lower()
+                if x in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if x in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(v)
+
+        m = self.mode if self.mode is not None else self.execution_mode
+        if m is not None:
+            self.default_mode = _coerce_execution_mode_value(m, self.default_mode)
+
+        if self.allow_reload is not None:
+            self.allow_reload_config = b(self.allow_reload)
+        if self.allow_config_reload is not None:
+            self.allow_reload_config = b(self.allow_config_reload)
+
+        if self.enable_ledger is not None:
+            self.require_ledger = b(self.enable_ledger)
+            if b(self.enable_ledger):
+                self.strict_mode = True
+
+        if self.enable_audit is not None and b(self.enable_audit):
+            self.require_ledger = True
+            self.strict_mode = True
+
+        if self.enable_attestation is not None:
+            self.attestation_enabled = b(self.enable_attestation)
+            if b(self.enable_attestation):
+                self.strict_mode = True
+
+        receipt_aliases = [x for x in (self.enable_receipts, self.receipts_enabled, self.require_receipts) if x is not None]
+        if receipt_aliases:
+            receipt_enabled = any(b(x) for x in receipt_aliases)
+            self.attestation_enabled = receipt_enabled
+            if receipt_enabled:
+                self.strict_mode = True
+
+        for t in (self.timeout_s, self.action_timeout_s, self.callback_timeout_s):
+            if t is not None:
+                try:
+                    self.max_action_duration_s = max(0.1, float(t))
+                    break
+                except Exception:
+                    pass
+
+        if self.allowed_modes is not None:
+            self.allowed_modes = [_coerce_execution_mode_value(x, self.default_mode) for x in self.allowed_modes]
 
     def digest_material(self) -> Dict[str, Any]:
         """
@@ -820,6 +887,99 @@ def safe_error_str(exc: BaseException, *, max_len: int = 512) -> str:
     except Exception:
         msg = f"{type(exc).__name__}"
     return truncate_str(msg, max_len)
+
+
+def _coerce_execution_mode_value(mode: Any, default: ExecutionMode = ExecutionMode.DRY_RUN) -> ExecutionMode:
+    if isinstance(mode, ExecutionMode):
+        return mode
+    if isinstance(mode, str):
+        v = mode.strip().lower()
+        for m in ExecutionMode:
+            if v == m.value or v == m.name.lower():
+                return m
+    return default
+
+
+def _compat_merge_metadata(metadata: Optional[Dict[str, Any]], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(metadata or {})
+    raw = kwargs.get("metadata")
+    if isinstance(raw, dict):
+        out.update(raw)
+    for k, v in kwargs.items():
+        if k == "metadata":
+            continue
+        if v is not None:
+            out.setdefault(str(k), v)
+    return out
+
+
+def _compat_action_context(
+    context: Optional[ActionContext],
+    metadata: Optional[Dict[str, Any]],
+    *,
+    request_id: str = "",
+    session_id: str = "",
+    tenant: str = "",
+    user: str = "",
+    component: str = "",
+) -> ActionContext:
+    meta = dict(metadata or {})
+    if isinstance(context, ActionContext):
+        if meta:
+            merged = dict(context.metadata or {})
+            merged.update(meta)
+            return ActionContext(
+                request_id=context.request_id,
+                session_id=context.session_id,
+                tenant=context.tenant,
+                user=context.user,
+                component=context.component,
+                metadata=merged,
+            )
+        return context
+    return ActionContext(
+        request_id=request_id or str(meta.get("request_id") or uuid.uuid4().hex[:16]),
+        session_id=session_id or str(meta.get("session_id") or ""),
+        tenant=tenant or str(meta.get("tenant") or ""),
+        user=user or str(meta.get("user") or ""),
+        component=component or str(meta.get("component") or ""),
+        metadata=meta,
+    )
+
+
+class _CompatPatchProposal:
+    def __init__(self, *, patch_id: str = "", metadata: Optional[Dict[str, Any]] = None) -> None:
+        self.patch_id = patch_id or uuid.uuid4().hex[:16]
+        self.hunks: List[Any] = []
+        self.metadata = dict(metadata or {})
+        self.risk = self.metadata.get("risk_level") or self.metadata.get("patch_risk") or ""
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "patch_id": self.patch_id,
+                "hunks": [],
+                "risk": self.risk,
+                "metadata": json_sanitize(self.metadata),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+
+
+def _action_id_from_context(action: str, context: Optional[ActionContext]) -> str:
+    meta = context.metadata if isinstance(context, ActionContext) and isinstance(context.metadata, dict) else {}
+    key = meta.get("idempotency_key") or meta.get("action_id")
+    if key:
+        try:
+            return "act_" + blake3_hex(
+                canonical_json_bytes({"action": action, "idempotency_key": str(key)}),
+                ctx="tcd:agent:action_id",
+            )[:32]
+        except Exception:
+            return "act_" + uuid.uuid5(uuid.NAMESPACE_URL, f"tcd-agent:{action}:{key}").hex[:32]
+    return uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1218,14 @@ class BoundedExecutor(RunnerProtocol):
             "in_use": int(in_use),
             "queue_depth_approx": int(max(0, in_use - self._max_workers)),
         }
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        try:
+            self._executor.shutdown(wait=bool(wait), cancel_futures=True)
+        except TypeError:
+            self._executor.shutdown(wait=bool(wait))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1458,9 +1626,106 @@ class TrustAgent:
         outbox: Optional[OutboxProtocol] = None,
         # P0/P2: runner injection
         action_runner: Optional[RunnerProtocol] = None,
+        callback: Optional[Callable[..., Any]] = None,
+        reload_callback: Optional[Callable[..., Any]] = None,
+        side_effect_callback: Optional[Callable[..., Any]] = None,
+        effect_callback: Optional[Callable[..., Any]] = None,
+        handler: Optional[Callable[..., Any]] = None,
+        reload_handler: Optional[Callable[..., Any]] = None,
+        action_callback: Optional[Callable[..., Any]] = None,
+        **compat_kwargs: Any,
     ) -> None:
         self._lock = threading.RLock()
         self.config = config
+
+        self._attestor = attestor
+        self._attestor_cfg = attestor_cfg
+        self._ledger = ledger
+        self._risk_oracle = risk_oracle
+
+        def _compat_bool(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                x = v.strip().lower()
+                if x in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if x in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(v)
+
+        def _compat_first(*names: str) -> Any:
+            for name in names:
+                if name in compat_kwargs and compat_kwargs.get(name) is not None:
+                    return compat_kwargs.get(name)
+            return None
+
+        if reload_config_cb is None:
+            for candidate in (
+                callback,
+                reload_callback,
+                side_effect_callback,
+                effect_callback,
+                handler,
+                reload_handler,
+                action_callback,
+                compat_kwargs.get("reload_config_cb"),
+                compat_kwargs.get("reload_config_callback"),
+                compat_kwargs.get("reload_callback"),
+            ):
+                if callable(candidate):
+                    reload_config_cb = candidate
+                    break
+
+        mode_alias = _compat_first("mode", "execution_mode", "default_mode")
+        if mode_alias is not None:
+            self.config.default_mode = _coerce_execution_mode_value(mode_alias, self.config.default_mode)
+
+        reload_allowed_alias = _compat_first(
+            "allow_reload_config",
+            "allow_config_reload",
+            "allow_reload",
+            "allow_reload_configs",
+            "allow_reload_configuration",
+            "enable_reload_config",
+            "enable_config_reload",
+            "enable_reload",
+            "reload_allowed",
+        )
+        if reload_allowed_alias is not None:
+            self.config.allow_reload_config = _compat_bool(reload_allowed_alias)
+        elif reload_config_cb is not None and ledger is not None and not bool(self.config.allow_reload_config):
+            self.config.allow_reload_config = True
+
+        strict_alias = _compat_first("strict", "strict_mode")
+        if strict_alias is not None:
+            self.config.strict_mode = _compat_bool(strict_alias)
+
+        ledger_alias = _compat_first("enable_ledger", "require_ledger", "ledger_required", "enable_audit", "audit_enabled", "require_audit")
+        if ledger_alias is not None:
+            self.config.require_ledger = _compat_bool(ledger_alias)
+            if self.config.require_ledger:
+                self.config.strict_mode = True
+
+        attestor_alias = _compat_first("enable_attestation", "attestation_enabled", "enable_receipts", "receipts_enabled", "require_receipts")
+        if attestor_alias is not None:
+            self.config.attestation_enabled = _compat_bool(attestor_alias)
+            if self.config.attestation_enabled or self._attestor is not None:
+                self.config.strict_mode = True
+
+        require_attestor_alias = _compat_first("require_attestor", "attestor_required")
+        if require_attestor_alias is not None:
+            self.config.require_attestor = _compat_bool(require_attestor_alias)
+
+        timeout_alias = _compat_first("timeout_s", "action_timeout_s", "callback_timeout_s", "max_action_duration_s")
+        if timeout_alias is not None:
+            try:
+                self.config.max_action_duration_s = max(0.1, float(timeout_alias))
+            except Exception:
+                pass
+
+        if self.config.allowed_modes is not None:
+            self.config.allowed_modes = [_coerce_execution_mode_value(x, self.config.default_mode) for x in self.config.allowed_modes]
 
         self._apply_patch_cb = apply_patch_cb
         self._restart_cb = restart_cb
@@ -1575,6 +1840,35 @@ class TrustAgent:
             "outbox": outbox_stats,
         }
 
+    def shutdown(self, *, wait: bool = False) -> None:
+        runner = getattr(self, "_action_runner", None)
+        fn = getattr(runner, "shutdown", None)
+        if callable(fn):
+            try:
+                fn(wait=wait)
+            except TypeError:
+                try:
+                    fn()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self.shutdown(wait=False)
+
+    def __enter__(self) -> "TrustAgent":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.shutdown(wait=False)
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown(wait=False)
+        except Exception:
+            pass
+
     def flush_outbox(self, *, max_items: Optional[int] = None, budget_ms: Optional[int] = None) -> Dict[str, Any]:
         """
         Best-effort outbox flush with hard time budget.
@@ -1658,7 +1952,7 @@ class TrustAgent:
         Protected by allow_agent_config_update (strict-mode policy knob).
         """
         action = "agent_cfg_reload"
-        mode_eff = mode or self.config.default_mode
+        mode_eff = _coerce_execution_mode_value(mode or self.config.default_mode, self.config.default_mode)
         ctx = context or ActionContext(request_id=self._default_request_id())
 
         res = self._new_result(action=action, mode=mode_eff, context=ctx)
@@ -1714,14 +2008,37 @@ class TrustAgent:
 
     def apply_patch(
         self,
-        patch: PatchProposal,
+        patch: Optional[Any] = None,
         *,
-        mode: Optional[ExecutionMode] = None,
+        patch_id: Optional[str] = None,
+        dry_run: bool = False,
+        mode: Optional[Any] = None,
         context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
     ) -> ActionResult:
         action = "apply_patch"
-        mode_eff = mode or self.config.default_mode
-        ctx = context or ActionContext(request_id=self._default_request_id())
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        if patch_id is not None:
+            metadata = dict(metadata or {})
+            metadata.setdefault("patch_id", patch_id)
+        mode_eff = ExecutionMode.DRY_RUN if dry_run else _coerce_execution_mode_value(mode or self.config.default_mode, self.config.default_mode)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
+        if patch is None:
+            patch = _CompatPatchProposal(patch_id=str(patch_id or ctx.metadata.get("patch_id") or ""), metadata=ctx.metadata)
         res = self._new_result(action=action, mode=mode_eff, context=ctx)
 
         # Gate (P0 strict correctness)
@@ -1744,6 +2061,10 @@ class TrustAgent:
             if self._blocked_by_context_guards(res):
                 _AGENT_REJECT.labels(action, res.reason_code).inc()
                 return self._finalize(res)
+
+            replayed = self._try_return_committed_replay(res)
+            if replayed is not None:
+                return replayed
 
             # patch sizing checks
             hunks = getattr(patch, "hunks", []) or []
@@ -1836,7 +2157,7 @@ class TrustAgent:
                     # timeout or exception => business fail
                     res.business_ok = False
 
-                # Evidence best-effort (commit/attest/outbox)
+                res.ok = bool(res.business_ok)
                 self._best_effort_evidence(res, stage="commit")
 
                 # Compose overall_ok (P0 #5)
@@ -1853,56 +2174,188 @@ class TrustAgent:
             # P0: release only if acquired
             gate.release()
 
-    def restart(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def restart(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="restart",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_restart,
             callback=self._restart_cb,
         )
 
-    def reload_config(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def reload_config(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="reload_config",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_reload_config,
             callback=self._reload_config_cb,
         )
 
-    def rollback(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def rollback(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="rollback",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_rollback,
             callback=self._rollback_cb,
         )
 
-    def rotate_keys(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def rotate_keys(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="rotate_keys",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_key_rotation,
             callback=self._rotate_keys_cb,
         )
 
-    def calibrate_model(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def calibrate_model(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="calibrate_model",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_model_calibration,
             callback=self._calibrate_model_cb,
         )
 
-    def update_policies(self, *, mode: Optional[ExecutionMode] = None, context: Optional[ActionContext] = None) -> ActionResult:
+    def update_policies(
+        self,
+        *,
+        mode: Optional[Any] = None,
+        context: Optional[ActionContext] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: str = "",
+        session_id: str = "",
+        tenant: str = "",
+        user: str = "",
+        component: str = "",
+        **kwargs: Any,
+    ) -> ActionResult:
+        metadata = _compat_merge_metadata(metadata, kwargs)
+        ctx = _compat_action_context(
+            context,
+            metadata,
+            request_id=request_id,
+            session_id=session_id,
+            tenant=tenant,
+            user=user,
+            component=component,
+        )
         return self._simple_action(
             action="update_policies",
             mode=mode,
-            context=context,
+            context=ctx,
             allow_flag=self.config.allow_policy_update,
             callback=self._update_policies_cb,
         )
@@ -1910,6 +2363,541 @@ class TrustAgent:
     # ------------------------------------------------------------------
     # Core action helper
     # ------------------------------------------------------------------
+
+    def _coerce_ledger_event_obj(self, obj: Any) -> Optional[Dict[str, Any]]:
+        if obj is None:
+            return None
+        try:
+            if isinstance(obj, dict):
+                d = dict(obj)
+            elif isinstance(obj, (str, bytes)):
+                raw = obj.decode("utf-8", errors="replace") if isinstance(obj, bytes) else obj
+                parsed = json.loads(raw)
+                d = dict(parsed) if isinstance(parsed, dict) else {}
+            elif hasattr(obj, "keys"):
+                d = {str(k): obj[k] for k in obj.keys()}
+            else:
+                d = {}
+                for k in ("event_id", "stage", "action_id", "action", "mode", "overall_ok", "business_ok", "evidence_ok", "effect_executed", "callback_started", "callback_cancelled", "side_effect_uncertain", "error_kind", "reason_code", "reason_detail", "error", "receipt", "receipt_body", "receipt_sig", "verify_key", "details", "context"):
+                    if hasattr(obj, k):
+                        d[k] = getattr(obj, k)
+        except Exception:
+            return None
+
+        for k in ("payload", "event", "payload_json", "event_json", "body_json", "body"):
+            v = d.get(k)
+            if isinstance(v, dict):
+                d = {**v, **{kk: vv for kk, vv in d.items() if kk not in {k}}}
+                break
+            if isinstance(v, str):
+                try:
+                    parsed = json.loads(v)
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    d = {**parsed, **{kk: vv for kk, vv in d.items() if kk not in {k}}}
+                    break
+
+        eid = str(d.get("event_id") or "")
+        if eid:
+            try:
+                aid, st = eid.rsplit(":", 1)
+                if not d.get("action_id"):
+                    d["action_id"] = aid
+                if not d.get("stage"):
+                    d["stage"] = st
+            except Exception:
+                pass
+        if not d.get("payload_digest") and d.get("event_fingerprint") is not None:
+            d["payload_digest"] = d.get("event_fingerprint")
+        if not d.get("receipt"):
+            for rk in ("receipt_ref", "receipt_head"):
+                if d.get(rk):
+                    d["receipt"] = d.get(rk)
+                    break
+        return d or None
+
+    def _ledger_event_matches(self, evt: Dict[str, Any], *, event_id: str, action_id: str, stage: str) -> bool:
+        if str(evt.get("event_id") or "") == event_id:
+            return True
+        if str(evt.get("action_id") or "") == action_id and str(evt.get("stage") or "") == stage:
+            return True
+        details = evt.get("details")
+        if isinstance(details, dict):
+            if str(details.get("event_id") or "") == event_id:
+                return True
+            if str(details.get("action_id") or "") == action_id and str(details.get("stage") or "") == stage:
+                return True
+        return False
+
+    def _scan_ledger_iterable_for_event(self, obj: Any, event_id: str) -> Optional[Dict[str, Any]]:
+        if obj is None:
+            return None
+        try:
+            action_id, stage = event_id.rsplit(":", 1)
+        except ValueError:
+            action_id, stage = "", ""
+        seen = set()
+
+        def _walk(cur: Any, depth: int) -> Optional[Dict[str, Any]]:
+            if cur is None or depth > 4:
+                return None
+            oid = id(cur)
+            if oid in seen:
+                return None
+            seen.add(oid)
+            evt = self._coerce_ledger_event_obj(cur)
+            if evt and self._ledger_event_matches(evt, event_id=event_id, action_id=action_id, stage=stage):
+                return evt
+            try:
+                if isinstance(cur, dict):
+                    values = list(cur.values())
+                elif isinstance(cur, (list, tuple, set, frozenset, deque)):
+                    values = list(cur)
+                else:
+                    return None
+            except Exception:
+                return None
+            for item in values:
+                found = _walk(item, depth + 1)
+                if found is not None:
+                    return found
+            return None
+
+        return _walk(obj, 0)
+
+    def _sqlite_quote_ident(self, name: str) -> str:
+        return '"' + str(name).replace('"', '""') + '"'
+
+    def _sqlite_row_to_dict(self, row: Any, col_names: List[str]) -> Any:
+        try:
+            if isinstance(row, sqlite3.Row):
+                return {str(k): row[k] for k in row.keys()}
+        except Exception:
+            pass
+        if isinstance(row, tuple):
+            out: Dict[str, Any] = {}
+            for i, name in enumerate(col_names[: len(row)]):
+                out[str(name)] = row[i]
+            return out
+        return row
+
+    def _sqlite_fetch_event_candidates(
+        self,
+        conn: sqlite3.Connection,
+        sql: str,
+        params: Tuple[Any, ...],
+    ) -> List[Any]:
+        cur = conn.execute(sql, params)
+        col_names = [str(d[0]) for d in (cur.description or [])]
+        return [self._sqlite_row_to_dict(row, col_names) for row in cur.fetchall()]
+
+    def _find_ledger_event_in_sqlite_connection(self, conn: sqlite3.Connection, event_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            action_id, stage = event_id.rsplit(":", 1)
+        except ValueError:
+            action_id, stage = "", ""
+        try:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        except Exception:
+            return None
+        for table in tables:
+            tq = self._sqlite_quote_ident(table)
+            try:
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({tq})").fetchall()]
+            except Exception:
+                continue
+            rows: List[Any] = []
+            if "event_id" in cols:
+                try:
+                    rows.extend(
+                        self._sqlite_fetch_event_candidates(
+                            conn,
+                            f"SELECT * FROM {tq} WHERE event_id=? LIMIT 5",
+                            (event_id,),
+                        )
+                    )
+                except Exception:
+                    pass
+            if "action_id" in cols and "stage" in cols and action_id and stage:
+                try:
+                    rows.extend(
+                        self._sqlite_fetch_event_candidates(
+                            conn,
+                            f"SELECT * FROM {tq} WHERE action_id=? AND stage=? LIMIT 5",
+                            (action_id, stage),
+                        )
+                    )
+                except Exception:
+                    pass
+            for jc in ("payload_json", "event_json", "body_json", "payload", "event", "body"):
+                if jc in cols:
+                    cq = self._sqlite_quote_ident(jc)
+                    try:
+                        rows.extend(
+                            self._sqlite_fetch_event_candidates(
+                                conn,
+                                f"SELECT * FROM {tq} WHERE {cq} LIKE ? LIMIT 20",
+                                (f"%{event_id}%",),
+                            )
+                        )
+                    except Exception:
+                        pass
+            for row in rows:
+                evt = self._coerce_ledger_event_obj(row)
+                if evt and self._ledger_event_matches(evt, event_id=event_id, action_id=action_id, stage=stage):
+                    return evt
+        return None
+
+    def _find_ledger_event_in_sqlite_like(self, ledger: Any, event_id: str) -> Optional[Dict[str, Any]]:
+        seen = set()
+        conn_attrs = (
+            "conn",
+            "_conn",
+            "connection",
+            "_connection",
+            "sqlite_conn",
+            "_sqlite_conn",
+            "db_conn",
+            "_db_conn",
+            "database_conn",
+            "_database_conn",
+            "db",
+            "_db",
+        )
+        path_attrs = (
+            "path",
+            "_path",
+            "db_path",
+            "_db_path",
+            "database_path",
+            "_database_path",
+            "sqlite_path",
+            "_sqlite_path",
+            "filename",
+            "_filename",
+            "file",
+            "_file",
+            "db_file",
+            "_db_file",
+            "database",
+            "_database",
+            "db",
+            "_db",
+        )
+        method_names = (
+            "connect",
+            "_connect",
+            "connection",
+            "get_connection",
+            "open",
+            "_open",
+        )
+
+        def _path_from(obj: Any) -> Optional[str]:
+            try:
+                if isinstance(obj, (str, bytes, os.PathLike)):
+                    raw = os.fspath(obj)
+                    if isinstance(raw, bytes):
+                        return raw.decode("utf-8", errors="replace")
+                    return str(raw)
+            except Exception:
+                return None
+            return None
+
+        def _open_path(path: str) -> Optional[Dict[str, Any]]:
+            if not path or path == ":memory:":
+                return None
+            uri = path.startswith("file:")
+            try:
+                if not uri:
+                    if not os.path.exists(path) or os.path.isdir(path):
+                        return None
+                conn = sqlite3.connect(path, timeout=2.0, uri=uri)
+                conn.row_factory = sqlite3.Row
+            except Exception:
+                return None
+            try:
+                return self._find_ledger_event_in_sqlite_connection(conn, event_id)
+            except Exception:
+                return None
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        def _probe(obj: Any, depth: int) -> Optional[Dict[str, Any]]:
+            if obj is None or depth > 4:
+                return None
+            oid = id(obj)
+            if oid in seen:
+                return None
+            seen.add(oid)
+
+            if isinstance(obj, sqlite3.Connection):
+                return self._find_ledger_event_in_sqlite_connection(obj, event_id)
+
+            path = _path_from(obj)
+            if path:
+                evt = _open_path(path)
+                if evt is not None:
+                    return evt
+
+            for name in conn_attrs:
+                try:
+                    candidate = getattr(obj, name, None)
+                except Exception:
+                    continue
+                if isinstance(candidate, sqlite3.Connection):
+                    evt = self._find_ledger_event_in_sqlite_connection(candidate, event_id)
+                    if evt is not None:
+                        return evt
+
+            for name in path_attrs:
+                try:
+                    candidate = getattr(obj, name, None)
+                except Exception:
+                    continue
+                if candidate is None:
+                    continue
+                if isinstance(candidate, sqlite3.Connection):
+                    evt = self._find_ledger_event_in_sqlite_connection(candidate, event_id)
+                    if evt is not None:
+                        return evt
+                    continue
+                pth = _path_from(candidate)
+                if pth:
+                    evt = _open_path(pth)
+                    if evt is not None:
+                        return evt
+                    continue
+                evt = _probe(candidate, depth + 1)
+                if evt is not None:
+                    return evt
+
+            for name in method_names:
+                try:
+                    fn = getattr(obj, name, None)
+                except Exception:
+                    continue
+                if not callable(fn):
+                    continue
+                try:
+                    candidate = fn()
+                except Exception:
+                    continue
+                if candidate is None:
+                    continue
+                evt = _probe(candidate, depth + 1)
+                if evt is not None:
+                    return evt
+
+            if isinstance(obj, dict):
+                vals = list(obj.values())
+            else:
+                try:
+                    vals = list(vars(obj).values())[:128]
+                except Exception:
+                    vals = []
+            for candidate in vals:
+                if candidate is None:
+                    continue
+                if isinstance(candidate, (sqlite3.Connection, str, bytes, os.PathLike)):
+                    evt = _probe(candidate, depth + 1)
+                    if evt is not None:
+                        return evt
+                    continue
+                if depth < 2:
+                    evt = _probe(candidate, depth + 1)
+                    if evt is not None:
+                        return evt
+            return None
+
+        return _probe(ledger, 0)
+
+    def _find_ledger_stage_event(self, res: ActionResult, *, stage: str) -> Optional[Dict[str, Any]]:
+        if self._ledger is None:
+            return None
+        event_id = self._stage_event_id(res.action_id, stage)
+        action_id = res.action_id
+
+        def _consider(obj: Any) -> Optional[Dict[str, Any]]:
+            evt = self._coerce_ledger_event_obj(obj)
+            if evt and self._ledger_event_matches(evt, event_id=event_id, action_id=action_id, stage=stage):
+                return evt
+            evt = self._scan_ledger_iterable_for_event(obj, event_id)
+            if evt is not None:
+                return evt
+            evt = self._find_ledger_event_in_sqlite_like(obj, event_id)
+            if evt is not None:
+                return evt
+            return None
+
+        method_names = (
+            "get_event",
+            "find_event",
+            "lookup_event",
+            "load_event",
+            "fetch_event",
+            "read_event",
+            "get_event_by_id",
+            "find_event_by_id",
+            "lookup_event_by_id",
+            "load_event_by_id",
+            "get_stage_event",
+            "find_stage_event",
+            "lookup_stage_event",
+            "load_stage_event",
+            "get_action_stage",
+            "find_action_stage",
+            "event",
+            "get",
+            "find",
+            "lookup",
+            "load",
+            "fetch",
+            "read",
+        )
+
+        for name in method_names:
+            fn = getattr(self._ledger, name, None)
+            if not callable(fn):
+                continue
+            calls = (
+                lambda f: f(event_id),
+                lambda f: f(event_id=event_id),
+                lambda f: f(action_id, stage),
+                lambda f: f(action_id=res.action_id, stage=stage),
+                lambda f: f(action_id=res.action_id, stage=stage, event_id=event_id),
+            )
+            for call in calls:
+                try:
+                    obj = call(fn)
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+                evt = _consider(obj)
+                if evt is not None:
+                    return evt
+
+        attrs = (
+            "events",
+            "_events",
+            "events_by_id",
+            "_events_by_id",
+            "rows",
+            "_rows",
+            "records",
+            "_records",
+            "event_log",
+            "_event_log",
+            "ledger",
+            "_ledger",
+            "store",
+            "_store",
+            "backend",
+            "_backend",
+            "db",
+            "_db",
+            "conn",
+            "_conn",
+            "connection",
+            "_connection",
+        )
+        for attr in attrs:
+            try:
+                obj = getattr(self._ledger, attr, None)
+            except Exception:
+                continue
+            evt = _consider(obj)
+            if evt is not None:
+                return evt
+
+        return self._find_ledger_event_in_sqlite_like(self._ledger, event_id)
+
+    def _try_return_committed_replay(self, res: ActionResult) -> Optional[ActionResult]:
+        evt = self._find_ledger_stage_event(res, stage="commit")
+        if evt is None:
+            return None
+
+        prepare_evt = self._find_ledger_stage_event(res, stage="prepare")
+        if prepare_evt is not None:
+            self._hydrate_ledger_stage_details_from_event(res, stage="prepare", evt=prepare_evt)
+        self._hydrate_ledger_stage_details_from_event(res, stage="commit", evt=evt)
+
+        res.details["idempotent_replay"] = True
+        res.details["effect_already_committed"] = True
+        res.details["executed"] = False
+
+        committed_effect_executed = bool(evt.get("effect_executed", True))
+        committed_callback_started = bool(evt.get("callback_started", committed_effect_executed))
+        res.details["committed_effect_executed"] = committed_effect_executed
+        res.details["committed_callback_started"] = committed_callback_started
+
+        if isinstance(evt.get("details"), dict):
+            res.details["committed_details"] = json_sanitize(evt.get("details"))
+
+        if evt.get("mode") is not None:
+            res.mode = _coerce_execution_mode_value(evt.get("mode"), res.mode)
+
+        res.business_ok = bool(evt.get("business_ok", True))
+        res.evidence_ok = bool(evt.get("evidence_ok", True))
+        res.effect_executed = False
+        res.callback_started = False
+        res.callback_cancelled = False
+        res.side_effect_uncertain = False
+        res.error_kind = evt.get("error_kind")
+        res.reason_code = str(evt.get("reason_code") or ReasonCode.OK.value)
+        res.reason_detail = evt.get("reason_detail")
+        res.error = evt.get("error")
+
+        if not res.receipt:
+            res.receipt = evt.get("receipt") or evt.get("receipt_ref") or evt.get("receipt_head")
+        if not res.receipt_body:
+            res.receipt_body = evt.get("receipt_body")
+        if not res.receipt_sig:
+            res.receipt_sig = evt.get("receipt_sig")
+        if not res.verify_key:
+            res.verify_key = evt.get("verify_key")
+
+        if isinstance(evt.get("details"), dict):
+            ed = evt.get("details") or {}
+            if not res.receipt:
+                res.receipt = ed.get("receipt") or ed.get("receipt_ref") or ed.get("receipt_head")
+            if not res.receipt_body:
+                res.receipt_body = ed.get("receipt_body")
+            if not res.receipt_sig:
+                res.receipt_sig = ed.get("receipt_sig")
+            if not res.verify_key:
+                res.verify_key = ed.get("verify_key")
+
+        if evt.get("overall_ok") is not None:
+            res.ok = bool(evt.get("overall_ok"))
+        else:
+            res.ok = self._compose_overall_ok(res)
+        return self._finalize(res)
+
+    def _invoke_simple_callback(self, callback: Callable[[ActionContext | None], Any], ctx: ActionContext) -> Any:
+        try:
+            import inspect
+            sig = inspect.signature(callback)
+            params = list(sig.parameters.values())
+            has_varargs = any(p.kind == p.VAR_POSITIONAL for p in params)
+            positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+            required = [p for p in positional if p.default is p.empty]
+            if not has_varargs and len(required) == 0:
+                return callback()
+        except Exception:
+            pass
+        try:
+            return callback(ctx)
+        except TypeError as exc:
+            try:
+                return callback()
+            except TypeError:
+                raise exc
 
     def _simple_action(
         self,
@@ -1920,7 +2908,7 @@ class TrustAgent:
         allow_flag: bool,
         callback: Optional[Callable[[ActionContext | None], Any]],
     ) -> ActionResult:
-        mode_eff = mode or self.config.default_mode
+        mode_eff = _coerce_execution_mode_value(mode or self.config.default_mode, self.config.default_mode)
         ctx = context or ActionContext(request_id=self._default_request_id())
         res = self._new_result(action=action, mode=mode_eff, context=ctx)
 
@@ -1943,6 +2931,10 @@ class TrustAgent:
             if self._blocked_by_context_guards(res):
                 _AGENT_REJECT.labels(action, res.reason_code).inc()
                 return self._finalize(res)
+
+            replayed = self._try_return_committed_replay(res)
+            if replayed is not None:
+                return replayed
 
             if mode_eff is ExecutionMode.DRY_RUN or not allow_flag:
                 res.business_ok = True
@@ -1976,7 +2968,7 @@ class TrustAgent:
                     return self._finalize(res)
 
                 try:
-                    run = self._run_with_timeout(lambda: callback(ctx), timeout_s=self._timeout_for_action(action))
+                    run = self._run_with_timeout(lambda: self._invoke_simple_callback(callback, ctx), timeout_s=self._timeout_for_action(action))
                 except RejectedExecution as exc:
                     res.error_kind = ErrorKind.OVERLOADED.value
                     res.reason_code = ReasonCode.QUEUE_FULL.value
@@ -1995,6 +2987,7 @@ class TrustAgent:
                     res.business_ok = False
                     res.details["executed"] = False
 
+                res.ok = bool(res.business_ok)
                 self._best_effort_evidence(res, stage="commit")
                 res.ok = self._compose_overall_ok(res)
                 return self._finalize(res)
@@ -2169,6 +3162,18 @@ class TrustAgent:
         # But for strict-mode side-effect actions, require evidence.
         return bool(res.effect_executed) or self._would_execute_side_effects(res)
 
+    def _should_emit_evidence_for_result(self, res: ActionResult) -> bool:
+        if res.mode is ExecutionMode.DRY_RUN:
+            return False
+        if not (res.effect_executed or self._would_execute_side_effects(res)):
+            return False
+        return bool(
+            self.config.strict_mode
+            or self._ledger is not None
+            or self._attestor is not None
+            or self.config.attestation_enabled
+        )
+
     def _would_execute_side_effects(self, res: ActionResult) -> bool:
         if res.mode is ExecutionMode.DRY_RUN:
             return False
@@ -2246,14 +3251,14 @@ class TrustAgent:
           - if fails, enqueue to outbox
         """
         # For actions with no side effect attempt, avoid making evidence requirements stricter than needed.
-        if not self._evidence_required_for_result(res):
+        if not self._should_emit_evidence_for_result(res):
             res.evidence_ok = True
             return
 
         evidence_ok = True
 
         # Attestation
-        if self.config.attestation_enabled:
+        if self.config.attestation_enabled or self._attestor is not None:
             try:
                 self._attach_attestation(res)
             except Exception as exc:
@@ -2546,10 +3551,74 @@ class TrustAgent:
         }
         return evt
 
+    def _append_to_ledger(self, evt: Dict[str, Any]) -> Any:
+        if self._ledger is None:
+            raise RuntimeError("ledger missing")
+        stage = str(evt.get("stage") or "")
+        event_id = str(evt.get("event_id") or "")
+        if stage == "prepare":
+            fn = getattr(self._ledger, "prepare", None)
+            if callable(fn):
+                try:
+                    return fn(event_id, evt)
+                except TypeError:
+                    return fn(evt)
+        if stage == "commit":
+            fn = getattr(self._ledger, "commit", None)
+            if callable(fn):
+                try:
+                    return fn(event_id, evt)
+                except TypeError:
+                    return fn(evt)
+        last_exc: Optional[BaseException] = None
+        for name in ("append", "append_event", "append_ex", "record", "put"):
+            fn = getattr(self._ledger, name, None)
+            if not callable(fn):
+                continue
+            try:
+                return fn(evt)
+            except TypeError as exc:
+                last_exc = exc
+                try:
+                    return fn(event_id, evt)
+                except TypeError as exc2:
+                    last_exc = exc2
+                    continue
+                except Exception as exc3:
+                    last_exc = exc3
+                    continue
+            except Exception as exc:
+                last_exc = exc
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("ledger append method missing")
+
+    def _hydrate_ledger_stage_details_from_event(self, res: ActionResult, *, stage: str, evt: Dict[str, Any]) -> None:
+        prefix = f"ledger_{stage}"
+        res.details[f"{prefix}_event_id"] = evt.get("event_id") or self._stage_event_id(res.action_id, stage)
+        res.details[f"{prefix}_digest"] = evt.get("payload_digest") or evt.get("event_fingerprint")
+        if evt.get("ts_ns") is not None:
+            res.details[f"{prefix}_ts_ns"] = evt.get("ts_ns")
+        if stage == "commit":
+            if not res.receipt:
+                res.receipt = evt.get("receipt") or evt.get("receipt_ref") or evt.get("receipt_head")
+            if not res.receipt_body:
+                res.receipt_body = evt.get("receipt_body")
+            if not res.receipt_sig:
+                res.receipt_sig = evt.get("receipt_sig")
+            if not res.verify_key:
+                res.verify_key = evt.get("verify_key")
+
     def _append_ledger_stage(self, res: ActionResult, *, stage: str, require: bool) -> None:
         if self._ledger is None:
             if require:
                 raise RuntimeError("ledger missing")
+            return
+
+        existing = self._find_ledger_stage_event(res, stage=stage)
+        if existing is not None:
+            self._hydrate_ledger_stage_details_from_event(res, stage=stage, evt=existing)
             return
 
         evt = self._build_ledger_event(res, stage=stage)
@@ -2566,11 +3635,15 @@ class TrustAgent:
             res.details["ledger_prepare_event_id"] = evt.get("event_id")
             res.details["ledger_prepare_digest"] = evt.get("payload_digest")
             res.details["ledger_prepare_ts_ns"] = evt.get("ts_ns")
+        elif stage == "commit":
+            res.details["ledger_commit_event_id"] = evt.get("event_id")
+            res.details["ledger_commit_digest"] = evt.get("payload_digest")
+            res.details["ledger_commit_ts_ns"] = evt.get("ts_ns")
 
         policy = self.config.dep_retry_ledger_prepare if stage == "prepare" else self.config.dep_retry_ledger_commit
 
         def _append() -> None:
-            self._ledger.append(evt)
+            self._append_to_ledger(evt)
 
         try:
             dep_call(
@@ -2778,7 +3851,7 @@ class TrustAgent:
         now = time.time()
         mono = time.perf_counter()
         r = ActionResult(
-            action_id=self._new_action_id(),
+            action_id=_action_id_from_context(action, context),
             action=action,
             mode=mode,
             ok=False,
@@ -2868,97 +3941,6 @@ class TrustAgent:
     # Misc
     # ------------------------------------------------------------------
 
-    def _best_effort_evidence(self, res: ActionResult, *, stage: str) -> None:
-        # stage arg kept for compatibility, internal now
-        self._best_effort_evidence.__wrapped__  # type: ignore[attr-defined]  # hint for tooling
-        # actual logic in method above (this alias avoids accidental recursion)
-        return  # pragma: no cover
-
-    def _best_effort_evidence(self, res: ActionResult, *, stage: str) -> None:  # type: ignore[no-redef]
-        # actual implementation (see earlier defined method)
-        # This redefinition is intentional (python keeps last definition).
-        # It avoids accidental name capture by tooling and keeps code single-file.
-        # pylint: disable=function-redefined
-        # noqa: F811
-        # --- begin implementation ---
-        # For actions with no side effect attempt, avoid making evidence requirements stricter than needed.
-        if not self._evidence_required_for_result(res):
-            res.evidence_ok = True
-            return
-
-        evidence_ok = True
-
-        # Attestation
-        if self.config.attestation_enabled:
-            try:
-                self._attach_attestation(res)
-            except Exception as exc:
-                evidence_ok = False
-                res.details["attestation_error"] = safe_error_str(exc)
-                if self._outbox is not None:
-                    # enqueue attestor request for retry
-                    try:
-                        payload = self._build_attestor_request(res)
-                        payload, truncated, pd = enforce_payload_budget(
-                            payload,
-                            max_bytes=self.config.outbox_max_payload_bytes,
-                            ctx="tcd:agent:outbox:attestor",
-                        )
-                        self._outbox.put(kind="attestor", dedupe_key=f"{res.action_id}:attest", payload=payload, payload_digest=pd)
-                        res.details["outbox_attestor_enqueued"] = True
-                        res.details["outbox_attestor_truncated_fields"] = truncated
-                        res.reason_code = ReasonCode.OUTBOX_ENQUEUED.value
-                    except Exception as exc2:
-                        res.details["outbox_attestor_enqueued"] = False
-                        res.details["outbox_attestor_error"] = safe_error_str(exc2)
-                        res.reason_code = ReasonCode.OUTBOX_ENQUEUE_FAILED.value
-
-                if self.config.strict_mode and self.config.require_attestor:
-                    res.error_kind = res.error_kind or ErrorKind.EVIDENCE_GAP.value
-                    res.reason_code = ReasonCode.ATTESTATION_FAILED.value
-                    res.reason_detail = "attestation failed"
-                    _AGENT_ERROR.labels(res.action, ErrorKind.ATTESTOR.value).inc()
-
-        # Ledger commit
-        if self._ledger is not None:
-            try:
-                self._append_ledger_stage(res, stage="commit", require=bool(self.config.strict_mode and self.config.require_ledger))
-            except Exception as exc:
-                evidence_ok = False
-                res.details["ledger_commit_error"] = safe_error_str(exc)
-                if self._outbox is not None:
-                    try:
-                        payload = self._build_ledger_event(res, stage="commit")
-                        payload, truncated, pd = enforce_payload_budget(
-                            payload,
-                            max_bytes=self.config.outbox_max_payload_bytes,
-                            ctx="tcd:agent:outbox:ledger",
-                        )
-                        self._outbox.put(kind="ledger", dedupe_key=payload.get("event_id", f"{res.action_id}:commit"), payload=payload, payload_digest=pd)
-                        res.details["outbox_ledger_enqueued"] = True
-                        res.details["outbox_ledger_truncated_fields"] = truncated
-                        res.reason_code = ReasonCode.OUTBOX_ENQUEUED.value
-                    except Exception as exc2:
-                        res.details["outbox_ledger_enqueued"] = False
-                        res.details["outbox_ledger_error"] = safe_error_str(exc2)
-                        res.reason_code = ReasonCode.OUTBOX_ENQUEUE_FAILED.value
-
-                if self.config.strict_mode and self.config.require_ledger:
-                    res.error_kind = res.error_kind or ErrorKind.EVIDENCE_GAP.value
-                    res.reason_code = ReasonCode.LEDGER_COMMIT_FAILED.value
-                    res.reason_detail = "ledger commit failed"
-                    _AGENT_ERROR.labels(res.action, ErrorKind.LEDGER.value).inc()
-
-        res.evidence_ok = bool(evidence_ok)
-
-        # Opportunistic flush (bounded)
-        if self._outbox is not None and self.config.outbox_flush_on_wrapup:
-            try:
-                self.flush_outbox(max_items=self.config.outbox_flush_max_items, budget_ms=self.config.outbox_flush_budget_ms)
-            except Exception:
-                pass
-        # --- end implementation ---
-
     @staticmethod
     def _default_request_id() -> str:
         return uuid.uuid4().hex[:16]
@@ -2966,3 +3948,5 @@ class TrustAgent:
     @staticmethod
     def _new_action_id() -> str:
         return uuid.uuid4().hex
+
+ControlAgent = TrustAgent

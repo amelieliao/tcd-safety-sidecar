@@ -1,0 +1,131 @@
+{
+  "policyset_ref": "tcd-local-security-policyset@v1",
+  "rules": [
+    {
+      "action_hint": "block",
+      "attach_policy_refs": true,
+      "audit_force_on_violation": true,
+      "audit_label": "security",
+      "audit_require_full_trace": true,
+      "audit_sample_rate": 1.0,
+      "compliance_profile": "strict",
+      "decision": "deny",
+      "enable_receipts": false,
+      "enable_verify_metrics": true,
+      "enforcement": "block",
+      "match": {
+        "route": "admin",
+        "trust_zone": "internet"
+      },
+      "name": "block-internet-admin",
+      "policy_ref": "policy:block-internet-admin@v1",
+      "priority": 1000,
+      "risk_label": "critical",
+      "route_profile": "restricted",
+      "token_cost_divisor": 50.0,
+      "version": "1"
+    },
+    {
+      "action_hint": "block",
+      "attach_policy_refs": true,
+      "audit_force_on_violation": true,
+      "audit_label": "security",
+      "audit_require_full_trace": true,
+      "audit_sample_rate": 1.0,
+      "compliance_profile": "strict",
+      "decision": "deny",
+      "enable_receipts": false,
+      "enable_verify_metrics": true,
+      "enforcement": "block",
+      "match": {
+        "route": "control",
+        "trust_zone": "internet"
+      },
+      "name": "block-internet-control",
+      "policy_ref": "policy:block-internet-control@v1",
+      "priority": 950,
+      "risk_label": "critical",
+      "route_profile": "restricted",
+      "token_cost_divisor": 50.0,
+      "version": "1"
+    },
+    {
+      "action_hint": "block",
+      "attach_policy_refs": true,
+      "audit_force_on_violation": true,
+      "audit_label": "security",
+      "audit_require_full_trace": true,
+      "audit_sample_rate": 1.0,
+      "compliance_profile": "strict",
+      "decision": "deny",
+      "enable_receipts": false,
+      "enable_verify_metrics": true,
+      "enforcement": "block",
+      "match": {
+        "route": "restricted"
+      },
+      "name": "block-restricted-route",
+      "policy_ref": "policy:block-restricted-route@v1",
+      "priority": 900,
+      "risk_label": "critical",
+      "route_profile": "restricted",
+      "token_cost_divisor": 50.0,
+      "version": "1"
+    },
+    {
+      "action_hint": "degrade",
+      "attach_policy_refs": true,
+      "audit_force_on_violation": false,
+      "audit_label": "partner",
+      "audit_require_full_trace": false,
+      "audit_sample_rate": 0.25,
+      "compliance_profile": "standard",
+      "decision": "degrade",
+      "enable_receipts": false,
+      "enable_verify_metrics": true,
+      "enforcement": "degrade",
+      "match": {
+        "route": "inference",
+        "trust_zone": "partner"
+      },
+      "name": "degrade-partner-inference",
+      "policy_ref": "policy:degrade-partner-inference@v1",
+      "priority": 300,
+      "risk_label": "elevated",
+      "route_profile": "inference",
+      "token_cost_divisor": 50.0,
+      "version": "1"
+    },
+    {
+      "action_hint": "allow",
+      "attach_policy_refs": true,
+      "audit_force_on_violation": false,
+      "audit_label": "default",
+      "audit_require_full_trace": false,
+      "audit_sample_rate": 0.0,
+      "compliance_profile": "standard",
+      "decision": "allow",
+      "enable_receipts": false,
+      "enable_verify_metrics": true,
+      "enforcement": "allow",
+      "match": {
+        "lang": "*",
+        "model_id": "*",
+        "route": "*",
+        "session": "*",
+        "task": "*",
+        "tenant": "*",
+        "trust_zone": "*",
+        "user": "*"
+      },
+      "name": "default-inference-allow",
+      "policy_ref": "policy:default-inference-allow@v1",
+      "priority": 1,
+      "risk_label": "normal",
+      "route_profile": "inference",
+      "token_cost_divisor": 50.0,
+      "version": "1"
+    }
+  ],
+  "schema_version": 1
+}

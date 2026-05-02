@@ -978,6 +978,30 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
 
+        # service_http may authoritatively set request.state.request_id.
+        # If this middleware wraps service_http, keep response headers aligned
+        # with downstream body/event identity instead of overwriting it with
+        # the earlier outer-generated id.
+        try:
+            downstream_rid = getattr(request.state, "request_id", None)
+        except Exception:
+            downstream_rid = None
+        if isinstance(downstream_rid, str):
+            downstream_rid_s = _safe_taglike_id(
+                downstream_rid,
+                max_len=255,
+                pattern=_TAGLIKE_ID_RE,
+                allow_truncate=False,
+            )
+            if downstream_rid_s and downstream_rid_s != rid:
+                rid = downstream_rid_s
+                chain, chain_truncated = self._sanitize_chain(upstream_chain, rid)
+                try:
+                    request.state.request_chain = chain
+                    request.state.chain_truncated = chain_truncated
+                except Exception:
+                    pass
+
         # Decide exposure posture
         hide_sess_chain = cfg.hide_session_and_chain_in_high_security and cfg.trust_profile == "HIGH_SECURITY"
 
@@ -1227,18 +1251,29 @@ class RequestContextASGIMiddleware:
 
         # Attach to scope state (Starlette Request.state reads this)
         st = scope.setdefault("state", {})
-        try:
-            st["request_id"] = rid
-            st["session_id"] = sid
-            st["request_chain"] = chain
-            st["session_rotated"] = rotated
-            st["session_source"] = sid_src
-            st["upstream_id_accepted"] = upstream_accepted
-            st["upstream_id_trusted"] = upstream_trusted
-            st["chain_truncated"] = chain_truncated
-            st["tcd_trust_profile"] = cfg.trust_profile
-        except Exception:
-            pass
+        if cfg.attach_ids_to_state:
+            try:
+                st["request_id"] = rid
+                st["session_id"] = sid
+                st["request_chain"] = chain
+                st["session_rotated"] = rotated
+                st["session_source"] = sid_src
+                st["upstream_id_accepted"] = upstream_accepted
+                st["upstream_id_trusted"] = upstream_trusted
+                st["chain_truncated"] = chain_truncated
+                st["tcd_trust_profile"] = cfg.trust_profile
+                if not cfg.minimize_state_context_dict:
+                    st["request_context"] = {
+                        "trust_profile": cfg.trust_profile,
+                        "upstream_id_accepted": upstream_accepted,
+                        "upstream_id_trusted": upstream_trusted,
+                        "chain_truncated": chain_truncated,
+                        "session_rotated": rotated,
+                        "session_source": sid_src,
+                        "session_accepted": sid_accepted,
+                    }
+            except Exception:
+                pass
 
         hide_sess_chain = cfg.hide_session_and_chain_in_high_security and cfg.trust_profile == "HIGH_SECURITY"
         rid_hdr = _safe_taglike_id(rid, max_len=255, pattern=_TAGLIKE_ID_RE, allow_truncate=False)
@@ -1266,12 +1301,44 @@ class RequestContextASGIMiddleware:
         async def send_wrapper(message):
             if message.get("type") == "http.response.start":
                 hdrs = list(message.get("headers") or [])
-                if rid_hdr:
-                    _asgi_set_header(hdrs, cfg.request_id_header, rid_hdr, preserve=cfg.preserve_existing_response_header)
-                if not hide_sess_chain and sid_hdr:
-                    _asgi_set_header(hdrs, cfg.session_id_header, sid_hdr, preserve=cfg.preserve_existing_response_header)
-                if not hide_sess_chain and chain_hdr and len(chain_hdr) <= cfg.max_chain_chars:
-                    _asgi_set_header(hdrs, cfg.request_chain_header, chain_hdr, preserve=cfg.preserve_existing_response_header)
+                if cfg.expose_ids_to_downstream_headers:
+                    effective_rid = st.get("request_id") if isinstance(st, dict) else rid
+                    effective_sid = st.get("session_id") if isinstance(st, dict) else sid
+                    effective_chain = st.get("request_chain") if isinstance(st, dict) else chain
+
+                    rid_out = _safe_taglike_id(
+                        effective_rid if isinstance(effective_rid, str) else rid,
+                        max_len=255,
+                        pattern=_TAGLIKE_ID_RE,
+                        allow_truncate=False,
+                    )
+                    sid_out = _safe_taglike_id(
+                        effective_sid if isinstance(effective_sid, str) else sid,
+                        max_len=255,
+                        pattern=_TAGLIKE_ID_RE,
+                        allow_truncate=False,
+                    )
+
+                    if rid_out and rid_out != rid and (not isinstance(effective_chain, str) or effective_chain == chain):
+                        try:
+                            effective_chain, _chain_tr = self._impl._sanitize_chain(upstream_chain, rid_out)  # pylint: disable=protected-access
+                            if isinstance(st, dict):
+                                st["request_chain"] = effective_chain
+                                st["chain_truncated"] = bool(st.get("chain_truncated")) or bool(_chain_tr)
+                        except Exception:
+                            effective_chain = chain
+
+                    chain_out = _strip_unsafe_text(
+                        effective_chain if isinstance(effective_chain, str) else chain,
+                        max_len=cfg.max_chain_chars,
+                    ).strip()
+
+                    if rid_out:
+                        _asgi_set_header(hdrs, cfg.request_id_header, rid_out, preserve=cfg.preserve_existing_response_header)
+                    if not hide_sess_chain and sid_out:
+                        _asgi_set_header(hdrs, cfg.session_id_header, sid_out, preserve=cfg.preserve_existing_response_header)
+                    if not hide_sess_chain and chain_out and len(chain_out) <= cfg.max_chain_chars:
+                        _asgi_set_header(hdrs, cfg.request_chain_header, chain_out, preserve=cfg.preserve_existing_response_header)
                 if set_cookie_value:
                     _asgi_add_set_cookie(hdrs, set_cookie_value)
                 message["headers"] = hdrs
@@ -1356,8 +1423,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(
         self,
         app,
-        rate_per_sec: float = 10.0,
-        burst: float = 20.0,
+        rate_per_sec: Optional[float] = None,
+        burst: Optional[float] = None,
         *,
         config: Optional[RateLimitConfig] = None,
     ):
@@ -1369,7 +1436,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if burst is not None:
                 self._cfg.burst = float(burst)
         else:
-            self._cfg = RateLimitConfig(rate_per_sec=rate_per_sec, burst=burst)
+            self._cfg = RateLimitConfig(
+                rate_per_sec=10.0 if rate_per_sec is None else float(rate_per_sec),
+                burst=20.0 if burst is None else float(burst),
+            )
 
         self._trusted_proxy_nets = _parse_trusted_proxies(self._cfg.trusted_proxies)
 
@@ -1538,15 +1608,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # LRU bucket map for zone
             zmap = self._zone_buckets.setdefault(zone, OrderedDict())
 
-            # Enforce hard cap with sharded overflow buckets (fairness)
-            bucket_key = ip
-            if bucket_key not in zmap and len(zmap) >= max_entries:
-                bucket_key = self._overflow_key(ip)
-
-            # TTL eviction from oldest
+            # TTL eviction from oldest before deciding whether a new key must use overflow.
             cutoff = now - idle_ttl
             while zmap:
-                k0, v0 = next(iter(zmap.items()))
+                _k0, v0 = next(iter(zmap.items()))
                 if v0.get("t", now) >= cutoff:
                     break
                 zmap.popitem(last=False)
@@ -1554,6 +1619,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # LRU hard cap eviction (O(1))
             while len(zmap) > max_entries:
                 zmap.popitem(last=False)
+
+            # Enforce hard cap with sharded overflow buckets (fairness)
+            bucket_key = ip
+            if bucket_key not in zmap and len(zmap) >= max_entries:
+                bucket_key = self._overflow_key(ip)
 
             b = zmap.get(bucket_key)
             if b is None:
@@ -1572,12 +1642,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 b["tokens"] = max(0.0, b["tokens"] - need)
                 zmap[bucket_key] = b
                 zmap.move_to_end(bucket_key, last=True)
+                while len(zmap) > max_entries:
+                    zmap.popitem(last=False)
                 self._deny_counters.pop(ip, None)
                 return True
 
             # update bucket and deny
             zmap[bucket_key] = b
             zmap.move_to_end(bucket_key, last=True)
+            while len(zmap) > max_entries:
+                zmap.popitem(last=False)
             self._note_deny_locked(ip, now)
             return False
 
@@ -1708,7 +1782,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # --------------------------------
 
 class RateLimitASGIMiddleware:
-    def __init__(self, app, *, config: Optional[RateLimitConfig] = None, rate_per_sec: float = 10.0, burst: float = 20.0):
+    def __init__(self, app, *, config: Optional[RateLimitConfig] = None, rate_per_sec: Optional[float] = None, burst: Optional[float] = None):
         self.app = app
         self._impl = RateLimitMiddleware(app=None, config=config, rate_per_sec=rate_per_sec, burst=burst)
 
@@ -2132,8 +2206,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             "route": rec.get("route", "unknown"),
             "status": rec.get("status", "err"),
             "latency_ms": rec.get("latency_ms", 0.0),
-            "shrunk": True,
         }
+        if self._allow_field("shrunk"):
+            minimal["shrunk"] = True
         try:
             s2 = json.dumps(minimal, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         except Exception:

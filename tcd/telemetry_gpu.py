@@ -495,7 +495,7 @@ def _hash_hex(*, ctx: str, payload: Mapping[str, Any], out_hex: int = 32) -> str
     if Blake3Hash is not None:
         with contextlib.suppress(Exception):
             return Blake3Hash().hex(raw, ctx=ctx)[:out_hex]
-    return hashlib.sha256(raw).hexdigest()[:out_hex)
+    return hashlib.sha256(raw).hexdigest()[:out_hex]
 
 
 def _parse_key_material(v: Any) -> Optional[bytes]:

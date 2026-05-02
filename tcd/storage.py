@@ -182,6 +182,11 @@ _ALLOWED_REASON_CODES = frozenset(
         "LEDGER_COMMITTED",
         "RECEIPT_PREPARED",
         "RECEIPT_COMMITTED",
+        "RECEIPT_LOCAL_ONLY",
+        "RECEIPT_DURABILITY_PENDING",
+        "RECEIPT_DURABLE_OUTBOX",
+        "RECEIPT_DURABLE_COMMITTED",
+        "AUDIT_OUTBOX_QUEUED",
         "INTEGRITY_ERROR",
         "REPLAY_SUPPRESSED",
     }
@@ -195,8 +200,8 @@ _ALLOWED_CONTROLLER_MODES = frozenset(
 _ALLOWED_DECISION_MODES = frozenset(
     {"strict_only", "controller_only", "prefer_current_strict", "dual_track"}
 )
-_ALLOWED_LEDGER_STAGE = frozenset({"prepared", "committed", "outboxed", "skipped", "failed"})
-_ALLOWED_OUTBOX_STATUS = frozenset({"queued", "flushed", "dropped", "disabled", "none"})
+_ALLOWED_LEDGER_STAGE = frozenset({"prepared", "committed", "outboxed", "skipped", "failed", "prepare_failed", "commit_failed"})
+_ALLOWED_OUTBOX_STATUS = frozenset({"queued", "flushed", "committed", "dropped", "disabled", "none"})
 _ALLOWED_HEAD_SEMANTICS = frozenset(
     {"attestation_v1", "storage_chain_v1", "external_receipt_passthrough", "legacy_raw_head"}
 )
@@ -234,6 +239,7 @@ _RECEIPT_STRUCTURAL_KEYS = frozenset(
         "canonicalization_version",
         "receipt_kind",
         "event_type",
+        "request_id",
         "head",
         "receipt_head",
         "receipt",
@@ -272,6 +278,7 @@ _RECEIPT_STRUCTURAL_KEYS = frozenset(
         "stream_hash",
         "state_domain_id",
         "adapter_registry_fp",
+        "request_id",
         "event_id",
         "decision_id",
         "route_plan_id",
@@ -312,8 +319,20 @@ _RECEIPT_STRUCTURAL_KEYS = frozenset(
         "outbox_dedupe_key",
         "delivery_attempts",
         "ledger_stage",
+        "receipt_surface_kind",
+        "receipt_delivery_state",
+        "evidence_durable",
+        "evidence_storage_ready",
+        "governance_terminal",
+        "receipt_governance_ready",
         "payload_digest",
         "event_digest",
+        "receipt_surface_kind",
+        "receipt_delivery_state",
+        "evidence_durable",
+        "evidence_storage_ready",
+        "governance_terminal",
+        "receipt_governance_ready",
     }
 )
 
@@ -325,7 +344,7 @@ _SAFE_REASON_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 _SAFE_TAGLIKE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,255}$")
 _DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{16,256}$")
 _DIGEST_HEX_0X_RE = re.compile(r"^0x[0-9a-f]{16,256}$")
-_DIGEST_ALG_HEX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:[0-9a-f]{16,256}$")
+_DIGEST_ALG_HEX_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:){1,3}[0-9a-f]{16,256}$")
 _CFG_FP_RE = re.compile(
     r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256}|[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256})$"
 )
@@ -893,6 +912,8 @@ def _view_instance(view_cls: Any, payload: Dict[str, Any]) -> Any:
     if view_cls is None:
         return dict(payload)
     try:
+        if hasattr(view_cls, "model_validate"):
+            return view_cls.model_validate(dict(payload))
         return view_cls(**payload)
     except Exception:
         return dict(payload)
@@ -909,6 +930,128 @@ def _sqlite_insert(conn: sqlite3.Connection, table: str, payload: Mapping[str, A
     placeholders = ",".join("?" for _ in cols)
     sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})"
     return conn.execute(sql, tuple(payload[c] for c in cols))
+
+
+def _dataclass_shallow_dict(obj: Any) -> Dict[str, Any]:
+    """
+    Shallow dataclass projection.
+
+    dataclasses.asdict() deep-copies every field. That breaks normalized
+    storage objects because meta is intentionally a MappingProxyType.
+    """
+    if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
+        raise TypeError("expected dataclass instance")
+    return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
+
+
+def _json_tuple_from_text(
+    raw: Any,
+    *,
+    max_items: int = 64,
+    max_len: int = 256,
+    invalid_marker: Optional[str] = "INTEGRITY_ERROR",
+) -> Tuple[str, ...]:
+    """
+    Corruption-tolerant parser for JSON array columns.
+
+    Storage verification should mark a bad row as bad; it should not crash
+    before VerifyWindowReport can report bad_rows/reasons.
+    """
+    if raw is None or raw == "":
+        return tuple()
+    if not isinstance(raw, str):
+        return (invalid_marker,) if invalid_marker else tuple()
+    try:
+        val = _json_loads_strict(raw)
+    except Exception:
+        return (invalid_marker,) if invalid_marker else tuple()
+    if not isinstance(val, list):
+        return (invalid_marker,) if invalid_marker else tuple()
+
+    out: List[str] = []
+    seen = set()
+    for item in val[: max(0, int(max_items))]:
+        ss = _safe_text(item, max_len=max_len)
+        if not ss or ss in seen:
+            continue
+        seen.add(ss)
+        out.append(ss)
+    return tuple(out)
+
+
+def _body_digest_matches(body_json: Any, stored_digest: Any) -> bool:
+    """
+    Verify that body_digest still binds persisted body_json.
+
+    Accepts the storage-native pd2:sha256:<hex> form, sha256:<hex>, and raw
+    sha256 hex for compatibility.
+    """
+    if not isinstance(body_json, str) or not isinstance(stored_digest, str):
+        return False
+    s = stored_digest.strip().lower()
+    if not s:
+        return False
+    if s.startswith("0x"):
+        s = s[2:]
+
+    try:
+        sha = hashlib.sha256(body_json.encode("utf-8", errors="strict")).hexdigest()
+    except Exception:
+        return False
+
+    if s == sha:
+        return True
+
+    parts = s.split(":")
+    if parts and parts[-1] == sha and ("sha256" in parts[:-1]):
+        return True
+
+    return False
+
+
+def _receipt_row_integrity_issues(rec: "ReceiptRecord", *, cfg: "StorageConfig") -> Tuple[str, ...]:
+    """
+    Read-path row integrity checks for verify_window().
+
+    This catches direct row corruption such as body_json mutation, invalid JSON,
+    oversized stored body, and rows already carrying integrity errors.
+    """
+    issues: List[str] = []
+    body = rec.body_json
+
+    if not isinstance(body, str):
+        issues.append("body_json_invalid")
+    else:
+        try:
+            body_bytes = body.encode("utf-8", errors="strict")
+        except Exception:
+            body_bytes = b""
+            issues.append("body_json_invalid")
+
+        if body_bytes and len(body_bytes) > cfg.max_receipt_body_bytes:
+            issues.append("body_json_oversized")
+
+        if cfg.validate_receipt_json:
+            if _json_depth_exceeds(body, max_depth=_MAX_JSON_DEPTH):
+                issues.append("body_json_depth_exceeded")
+            else:
+                try:
+                    parsed = _json_loads_strict(body)
+                except Exception:
+                    issues.append("body_json_invalid")
+                else:
+                    if cfg.strict_dict_top_level_external and _profile_is_strict(cfg.profile) and not isinstance(parsed, dict):
+                        issues.append("body_json_not_object")
+                    if cfg.reject_forbidden_body_keys and _body_contains_forbidden_keys(parsed):
+                        issues.append("body_json_forbidden_key")
+
+    if not _body_digest_matches(body, rec.body_digest):
+        issues.append("body_digest_mismatch")
+
+    if rec.integrity_ok is False or bool(rec.integrity_errors):
+        issues.append("row_integrity_error")
+
+    return tuple(sorted(set(issues)))
 
 
 # =============================================================================
@@ -941,7 +1084,7 @@ class StorageConfig:
 
     # receipt governance
     validate_receipt_json: bool = True
-    canonicalize_receipt_body: bool = True
+    canonicalize_receipt_body: bool = False
     strict_dict_top_level_external: bool = False
     reject_forbidden_body_keys: bool = True
 
@@ -951,6 +1094,7 @@ class StorageConfig:
     enforce_single_genesis_per_chain: bool = True
     require_chain_leaf_append: bool = True
     fail_closed_on_chain_ambiguity: bool = True
+    server_assign_receipt_chain_position: bool = True
 
     default_chain_namespace: str = "default"
     default_chain_id: str = "default"
@@ -1001,6 +1145,7 @@ class StorageConfig:
         object.__setattr__(self, "enforce_single_genesis_per_chain", bool(self.enforce_single_genesis_per_chain))
         object.__setattr__(self, "require_chain_leaf_append", bool(self.require_chain_leaf_append))
         object.__setattr__(self, "fail_closed_on_chain_ambiguity", bool(self.fail_closed_on_chain_ambiguity))
+        object.__setattr__(self, "server_assign_receipt_chain_position", bool(self.server_assign_receipt_chain_position))
 
         object.__setattr__(self, "default_chain_namespace", _safe_id(self.default_chain_namespace, default="default", max_len=_MAX_CHAIN_ID_BYTES) or "default")
         object.__setattr__(self, "default_chain_id", _safe_id(self.default_chain_id, default="default", max_len=_MAX_CHAIN_ID_BYTES) or "default")
@@ -1064,7 +1209,7 @@ class StorageConfig:
             strict_policy_ref_taglike=_env_bool("TCD_STORAGE_STRICT_POLICY_REF_TAGLIKE", True),
             max_wealth_events_in_memory=_env_int("TCD_STORAGE_MAX_WEALTH_EVENTS_IN_MEMORY", 200_000),
             validate_receipt_json=_env_bool("TCD_STORAGE_VALIDATE_RECEIPT_JSON", True),
-            canonicalize_receipt_body=_env_bool("TCD_STORAGE_CANONICALIZE_RECEIPT_BODY", True),
+            canonicalize_receipt_body=_env_bool("TCD_STORAGE_CANONICALIZE_RECEIPT_BODY", False),
             strict_dict_top_level_external=_env_bool("TCD_STORAGE_STRICT_RECEIPT_DICT_TOPLEVEL_EXTERNAL", False),
             reject_forbidden_body_keys=_env_bool("TCD_STORAGE_REJECT_FORBIDDEN_BODY_KEYS", True),
             verify_receipt_head=_env_bool("TCD_STORAGE_VERIFY_RECEIPT_HEAD", True),
@@ -1072,6 +1217,7 @@ class StorageConfig:
             enforce_single_genesis_per_chain=_env_bool("TCD_STORAGE_ENFORCE_SINGLE_GENESIS", True),
             require_chain_leaf_append=_env_bool("TCD_STORAGE_REQUIRE_CHAIN_LEAF_APPEND", True),
             fail_closed_on_chain_ambiguity=_env_bool("TCD_STORAGE_FAIL_CLOSED_CHAIN_AMBIGUITY", True),
+            server_assign_receipt_chain_position=_env_bool("TCD_STORAGE_SERVER_ASSIGN_RECEIPT_CHAIN_POSITION", True),
             default_chain_namespace=_env("TCD_STORAGE_DEFAULT_CHAIN_NAMESPACE", "default"),
             default_chain_id=_env("TCD_STORAGE_DEFAULT_CHAIN_ID", "default"),
             max_receipt_body_bytes=_env_int("TCD_STORAGE_MAX_RECEIPT_BODY_BYTES", _MAX_RECEIPT_BODY_BYTES),
@@ -1351,7 +1497,7 @@ class WealthEventRecord:
     event_fingerprint: str
 
     def to_dict(self) -> Dict[str, Any]:
-        out = dataclasses.asdict(self)
+        out = _dataclass_shallow_dict(self)
         out["meta"] = dict(self.meta)
         return out
 
@@ -1402,10 +1548,11 @@ def _extract_receipt_fields(body_obj: Any) -> Dict[str, Any]:
         "canonicalization_version": get("canonicalization_version"),
         "receipt_kind": get("receipt_kind"),
         "event_type": get("event_type"),
-        "head": get("head") or get("receipt_head") or get("receipt"),
-        "body": get("body") or get("receipt_body"),
-        "sig": get("sig") or get("receipt_sig"),
-        "verify_key": get("verify_key"),
+        "request_id": get("request_id"),
+        "head": get("head") or get("receipt_head") or get("receipt") or get("receiptHead"),
+        "body": get("body") or get("receipt_body") or get("receiptBody"),
+        "sig": get("sig") or get("receipt_sig") or get("receiptSig"),
+        "verify_key": get("verify_key") or get("verifyKey"),
         "receipt_integrity": get("receipt_integrity"),
         "body_kind": get("body_kind"),
         "body_digest": get("body_digest"),
@@ -1431,7 +1578,7 @@ def _extract_receipt_fields(body_obj: Any) -> Dict[str, Any]:
         "policy_ref": get("policy_ref"),
         "policyset_ref": get("policyset_ref"),
         "policy_digest": get("policy_digest"),
-        "cfg_fp": get("cfg_fp"),
+        "cfg_fp": get("cfg_fp") or get("config_fingerprint"),
         "config_hash": get("config_hash"),
         "stream_hash": get("stream_hash"),
         "state_domain_id": get("state_domain_id"),
@@ -1475,14 +1622,25 @@ def _extract_receipt_fields(body_obj: Any) -> Dict[str, Any]:
         "outbox_dedupe_key": get("outbox_dedupe_key"),
         "delivery_attempts": get("delivery_attempts"),
         "ledger_stage": get("ledger_stage"),
+        "receipt_surface_kind": get("receipt_surface_kind"),
+        "receipt_delivery_state": get("receipt_delivery_state"),
+        "evidence_durable": get("evidence_durable"),
+        "evidence_storage_ready": get("evidence_storage_ready"),
+        "governance_terminal": get("governance_terminal"),
+        "receipt_governance_ready": get("receipt_governance_ready"),
         "payload_digest": get("payload_digest"),
         "event_digest": get("event_digest"),
     }
 
 
 def _canonicalize_receipt_body(body_json: str, *, cfg: StorageConfig) -> Tuple[str, Any]:
-    body = _safe_text(body_json, max_len=cfg.max_receipt_body_bytes * 2, redact_mode="none")
-    body_bytes = body.encode("utf-8", errors="strict")
+    if not isinstance(body_json, str):
+        raise StorageIntegrityError("receipt body_json must be a string")
+    body = body_json
+    try:
+        body_bytes = body.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise StorageIntegrityError("receipt body_json must be strict UTF-8 encodable") from exc
     if len(body_bytes) > cfg.max_receipt_body_bytes:
         raise StorageIntegrityError("receipt body exceeds configured byte budget")
     if cfg.validate_receipt_json:
@@ -1596,6 +1754,7 @@ def _semantic_fingerprint(env: "ReceiptEnvelope") -> str:
         "verify_key_fp": env.verify_key_fp,
         "verify_key_id": env.verify_key_id,
         "receipt_integrity": env.receipt_integrity,
+        "request_id": env.request_id,
         "event_id": env.event_id,
         "decision_id": env.decision_id,
         "route_plan_id": env.route_plan_id,
@@ -1611,6 +1770,12 @@ def _semantic_fingerprint(env: "ReceiptEnvelope") -> str:
         "prev_head_hex": env.prev_head_hex,
         "payload_digest": env.payload_digest,
         "event_digest": env.event_digest,
+        "receipt_surface_kind": env.receipt_surface_kind,
+        "receipt_delivery_state": env.receipt_delivery_state,
+        "evidence_durable": env.evidence_durable,
+        "evidence_storage_ready": env.evidence_storage_ready,
+        "governance_terminal": env.governance_terminal,
+        "receipt_governance_ready": env.receipt_governance_ready,
     }
     return f"rsf1:{_hash_hex(ctx='tcd:storage:receipt_semantic', payload=payload, out_hex=32)}"
 
@@ -1667,6 +1832,7 @@ class ReceiptEnvelope:
     state_domain_id: Optional[str] = None
     adapter_registry_fp: Optional[str] = None
 
+    request_id: Optional[str] = None
     event_id: Optional[str] = None
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
@@ -1695,6 +1861,14 @@ class ReceiptEnvelope:
     outbox_status: Optional[str] = None
     outbox_dedupe_key: Optional[str] = None
     delivery_attempts: Optional[int] = None
+
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+    governance_terminal: Optional[bool] = None
+    receipt_governance_ready: Optional[bool] = None
+
     payload_digest: Optional[str] = None
     event_digest: Optional[str] = None
 
@@ -1755,10 +1929,12 @@ class ReceiptEnvelope:
         if provenance_path_digest is None and produced_by:
             provenance_path_digest = f"sha256:{_hash_hex(ctx='tcd:storage:produced_by', payload={'produced_by': list(produced_by)}, out_hex=64)}"
 
-        meta = MappingProxyType(_safe_json_mapping(self.meta or body_fields.get("meta")))
-        integrity_errors = list(_normalize_reason_codes(self.integrity_errors or body_fields.get("integrity_errors"), max_items=64))
-        normalization_warnings = _normalize_reason_codes(self.normalization_warnings or body_fields.get("normalization_warnings"), max_items=32)
-        compat_warnings = _normalize_reason_codes(self.compat_warnings or body_fields.get("compat_warnings"), max_items=32)
+        meta_src = self.meta or body_fields.get("meta")
+        meta_map = _safe_json_mapping(meta_src)
+        meta = MappingProxyType(meta_map)
+        integrity_errors = list(_normalize_str_tuple(self.integrity_errors or body_fields.get("integrity_errors"), max_len=256, max_items=64))
+        normalization_warnings = _normalize_str_tuple(self.normalization_warnings or body_fields.get("normalization_warnings"), max_len=256, max_items=32)
+        compat_warnings = _normalize_str_tuple(self.compat_warnings or body_fields.get("compat_warnings"), max_len=256, max_items=32)
 
         head_verified = _coerce_bool(self.head_verified if self.head_verified is not None else body_fields.get("head_verified"))
         if cfg.verify_receipt_head:
@@ -1842,6 +2018,7 @@ class ReceiptEnvelope:
             stream_hash=_safe_id(self.stream_hash or body_fields.get("stream_hash"), default=None, max_len=256),
             state_domain_id=_safe_id(self.state_domain_id or body_fields.get("state_domain_id"), default=None, max_len=256),
             adapter_registry_fp=_safe_id(self.adapter_registry_fp or body_fields.get("adapter_registry_fp"), default=None, max_len=256),
+            request_id=_safe_id(self.request_id or body_fields.get("request_id") or meta_map.get("request_id"), default=None, max_len=256),
             event_id=_safe_id(self.event_id or body_fields.get("event_id"), default=None, max_len=256),
             decision_id=_safe_id(self.decision_id or body_fields.get("decision_id"), default=None, max_len=256),
             route_plan_id=_safe_id(self.route_plan_id or body_fields.get("route_plan_id"), default=None, max_len=256),
@@ -1867,6 +2044,12 @@ class ReceiptEnvelope:
             outbox_status=outbox_status,
             outbox_dedupe_key=_safe_id(self.outbox_dedupe_key or body_fields.get("outbox_dedupe_key"), default=None, max_len=256),
             delivery_attempts=max(0, _coerce_int(self.delivery_attempts if self.delivery_attempts is not None else body_fields.get("delivery_attempts")) or 0) or None,
+            receipt_surface_kind=_safe_label(self.receipt_surface_kind or body_fields.get("receipt_surface_kind"), default="") or None if (self.receipt_surface_kind or body_fields.get("receipt_surface_kind")) is not None else None,
+            receipt_delivery_state=_safe_label(self.receipt_delivery_state or body_fields.get("receipt_delivery_state"), default="") or None if (self.receipt_delivery_state or body_fields.get("receipt_delivery_state")) is not None else None,
+            evidence_durable=_coerce_bool(self.evidence_durable if self.evidence_durable is not None else body_fields.get("evidence_durable")),
+            evidence_storage_ready=_coerce_bool(self.evidence_storage_ready if self.evidence_storage_ready is not None else body_fields.get("evidence_storage_ready")),
+            governance_terminal=_coerce_bool(self.governance_terminal if self.governance_terminal is not None else body_fields.get("governance_terminal")),
+            receipt_governance_ready=_coerce_bool(self.receipt_governance_ready if self.receipt_governance_ready is not None else body_fields.get("receipt_governance_ready")),
             payload_digest=payload_digest,
             event_digest=_normalize_digest_token(self.event_digest or body_fields.get("event_digest"), kind="any", default=None),
             produced_by=produced_by,
@@ -1892,6 +2075,7 @@ class ReceiptEnvelope:
             "canonicalization_version": self.canonicalization_version,
             "receipt_kind": self.receipt_kind,
             "event_type": self.event_type,
+            "request_id": self.request_id,
             "head": self.head_hex,
             "body": self.body_json,
             "sig": self.sig,
@@ -1944,6 +2128,21 @@ class ReceiptEnvelope:
             "statistical_guarantee_scope": self.statistical_guarantee_scope,
             "trigger": self.trigger,
             "allowed": self.allowed,
+            "prepare_ref": self.prepare_ref,
+            "commit_ref": self.commit_ref,
+            "ledger_stage": self.ledger_stage,
+            "outbox_ref": self.outbox_ref,
+            "outbox_status": self.outbox_status,
+            "outbox_dedupe_key": self.outbox_dedupe_key,
+            "delivery_attempts": self.delivery_attempts,
+            "payload_digest": self.payload_digest,
+            "event_digest": self.event_digest,
+            "receipt_surface_kind": self.receipt_surface_kind,
+            "receipt_delivery_state": self.receipt_delivery_state,
+            "evidence_durable": self.evidence_durable,
+            "evidence_storage_ready": self.evidence_storage_ready,
+            "governance_terminal": self.governance_terminal,
+            "receipt_governance_ready": self.receipt_governance_ready,
             "produced_by": list(self.produced_by),
             "provenance_path_digest": self.provenance_path_digest,
             "head_verified": self.head_verified,
@@ -1966,6 +2165,9 @@ class ReceiptEnvelope:
         if hasattr(rv, "to_public_view"):
             with contextlib.suppress(Exception):
                 return rv.to_public_view(strict=False)
+        if hasattr(rv, "to_public_dict"):
+            with contextlib.suppress(Exception):
+                return rv.to_public_dict(strict=False)
         payload = {
             "schema": self.schema,
             "head": self.head_hex,
@@ -1980,8 +2182,18 @@ class ReceiptEnvelope:
             "verify_key_id": self.verify_key_id or self.sig_key_id,
             "verify_key_fp": self.verify_key_fp,
             "receipt_integrity": self.receipt_integrity,
+            "pq_required": self.pq_required,
+            "pq_ok": self.pq_ok,
             "pq_signature_required": self.pq_signature_required,
             "pq_signature_ok": self.pq_signature_ok,
+            "ledger_stage": self.ledger_stage,
+            "outbox_status": self.outbox_status,
+            "receipt_surface_kind": self.receipt_surface_kind,
+            "receipt_delivery_state": self.receipt_delivery_state,
+            "evidence_durable": self.evidence_durable,
+            "evidence_storage_ready": self.evidence_storage_ready,
+            "governance_terminal": self.governance_terminal,
+            "receipt_governance_ready": self.receipt_governance_ready,
             "integrity_ok": bool(self.integrity_ok),
             "integrity_errors": list(self.integrity_errors),
         }
@@ -1992,8 +2204,12 @@ class ReceiptEnvelope:
         if hasattr(rv, "to_audit_view"):
             with contextlib.suppress(Exception):
                 return rv.to_audit_view(strict=False)
+        if hasattr(rv, "to_audit_dict"):
+            with contextlib.suppress(Exception):
+                return rv.to_audit_dict(strict=False)
         payload = {
             "schema": self.schema,
+            "request_id": self.request_id,
             "head": self.head_hex,
             "body_digest": self.body_digest,
             "receipt_ref": self.receipt_ref,
@@ -2007,6 +2223,12 @@ class ReceiptEnvelope:
             "cfg_fp": self.cfg_fp,
             "state_domain_id": self.state_domain_id,
             "adapter_registry_fp": self.adapter_registry_fp,
+            "receipt_surface_kind": self.receipt_surface_kind,
+            "receipt_delivery_state": self.receipt_delivery_state,
+            "evidence_durable": self.evidence_durable,
+            "evidence_storage_ready": self.evidence_storage_ready,
+            "governance_terminal": self.governance_terminal,
+            "receipt_governance_ready": self.receipt_governance_ready,
             "verify_key_id": self.verify_key_id or self.sig_key_id,
             "verify_key_fp": self.verify_key_fp,
             "receipt_integrity": self.receipt_integrity,
@@ -2021,6 +2243,9 @@ class ReceiptEnvelope:
         if hasattr(rv, "to_verification_view"):
             with contextlib.suppress(Exception):
                 return rv.to_verification_view(strict=False, include_verify_key=include_verify_key)
+        if hasattr(rv, "to_verification_dict"):
+            with contextlib.suppress(Exception):
+                return rv.to_verification_dict(strict=False, include_verify_key=include_verify_key)
         payload = {
             "schema": self.schema,
             "head": self.head_hex,
@@ -2032,6 +2257,12 @@ class ReceiptEnvelope:
             "receipt_integrity": self.receipt_integrity,
             "body_kind": self.body_kind,
             "body_digest": self.body_digest,
+            "ledger_stage": self.ledger_stage,
+            "outbox_status": self.outbox_status,
+            "receipt_surface_kind": self.receipt_surface_kind,
+            "receipt_delivery_state": self.receipt_delivery_state,
+            "evidence_durable": self.evidence_durable,
+            "evidence_storage_ready": self.evidence_storage_ready,
             "head_verified": self.head_verified,
             "body_canonical_verified": self.body_canonical_verified,
             "integrity_hash_verified": self.integrity_hash_verified,
@@ -2046,6 +2277,7 @@ class ReceiptEnvelope:
 
     def evidence_identity_dict(self) -> Dict[str, Any]:
         payload = {
+            "request_id": self.request_id,
             "event_id": self.event_id,
             "event_id_kind": "event",
             "decision_id": self.decision_id,
@@ -2088,7 +2320,7 @@ class ReceiptEnvelope:
             "outbox_dedupe_key": self.outbox_dedupe_key,
             "delivery_attempts": self.delivery_attempts,
             "chain_id": self.chain_id,
-            "chain_head": None,
+            "chain_head": getattr(self, "chain_head_hex", None),
             "produced_by": list(self.produced_by),
             "provenance_path_digest": self.provenance_path_digest,
         }
@@ -2120,7 +2352,7 @@ class ReceiptRecord(ReceiptEnvelope):
     ) -> "ReceiptRecord":
         return ReceiptRecord(
             **{
-                **dataclasses.asdict(self),
+                **_dataclass_shallow_dict(self),
                 "store_backend": store_backend,
                 "store_id": store_id,
                 "inserted_at_unix_ns": inserted_at_unix_ns,
@@ -2161,6 +2393,52 @@ def _equivalent_receipt_record(a: ReceiptRecord, b: ReceiptRecord) -> bool:
             return False
     return True
 
+
+
+def _receipt_append_latest_requested(env: ReceiptEnvelope) -> bool:
+    meta = env.meta if isinstance(env.meta, Mapping) else {}
+    mode = _safe_label(meta.get("chain_append_mode"), default="")
+    return mode in {"latest", "server_latest", "auto", "append_latest"}
+
+
+def _receipt_input_equivalent(existing: ReceiptRecord, env: ReceiptEnvelope, *, cfg: StorageConfig) -> bool:
+    keys = (
+        "head_hex",
+        "head_semantics",
+        "body_json",
+        "body_digest",
+        "sig",
+        "verify_key_fp",
+        "verify_key_id",
+        "receipt_integrity",
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "policy_ref",
+        "policyset_ref",
+        "policy_digest",
+        "cfg_fp",
+        "stream_hash",
+        "state_domain_id",
+        "adapter_registry_fp",
+        "chain_namespace",
+        "chain_id",
+        "payload_digest",
+        "event_digest",
+    )
+    for k in keys:
+        if getattr(existing, k) != getattr(env, k):
+            return False
+    server_assign_position = bool(getattr(cfg, "server_assign_receipt_chain_position", False)) and (
+        env.prev_head_hex is None or _receipt_append_latest_requested(env)
+    )
+    if env.chain_seq is not None and not server_assign_position and existing.chain_seq != env.chain_seq:
+        return False
+    if env.prev_head_hex is not None and not server_assign_position:
+        prev = env.prev_head_hex
+        if existing.prev_chain_head_hex != prev and existing.prev_head_hex != prev:
+            return False
+    return True
 
 @dataclass(frozen=True)
 class PutResult:
@@ -2799,6 +3077,28 @@ ON receipts_v2(inserted_at_unix_ns DESC, store_id DESC);
 """
 
 
+_SQL_RECEIPTS_V2_COMPAT_COLUMNS: Mapping[str, str] = {
+    "request_id": "TEXT",
+    "receipt_surface_kind": "TEXT",
+    "receipt_delivery_state": "TEXT",
+    "evidence_durable": "INTEGER",
+    "evidence_storage_ready": "INTEGER",
+    "governance_terminal": "INTEGER",
+    "receipt_governance_ready": "INTEGER",
+}
+
+
+def _ensure_receipts_v2_columns(conn: sqlite3.Connection) -> None:
+    try:
+        rows = list(conn.execute("PRAGMA table_info(receipts_v2)"))
+        existing = {str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in rows}
+    except Exception:
+        return
+    for col, decl in _SQL_RECEIPTS_V2_COMPAT_COLUMNS.items():
+        if col in existing:
+            continue
+        conn.execute(f"ALTER TABLE receipts_v2 ADD COLUMN {col} {decl}")
+
 class _SQLite:
     def __init__(self, path: str, *, cfg: StorageConfig) -> None:
         self._path = path
@@ -2815,6 +3115,7 @@ class _SQLite:
             pass
         with self._conn:
             self._conn.executescript(_SQL_SCHEMA)
+            _ensure_receipts_v2_columns(self._conn)
             self._conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(name, applied_at_unix_ns) VALUES(?,?)",
                 (_SCHEMA, now_unix_ns()),
@@ -2929,7 +3230,7 @@ class SQLiteAlphaWealthLedger(AlphaWealthLedger):
             identity_status=row["identity_status"],
             audit_ref=row["audit_ref"],
             receipt_ref=row["receipt_ref"],
-            degraded_reasons=tuple(json.loads(row["degraded_reasons_json"] or "[]")),
+            degraded_reasons=_json_tuple_from_text(row["degraded_reasons_json"] or "[]", max_items=32),
             meta=MappingProxyType(_safe_json_mapping(_json_loads_strict(row["meta_json"]) if row["meta_json"] else {})),
             event_fingerprint=row["event_fingerprint"],
         )
@@ -3310,9 +3611,8 @@ class InMemoryReceiptStore(ReceiptStore):
 
         for env in envs:
             existing = staged_by_head.get(env.head_hex)
-            candidate0 = ReceiptRecord(**{**dataclasses.asdict(env), "chain_head_hex": None, "prev_chain_head_hex": None, "semantic_fingerprint": _semantic_fingerprint(env), "store_backend": "memory", "store_id": None, "inserted_at_unix_ns": None, "updated_at_unix_ns": None})
             if existing is not None:
-                if _equivalent_receipt_record(existing, candidate0):
+                if _receipt_input_equivalent(existing, env, cfg=self._cfg):
                     results.append(
                         PutResult(
                             stored=False,
@@ -3355,8 +3655,18 @@ class InMemoryReceiptStore(ReceiptStore):
             if self._cfg.fail_closed_on_chain_ambiguity and len(leaves) > 1:
                 raise StorageConflictError("chain has ambiguous multiple leaves")
 
+            append_latest_requested = _receipt_append_latest_requested(env)
+            server_assign_position = bool(self._cfg.server_assign_receipt_chain_position) and (env.prev_head_hex is None or append_latest_requested)
+
             resolved_prev: Optional[ReceiptRecord] = None
-            if env.prev_head_hex is None:
+            if server_assign_position:
+                if chain_rows:
+                    if self._cfg.fail_closed_on_chain_ambiguity and len(leaves) > 1:
+                        raise StorageConflictError("chain has ambiguous multiple leaves")
+                    resolved_prev = leaves[0] if leaves else latest
+                else:
+                    resolved_prev = None
+            elif env.prev_head_hex is None:
                 if chain_rows and self._cfg.enforce_single_genesis_per_chain:
                     raise StorageConflictError("single genesis per chain violated")
             else:
@@ -3377,7 +3687,7 @@ class InMemoryReceiptStore(ReceiptStore):
                     if leaves and leaves[0].chain_head_hex != resolved_prev.chain_head_hex:
                         raise StorageConflictError("strict chain append requires prev == current leaf")
 
-            requested_seq = env.chain_seq
+            requested_seq = None if server_assign_position else env.chain_seq
             prev_row_seq = resolved_prev.chain_seq if resolved_prev is not None else None
             latest_seq = latest.chain_seq if latest is not None else None
             final_seq = (requested_seq if requested_seq is not None else ((prev_row_seq + 1) if prev_row_seq is not None else ((latest_seq + 1) if latest_seq is not None else 0)))
@@ -3388,7 +3698,7 @@ class InMemoryReceiptStore(ReceiptStore):
                     raise StorageConflictError("chain_seq already exists")
                 if resolved_prev is not None and row.prev_chain_head_hex == resolved_prev.chain_head_hex:
                     raise StorageConflictError("fork detected: prev already consumed")
-                if env.prev_head_hex is None and row.prev_chain_head_hex is None and self._cfg.enforce_single_genesis_per_chain:
+                if (not server_assign_position) and env.prev_head_hex is None and row.prev_chain_head_hex is None and self._cfg.enforce_single_genesis_per_chain:
                     raise StorageConflictError("single genesis per chain violated")
 
             prev_chain_head_hex = resolved_prev.chain_head_hex if resolved_prev is not None else None
@@ -3408,8 +3718,9 @@ class InMemoryReceiptStore(ReceiptStore):
             semantic_fp = _semantic_fingerprint(env)
             record = ReceiptRecord(
                 **{
-                    **dataclasses.asdict(env),
+                    **_dataclass_shallow_dict(env),
                     "chain_head_hex": chain_head_hex,
+                    "prev_head_hex": prev_chain_head_hex,
                     "prev_chain_head_hex": prev_chain_head_hex,
                     "chain_namespace": chain_namespace,
                     "chain_id": chain_id,
@@ -3630,6 +3941,11 @@ class InMemoryReceiptStore(ReceiptStore):
                     bad_heads += 1
                     reasons.append("chain_head_mismatch")
 
+                row_issues = _receipt_row_integrity_issues(cur, cfg=self._cfg)
+                if row_issues:
+                    bad_rows += 1
+                    reasons.extend(row_issues)
+
                 if cur.prev_chain_head_hex:
                     prev = self._by_chain_head.get(cur.prev_chain_head_hex)
                     if prev is None:
@@ -3644,7 +3960,7 @@ class InMemoryReceiptStore(ReceiptStore):
                 else:
                     cur = None
 
-            ok = bad_heads == 0 and missing_prev == 0 and cycles == 0 and (forks == 0 or not self._cfg.fail_closed_on_chain_ambiguity)
+            ok = bad_heads == 0 and bad_rows == 0 and missing_prev == 0 and cycles == 0 and (forks == 0 or not self._cfg.fail_closed_on_chain_ambiguity)
             return VerifyWindowReport(
                 ok=ok,
                 checked=steps,
@@ -3742,10 +4058,12 @@ class SQLiteReceiptStore(ReceiptStore):
         self._db = _SQLite(path, cfg=self._cfg)
 
     def _row_to_record(self, row: sqlite3.Row) -> ReceiptRecord:
-        produced_by = ()
-        if row["produced_by_json"]:
-            with contextlib.suppress(Exception):
-                produced_by = tuple(json.loads(row["produced_by_json"]))
+        produced_by = _json_tuple_from_text(
+            row["produced_by_json"] or "[]",
+            max_items=32,
+            max_len=64,
+            invalid_marker=None,
+        )
         meta = {}
         if row["meta_json"]:
             with contextlib.suppress(Exception):
@@ -3791,6 +4109,7 @@ class SQLiteReceiptStore(ReceiptStore):
             stream_hash=row["stream_hash"],
             state_domain_id=row["state_domain_id"],
             adapter_registry_fp=row["adapter_registry_fp"],
+            request_id=row["request_id"],
             event_id=row["event_id"],
             decision_id=row["decision_id"],
             route_plan_id=row["route_plan_id"],
@@ -3816,6 +4135,12 @@ class SQLiteReceiptStore(ReceiptStore):
             outbox_status=row["outbox_status"],
             outbox_dedupe_key=row["outbox_dedupe_key"],
             delivery_attempts=int(row["delivery_attempts"]) if row["delivery_attempts"] is not None else None,
+            receipt_surface_kind=row["receipt_surface_kind"],
+            receipt_delivery_state=row["receipt_delivery_state"],
+            evidence_durable=bool(row["evidence_durable"]) if row["evidence_durable"] is not None else None,
+            evidence_storage_ready=bool(row["evidence_storage_ready"]) if row["evidence_storage_ready"] is not None else None,
+            governance_terminal=bool(row["governance_terminal"]) if row["governance_terminal"] is not None else None,
+            receipt_governance_ready=bool(row["receipt_governance_ready"]) if row["receipt_governance_ready"] is not None else None,
             payload_digest=row["payload_digest"],
             event_digest=row["event_digest"],
             produced_by=produced_by,
@@ -3828,9 +4153,9 @@ class SQLiteReceiptStore(ReceiptStore):
             policy_binding_verified=bool(row["policy_binding_verified"]) if row["policy_binding_verified"] is not None else None,
             cfg_binding_verified=bool(row["cfg_binding_verified"]) if row["cfg_binding_verified"] is not None else None,
             integrity_ok=bool(row["integrity_ok"]) if row["integrity_ok"] is not None else None,
-            integrity_errors=tuple(json.loads(row["integrity_errors_json"] or "[]")),
-            normalization_warnings=tuple(json.loads(row["normalization_warnings_json"] or "[]")),
-            compat_warnings=tuple(json.loads(row["compat_warnings_json"] or "[]")),
+            integrity_errors=_json_tuple_from_text(row["integrity_errors_json"] or "[]", max_items=64),
+            normalization_warnings=_json_tuple_from_text(row["normalization_warnings_json"] or "[]", max_items=32),
+            compat_warnings=_json_tuple_from_text(row["compat_warnings_json"] or "[]", max_items=32),
             meta=MappingProxyType(meta),
             chain_head_hex=row["chain_head_hex"],
             prev_chain_head_hex=row["prev_chain_head_hex"],
@@ -3880,9 +4205,8 @@ class SQLiteReceiptStore(ReceiptStore):
 
         for env in envs:
             existing = self._fetch_one(conn, "SELECT * FROM receipts_v2 WHERE head_hex=?", (env.head_hex,))
-            candidate0 = ReceiptRecord(**{**dataclasses.asdict(env), "chain_head_hex": None, "prev_chain_head_hex": None, "semantic_fingerprint": _semantic_fingerprint(env), "store_backend": "sqlite", "store_id": None, "inserted_at_unix_ns": None, "updated_at_unix_ns": None})
             if existing is not None:
-                if _equivalent_receipt_record(existing, candidate0):
+                if _receipt_input_equivalent(existing, env, cfg=self._cfg):
                     results.append(
                         PutResult(
                             stored=False,
@@ -3932,8 +4256,18 @@ class SQLiteReceiptStore(ReceiptStore):
             if self._cfg.fail_closed_on_chain_ambiguity and len(leaves) > 1:
                 raise StorageConflictError("chain has ambiguous multiple leaves")
 
+            append_latest_requested = _receipt_append_latest_requested(env)
+            server_assign_position = bool(self._cfg.server_assign_receipt_chain_position) and (env.prev_head_hex is None or append_latest_requested)
+
             resolved_prev: Optional[ReceiptRecord] = None
-            if env.prev_head_hex is None:
+            if server_assign_position:
+                if chain_rows:
+                    if self._cfg.fail_closed_on_chain_ambiguity and len(leaves) > 1:
+                        raise StorageConflictError("chain has ambiguous multiple leaves")
+                    resolved_prev = leaves[0] if leaves else latest
+                else:
+                    resolved_prev = None
+            elif env.prev_head_hex is None:
                 if chain_rows and self._cfg.enforce_single_genesis_per_chain:
                     raise StorageConflictError("single genesis per chain violated")
             else:
@@ -3954,7 +4288,7 @@ class SQLiteReceiptStore(ReceiptStore):
                     if leaves and leaves[0].chain_head_hex != resolved_prev.chain_head_hex:
                         raise StorageConflictError("strict chain append requires prev == current leaf")
 
-            requested_seq = env.chain_seq
+            requested_seq = None if server_assign_position else env.chain_seq
             prev_row_seq = resolved_prev.chain_seq if resolved_prev is not None else None
             latest_seq = latest.chain_seq if latest is not None else None
             final_seq = (requested_seq if requested_seq is not None else ((prev_row_seq + 1) if prev_row_seq is not None else ((latest_seq + 1) if latest_seq is not None else 0)))
@@ -3966,7 +4300,7 @@ class SQLiteReceiptStore(ReceiptStore):
                     raise StorageConflictError("chain_seq already exists")
                 if resolved_prev is not None and row.prev_chain_head_hex == resolved_prev.chain_head_hex:
                     raise StorageConflictError("fork detected: prev already consumed")
-                if env.prev_head_hex is None and row.prev_chain_head_hex is None and self._cfg.enforce_single_genesis_per_chain:
+                if (not server_assign_position) and env.prev_head_hex is None and row.prev_chain_head_hex is None and self._cfg.enforce_single_genesis_per_chain:
                     raise StorageConflictError("single genesis per chain violated")
 
             prev_chain_head_hex = resolved_prev.chain_head_hex if resolved_prev is not None else None
@@ -3985,8 +4319,9 @@ class SQLiteReceiptStore(ReceiptStore):
 
             record = ReceiptRecord(
                 **{
-                    **dataclasses.asdict(env),
+                    **_dataclass_shallow_dict(env),
                     "chain_head_hex": chain_head_hex,
+                    "prev_head_hex": prev_chain_head_hex,
                     "prev_chain_head_hex": prev_chain_head_hex,
                     "chain_namespace": chain_namespace,
                     "chain_id": chain_id,
@@ -4057,6 +4392,7 @@ class SQLiteReceiptStore(ReceiptStore):
                 "stream_hash": rec.stream_hash,
                 "state_domain_id": rec.state_domain_id,
                 "adapter_registry_fp": rec.adapter_registry_fp,
+                "request_id": rec.request_id,
                 "event_id": rec.event_id,
                 "decision_id": rec.decision_id,
                 "route_plan_id": rec.route_plan_id,
@@ -4081,6 +4417,12 @@ class SQLiteReceiptStore(ReceiptStore):
                 "outbox_status": rec.outbox_status,
                 "outbox_dedupe_key": rec.outbox_dedupe_key,
                 "delivery_attempts": rec.delivery_attempts,
+                "receipt_surface_kind": rec.receipt_surface_kind,
+                "receipt_delivery_state": rec.receipt_delivery_state,
+                "evidence_durable": _to_bool_int(rec.evidence_durable),
+                "evidence_storage_ready": _to_bool_int(rec.evidence_storage_ready),
+                "governance_terminal": _to_bool_int(rec.governance_terminal),
+                "receipt_governance_ready": _to_bool_int(rec.receipt_governance_ready),
                 "payload_digest": rec.payload_digest,
                 "event_digest": rec.event_digest,
                 "produced_by_json": _canonical_json_str(list(rec.produced_by)),
@@ -4294,6 +4636,11 @@ class SQLiteReceiptStore(ReceiptStore):
                     bad_heads += 1
                     reasons.append("chain_head_mismatch")
 
+                row_issues = _receipt_row_integrity_issues(cur, cfg=self._cfg)
+                if row_issues:
+                    bad_rows += 1
+                    reasons.extend(row_issues)
+
                 if cur.prev_chain_head_hex:
                     prev = self._fetch_one(
                         conn,
@@ -4312,7 +4659,7 @@ class SQLiteReceiptStore(ReceiptStore):
                 else:
                     cur = None
 
-        ok = bad_heads == 0 and missing_prev == 0 and cycles == 0 and (forks == 0 or not self._cfg.fail_closed_on_chain_ambiguity)
+        ok = bad_heads == 0 and bad_rows == 0 and missing_prev == 0 and cycles == 0 and (forks == 0 or not self._cfg.fail_closed_on_chain_ambiguity)
         return VerifyWindowReport(
             ok=ok,
             checked=steps,

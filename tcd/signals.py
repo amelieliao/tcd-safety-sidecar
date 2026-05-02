@@ -3740,8 +3740,8 @@ class SignalBus:
                 reason="integrity_rejected",
                 integrity_ok=False,
                 integrity_errors=tuple(x.code for x in integrity.errors),
-                normalization_warnings=signal.normalization_warnings(),
-                compatibility_warnings=signal.compatibility_warnings(),
+                normalization_warnings=_signal_diag_tuple(signal, 'normalization_warnings'),
+                compatibility_warnings=_signal_diag_tuple(signal, 'compatibility_warnings'),
             )
 
         regs = self._matching_regs(signal)
@@ -3797,8 +3797,8 @@ class SignalBus:
             required_sink_failed=required_sink_failed,
             integrity_ok=integrity.ok,
             integrity_errors=tuple(x.code for x in integrity.errors),
-            normalization_warnings=signal.normalization_warnings(),
-            compatibility_warnings=signal.compatibility_warnings(),
+            normalization_warnings=_signal_diag_tuple(signal, 'normalization_warnings'),
+            compatibility_warnings=_signal_diag_tuple(signal, 'compatibility_warnings'),
             queued_to_outbox=queued,
             delivery_status=MappingProxyType(dict(delivery_status)),
         )
@@ -4346,3 +4346,701 @@ def make_stream_context(
         state_revision=state_revision,
         identity_status=identity_status,
     )
+
+
+# --- TCD signals compatibility overlay START ---
+# Compatibility-only tail patch. Do not edit the original class bodies above.
+
+import contextlib as contextlib  # required by original helper bodies
+
+_ALLOWED_LEDGER_STAGE = frozenset(set(_ALLOWED_LEDGER_STAGE) | {
+    "none", "unknown", "prepare_failed", "commit_failed", "outbox_failed"
+})
+_ALLOWED_OUTBOX_STATUS = frozenset(set(_ALLOWED_OUTBOX_STATUS) | {
+    "pending", "failed", "unknown"
+})
+_ALLOWED_REASON_CODES = frozenset(set(_ALLOWED_REASON_CODES) | {
+    "DEFAULT_ALLOW",
+    "LOCAL_ROUTE_FALLBACK",
+    "DETECTOR_BLOCK",
+    "DETECTOR_HIGH",
+    "DETECTOR_CRITICAL",
+    "DETECTOR_TRIGGER",
+    "DETECTOR_ACTION_BLOCK",
+    "DETECTOR_ACTION_DEGRADE",
+    "FORMAL_DETECTOR_UNAVAILABLE",
+    "FORMAL_DETECTOR_REQUEST_BUILD_FAILED",
+    "FORMAL_DETECTOR_EXECUTION_FAILED",
+    "POLICY_BIND_ERROR",
+    "POLICY_DENY",
+    "POLICY_BLOCK",
+    "POLICY_DEGRADE",
+    "AUTHZ_DENY",
+    "RATE_IP_DENY",
+    "RATE_TENANT_DENY",
+    "RATE_USER_MODEL_DENY",
+    "ROUTE_BLOCK",
+    "ROUTE_DEGRADE",
+    "ROUTE_UNAVAILABLE",
+    "ATTESTATION_FAILED",
+    "RECEIPT_ISSUED",
+    "RECEIPT_SKIPPED",
+    "RECEIPT_LOCAL_ONLY",
+    "RECEIPT_DURABILITY_PENDING",
+    "AUDIT_EMIT_FAIL",
+    "LEDGER_PREPARE_FAILED",
+    "LEDGER_COMMIT_FAILED",
+})
+
+
+def _normalize_str_tuple(values: Any, *, max_len: int = 128, max_items: int = 32, lower: bool = False) -> Tuple[str, ...]:
+    if values is None:
+        return tuple()
+    if isinstance(values, str):
+        seq = [values]
+    elif isinstance(values, (list, tuple, set, frozenset)):
+        seq = list(values)
+    else:
+        return tuple()
+
+    out = []
+    seen = set()
+    for item in seq:
+        if len(out) >= max_items:
+            break
+        txt = _safe_text(item, max_len=max_len, redact_mode="token")
+        if lower:
+            txt = txt.lower()
+        if not txt or txt == "[redacted]" or txt in seen:
+            continue
+        seen.add(txt)
+        out.append(txt)
+    return tuple(out)
+
+
+def _normalize_digest_token(v: Any, *, kind: str = "any", default: Optional[str] = None) -> Optional[str]:
+    txt = _safe_text(v, max_len=4096, redact_mode="token")
+    if not txt or txt == "[redacted]":
+        return default
+
+    if _DIGEST_HEX_RE.fullmatch(txt) or _DIGEST_HEX_0X_RE.fullmatch(txt):
+        return txt.lower()
+
+    m = re.fullmatch(r"((?:[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}:){1,3})([0-9a-fA-F]{8,256})", txt)
+    if m:
+        return m.group(1) + m.group(2).lower()
+
+    if kind == "cfg_fp":
+        if _CFG_FP_RE.fullmatch(txt) or ":" in txt:
+            return txt
+        return default
+
+    if kind == "integrity":
+        if _RECEIPT_INTEGRITY_RE.fullmatch(txt) or ":" in txt:
+            return txt
+        return default
+
+    # Preserve service_http / receipt / storage handles such as:
+    # hcfg3:sha256:<hex>, body:sha256:<hex>, attn:<hex>, receipt@1#...
+    return txt
+
+
+def _to_primitive(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+
+    dump = getattr(obj, "model_dump", None)
+    if callable(dump) and not is_dataclass(obj):
+        with contextlib.suppress(Exception):
+            return _to_primitive(dump())
+
+    if is_dataclass(obj):
+        out = {}
+        with contextlib.suppress(Exception):
+            out.update({f.name: _to_primitive(getattr(obj, f.name)) for f in fields(obj)})
+        extra = getattr(obj, "__dict__", None)
+        if isinstance(extra, Mapping):
+            for k, v in extra.items():
+                if not str(k).startswith("_") and k not in out:
+                    out[str(k)] = _to_primitive(v)
+        return out
+
+    if isinstance(obj, Mapping):
+        return {str(k): _to_primitive(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_primitive(x) for x in obj]
+    if isinstance(obj, (set, frozenset)):
+        return [_to_primitive(x) for x in sorted(list(obj), key=lambda z: _safe_text_for_log(z, max_len=128))]
+
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        with contextlib.suppress(Exception):
+            return _to_primitive(to_dict())
+
+    return _safe_name(type(obj).__name__, default="object")
+
+
+def _view_instance(view_cls: Any, payload: Dict[str, Any]) -> Any:
+    if view_cls is None:
+        return dict(payload)
+    try:
+        mv = getattr(view_cls, "model_validate", None)
+        if callable(mv):
+            return mv(dict(payload))
+        return view_cls(**dict(payload))
+    except Exception:
+        return dict(payload)
+
+
+_OrigEvidenceIdentity = EvidenceIdentity
+_OrigArtifactRefs = ArtifactRefs
+_OrigReceiptSignal = ReceiptSignal
+
+
+class EvidenceIdentity(_OrigEvidenceIdentity):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        extras = {
+            k: kwargs.pop(k, None)
+            for k in (
+                "request_id", "trace_id", "ledger_ref", "attestation_ref",
+                "prepare_ref", "commit_ref", "outbox_ref", "outbox_status",
+                "ledger_stage",
+            )
+        }
+        _OrigEvidenceIdentity.__init__(self, *args, **kwargs)
+        object.__setattr__(self, "request_id", _safe_text_for_id(extras["request_id"], max_len=256, default=None))
+        object.__setattr__(self, "trace_id", _safe_text_for_id(extras["trace_id"], max_len=256, default=None))
+        for k in ("ledger_ref", "attestation_ref", "prepare_ref", "commit_ref", "outbox_ref"):
+            object.__setattr__(self, k, _safe_text_for_id(extras[k], max_len=256, default=None))
+        ob = _safe_label(extras["outbox_status"], default="") if extras["outbox_status"] is not None else ""
+        ls = _safe_label(extras["ledger_stage"], default="") if extras["ledger_stage"] is not None else ""
+        object.__setattr__(self, "outbox_status", ob if ob in _ALLOWED_OUTBOX_STATUS else (ob or None))
+        object.__setattr__(self, "ledger_stage", ls if ls in _ALLOWED_LEDGER_STAGE else (ls or None))
+
+    def to_evidence_identity_view(self, *, strict: bool = True) -> Any:
+        payload = self.to_internal_dict()
+        return _view_instance(EvidenceIdentityView, payload)
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return self.to_internal_dict()
+
+    def to_internal_dict(self) -> Dict[str, Any]:
+        return _to_primitive(self)
+
+
+class ArtifactRefs(_OrigArtifactRefs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        extras = {
+            k: kwargs.pop(k, None)
+            for k in (
+                "receipt_surface_kind", "receipt_delivery_state",
+                "evidence_durable", "evidence_storage_ready",
+                "governance_terminal", "receipt_governance_ready",
+                "receipt_required", "ledger_required", "attestation_required",
+                "durability",
+            )
+        }
+        _OrigArtifactRefs.__init__(self, *args, **kwargs)
+        for k in ("receipt_surface_kind", "receipt_delivery_state", "durability"):
+            object.__setattr__(self, k, _safe_text_for_id(extras[k], max_len=128, default=None))
+        for k in (
+            "evidence_durable", "evidence_storage_ready",
+            "governance_terminal", "receipt_governance_ready",
+            "receipt_required", "ledger_required", "attestation_required",
+        ):
+            object.__setattr__(self, k, _coerce_bool(extras[k]) if extras[k] is not None else None)
+
+    def to_artifact_refs_view(self, *, strict: bool = True) -> Any:
+        payload = self.to_internal_dict()
+        return _view_instance(ArtifactRefsView, payload)
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return self.to_internal_dict()
+
+    def to_internal_dict(self) -> Dict[str, Any]:
+        return _to_primitive(self)
+
+
+class ReceiptSignal(_OrigReceiptSignal):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        extra_names = (
+            "request_id", "ledger_ref", "attestation_ref", "prepare_ref",
+            "commit_ref", "outbox_ref", "outbox_status", "outbox_dedupe_key",
+            "delivery_attempts", "ledger_stage", "payload_digest",
+            "event_digest", "receipt_surface_kind", "receipt_delivery_state",
+            "evidence_durable", "evidence_storage_ready", "governance_terminal",
+            "receipt_governance_ready", "pq_required", "pq_ok",
+        )
+        extras = {k: kwargs.pop(k, None) for k in extra_names}
+        exact_body = kwargs.get("body")
+        _OrigReceiptSignal.__init__(self, *args, **kwargs)
+
+        ev = getattr(getattr(self, "envelope", None), "evidence", None)
+        art = getattr(getattr(self, "envelope", None), "artifacts", None)
+
+        def first(a: Any, b: Any = None) -> Any:
+            return a if a is not None else b
+
+        object.__setattr__(self, "request_id", _safe_text_for_id(first(extras["request_id"], getattr(ev, "request_id", None)), max_len=256, default=None))
+        for k in ("ledger_ref", "attestation_ref", "prepare_ref", "commit_ref", "outbox_ref", "outbox_dedupe_key"):
+            object.__setattr__(self, k, _safe_text_for_id(first(extras[k], getattr(art, k, None)), max_len=256, default=None))
+
+        da = _coerce_int(first(extras["delivery_attempts"], getattr(art, "delivery_attempts", None)))
+        object.__setattr__(self, "delivery_attempts", max(0, da) if da is not None else None)
+
+        ls = _safe_label(first(extras["ledger_stage"], getattr(art, "ledger_stage", None)), default="")
+        ob = _safe_label(first(extras["outbox_status"], getattr(art, "outbox_status", None)), default="")
+        object.__setattr__(self, "ledger_stage", ls if ls in _ALLOWED_LEDGER_STAGE else (ls or None))
+        object.__setattr__(self, "outbox_status", ob if ob in _ALLOWED_OUTBOX_STATUS else (ob or None))
+
+        object.__setattr__(self, "payload_digest", _normalize_digest_token(first(extras["payload_digest"], getattr(art, "payload_digest", None)), default=None))
+        object.__setattr__(self, "event_digest", _normalize_digest_token(first(extras["event_digest"], getattr(art, "event_digest", None)), default=None))
+
+        for k in ("receipt_surface_kind", "receipt_delivery_state"):
+            object.__setattr__(self, k, _safe_text_for_id(first(extras[k], getattr(art, k, None)), max_len=128, default=None))
+        for k in ("evidence_durable", "evidence_storage_ready", "governance_terminal", "receipt_governance_ready", "pq_required", "pq_ok"):
+            val = first(extras[k], getattr(art, k, None))
+            object.__setattr__(self, k, _coerce_bool(val) if val is not None else None)
+
+        if isinstance(exact_body, str):
+            try:
+                exact_body.encode("utf-8", errors="strict")
+                object.__setattr__(self, "body", exact_body)
+                if not getattr(self, "body_digest", None):
+                    object.__setattr__(self, "body_digest", "sha256:" + hashlib.sha256(exact_body.encode("utf-8")).hexdigest())
+            except Exception:
+                pass
+
+    def to_public_view(self, *, strict: bool = True) -> Any:
+        if strict:
+            self.assert_integrity()
+        payload = {
+            "schema": self.envelope.contract.schema_version,
+            "request_id": getattr(self, "request_id", None),
+            "head": self.head,
+            "receipt_ref": self.receipt_ref,
+            "audit_ref": self.audit_ref,
+            "event_id": self.event_id,
+            "decision_id": self.decision_id,
+            "route_plan_id": self.route_plan_id,
+            "policy_ref": self.policy_ref,
+            "policyset_ref": self.policyset_ref,
+            "cfg_fp": self.cfg_fp,
+            "verify_key_id": self.verify_key_id or self.sig_key_id,
+            "verify_key_fp": self.verify_key_fp,
+            "receipt_integrity": self.receipt_integrity,
+            "pq_required": getattr(self, "pq_required", None),
+            "pq_ok": getattr(self, "pq_ok", None),
+            "pq_signature_required": self.pq_signature_required,
+            "pq_signature_ok": self.pq_signature_ok,
+            "ledger_stage": getattr(self, "ledger_stage", None),
+            "outbox_status": getattr(self, "outbox_status", None),
+            "receipt_surface_kind": getattr(self, "receipt_surface_kind", None),
+            "receipt_delivery_state": getattr(self, "receipt_delivery_state", None),
+            "evidence_durable": getattr(self, "evidence_durable", None),
+            "evidence_storage_ready": getattr(self, "evidence_storage_ready", None),
+            "governance_terminal": getattr(self, "governance_terminal", None),
+            "receipt_governance_ready": getattr(self, "receipt_governance_ready", None),
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+        }
+        return _view_instance(ReceiptPublicView, payload)
+
+    def to_audit_view(self, *, strict: bool = True) -> Any:
+        if strict:
+            self.assert_integrity()
+        payload = {
+            **self.to_public_dict(),
+            "body_digest": self.body_digest,
+            "policy_digest": self.policy_digest,
+            "state_domain_id": self.state_domain_id,
+            "adapter_registry_fp": self.adapter_registry_fp,
+            "ledger_ref": getattr(self, "ledger_ref", None),
+            "attestation_ref": getattr(self, "attestation_ref", None),
+            "prepare_ref": getattr(self, "prepare_ref", None),
+            "commit_ref": getattr(self, "commit_ref", None),
+            "outbox_ref": getattr(self, "outbox_ref", None),
+            "outbox_dedupe_key": getattr(self, "outbox_dedupe_key", None),
+            "delivery_attempts": getattr(self, "delivery_attempts", None),
+            "payload_digest": getattr(self, "payload_digest", None),
+            "event_digest": getattr(self, "event_digest", None),
+            "meta": dict(self.meta) if isinstance(self.meta, Mapping) else {},
+        }
+        return _view_instance(ReceiptAuditView, payload)
+
+    def to_verification_view(self, *, strict: bool = True, include_verify_key: bool = True) -> Any:
+        if strict:
+            self.assert_integrity()
+        payload = {
+            "schema": self.envelope.contract.schema_version,
+            "request_id": getattr(self, "request_id", None),
+            "head": self.head,
+            "body": self.body,
+            "sig": self.sig,
+            "verify_key": self.verify_key if include_verify_key else None,
+            "verify_key_id": self.verify_key_id or self.sig_key_id,
+            "verify_key_fp": self.verify_key_fp,
+            "receipt_integrity": self.receipt_integrity,
+            "body_kind": self.body_kind,
+            "body_digest": self.body_digest,
+            "head_verified": self.head_verified,
+            "body_canonical_verified": self.body_canonical_verified,
+            "integrity_hash_verified": self.integrity_hash_verified,
+            "signature_verified": self.signature_verified,
+            "verify_key_allowed": self.verify_key_allowed,
+            "policy_binding_verified": self.policy_binding_verified,
+            "cfg_binding_verified": self.cfg_binding_verified,
+            "ledger_stage": getattr(self, "ledger_stage", None),
+            "outbox_status": getattr(self, "outbox_status", None),
+            "receipt_surface_kind": getattr(self, "receipt_surface_kind", None),
+            "receipt_delivery_state": getattr(self, "receipt_delivery_state", None),
+            "evidence_durable": getattr(self, "evidence_durable", None),
+            "evidence_storage_ready": getattr(self, "evidence_storage_ready", None),
+            "integrity_ok": self.integrity_ok,
+            "integrity_errors": list(self.integrity_errors),
+        }
+        return _view_instance(ReceiptVerificationView, payload)
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return _to_primitive(self.to_public_view(strict=False))
+
+    def to_audit_dict(self) -> Dict[str, Any]:
+        return _to_primitive(self.to_audit_view(strict=False))
+
+    def to_verification_dict(self, *, include_verify_key: bool = True, strict: bool = False) -> Dict[str, Any]:
+        return _to_primitive(self.to_verification_view(strict=strict, include_verify_key=include_verify_key))
+
+    def to_internal_dict(self) -> Dict[str, Any]:
+        return _to_primitive(self)
+
+
+def make_evidence_identity(**kwargs: Any) -> EvidenceIdentity:
+    return EvidenceIdentity(**kwargs)
+
+
+def make_artifact_refs(**kwargs: Any) -> ArtifactRefs:
+    return ArtifactRefs(**kwargs)
+
+
+def _obj_map(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    dump = getattr(obj, "model_dump", None)
+    if callable(dump):
+        with contextlib.suppress(Exception):
+            out = dump()
+            return dict(out) if isinstance(out, Mapping) else {}
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        with contextlib.suppress(Exception):
+            out = to_dict()
+            return dict(out) if isinstance(out, Mapping) else {}
+    if is_dataclass(obj):
+        with contextlib.suppress(Exception):
+            return _to_primitive(obj)
+    return {}
+
+
+def _submap(m: Mapping[str, Any], key: str) -> Dict[str, Any]:
+    v = m.get(key)
+    return dict(v) if isinstance(v, Mapping) else {}
+
+
+def _first(*vals: Any) -> Any:
+    for v in vals:
+        if v is not None and v != "" and v != [] and v != {}:
+            return v
+    return None
+
+
+def _service_http_evidence(payload: Mapping[str, Any]) -> EvidenceIdentity:
+    ev = _submap(payload, "evidence_identity")
+    art = _submap(payload, "artifacts")
+    return make_evidence_identity(
+        request_id=_first(ev.get("request_id"), payload.get("request_id")),
+        trace_id=_first(ev.get("trace_id"), payload.get("trace_id")),
+        event_id=_first(ev.get("event_id"), payload.get("event_id")),
+        decision_id=_first(ev.get("decision_id"), payload.get("decision_id")),
+        route_plan_id=_first(ev.get("route_plan_id"), payload.get("route_plan_id")),
+        route_id=_first(ev.get("route_id"), payload.get("route_plan_id")),
+        config_fingerprint=_first(ev.get("config_fingerprint"), payload.get("config_fingerprint"), payload.get("cfg_fp")),
+        bundle_version=_first(ev.get("bundle_version"), payload.get("bundle_version")),
+        policy_ref=_first(ev.get("policy_ref"), payload.get("policy_ref")),
+        policyset_ref=_first(ev.get("policyset_ref"), payload.get("policyset_ref")),
+        state_domain_id=_first(ev.get("state_domain_id"), payload.get("state_domain_id")),
+        controller_mode=_first(ev.get("controller_mode"), payload.get("controller_mode")),
+        statistical_guarantee_scope=_first(ev.get("statistical_guarantee_scope"), payload.get("statistical_guarantee_scope")),
+        adapter_registry_fp=_first(ev.get("adapter_registry_fp"), payload.get("adapter_registry_fp")),
+        selected_source=_first(ev.get("selected_source"), payload.get("selected_source")),
+        audit_ref=_first(ev.get("audit_ref"), art.get("audit_ref"), payload.get("audit_ref")),
+        receipt_ref=_first(ev.get("receipt_ref"), art.get("receipt_ref"), payload.get("receipt_ref")),
+        ledger_ref=_first(ev.get("ledger_ref"), art.get("ledger_ref"), payload.get("ledger_ref")),
+        attestation_ref=_first(ev.get("attestation_ref"), art.get("attestation_ref"), payload.get("attestation_ref")),
+        prepare_ref=_first(ev.get("prepare_ref"), art.get("prepare_ref"), payload.get("prepare_ref")),
+        commit_ref=_first(ev.get("commit_ref"), art.get("commit_ref"), payload.get("commit_ref")),
+        outbox_ref=_first(ev.get("outbox_ref"), art.get("outbox_ref"), payload.get("outbox_ref")),
+        outbox_status=_first(ev.get("outbox_status"), art.get("outbox_status"), payload.get("outbox_status")),
+        ledger_stage=_first(ev.get("ledger_stage"), art.get("ledger_stage"), payload.get("ledger_stage")),
+    )
+
+
+def _service_http_artifacts(payload: Mapping[str, Any]) -> ArtifactRefs:
+    art = _submap(payload, "artifacts")
+    pub = _submap(payload, "receipt_public")
+    ver = _submap(payload, "receipt_verification")
+    return make_artifact_refs(
+        audit_ref=_first(art.get("audit_ref"), pub.get("audit_ref"), payload.get("audit_ref")),
+        receipt_ref=_first(art.get("receipt_ref"), pub.get("receipt_ref"), pub.get("head"), ver.get("head"), payload.get("receipt_ref")),
+        ledger_ref=_first(art.get("ledger_ref"), payload.get("ledger_ref")),
+        attestation_ref=_first(art.get("attestation_ref"), payload.get("attestation_ref")),
+        event_digest=art.get("event_digest"),
+        body_digest=_first(art.get("body_digest"), payload.get("body_digest")),
+        payload_digest=art.get("payload_digest"),
+        prepare_ref=_first(art.get("prepare_ref"), payload.get("prepare_ref")),
+        commit_ref=_first(art.get("commit_ref"), payload.get("commit_ref")),
+        ledger_stage=_first(art.get("ledger_stage"), payload.get("ledger_stage")),
+        outbox_ref=_first(art.get("outbox_ref"), payload.get("outbox_ref")),
+        outbox_status=_first(art.get("outbox_status"), payload.get("outbox_status")),
+        outbox_dedupe_key=art.get("outbox_dedupe_key"),
+        delivery_attempts=art.get("delivery_attempts"),
+        chain_id=art.get("chain_id"),
+        chain_head=art.get("chain_head"),
+        receipt_surface_kind=_first(art.get("receipt_surface_kind"), pub.get("receipt_surface_kind")),
+        receipt_delivery_state=_first(art.get("receipt_delivery_state"), pub.get("receipt_delivery_state")),
+        evidence_durable=_first(art.get("evidence_durable"), pub.get("evidence_durable")),
+        evidence_storage_ready=_first(art.get("evidence_storage_ready"), pub.get("evidence_storage_ready")),
+        governance_terminal=_first(art.get("governance_terminal"), pub.get("governance_terminal")),
+        receipt_governance_ready=_first(art.get("receipt_governance_ready"), pub.get("receipt_governance_ready")),
+        receipt_required=art.get("receipt_required"),
+        ledger_required=art.get("ledger_required"),
+        attestation_required=art.get("attestation_required"),
+        durability=art.get("durability"),
+        produced_by=art.get("produced_by") or ("service_http", "signals"),
+        provenance_path_digest=art.get("provenance_path_digest"),
+    )
+
+
+def _service_http_envelope(payload: Mapping[str, Any], *, signal_kind: str, phase: str = "evaluated") -> SignalEnvelope:
+    ev = _service_http_evidence(payload)
+    art = _service_http_artifacts(payload)
+    return make_signal_envelope(
+        signal_kind=signal_kind,
+        phase=phase,
+        source_classification="control_plane_produced",
+        source="service_http",
+        profile="PROD",
+        config_fingerprint=ev.config_fingerprint,
+        bundle_version=ev.bundle_version,
+        evidence=ev,
+        artifacts=art,
+        tags=("signal:service_http",),
+    )
+
+
+def make_service_http_risk_signal(response: Any) -> RiskDecisionSignal:
+    payload = _obj_map(response)
+    comps = _submap(payload, "components")
+    ident = _submap(comps, "identity")
+    reqblk = _submap(comps, "request")
+    terminal = _submap(comps, "terminal")
+
+    subject = make_subject_context(
+        tenant=str(_first(ident.get("tenant"), reqblk.get("tenant"), payload.get("tenant"), "tenant0")),
+        user=str(_first(ident.get("user"), reqblk.get("user"), payload.get("user"), "user0")),
+        session=str(_first(ident.get("session"), reqblk.get("session"), payload.get("session"), "sess0")),
+    )
+    model = make_model_context(
+        model_id=str(_first(ident.get("model_id"), reqblk.get("model_id"), payload.get("model_id"), "model0")),
+        gpu_id=str(_first(reqblk.get("gpu_id"), payload.get("gpu_id"), "gpu0")),
+        task=str(_first(reqblk.get("task"), payload.get("task"), "chat")),
+        lang=str(_first(reqblk.get("lang"), payload.get("lang"), "en")),
+    )
+    security = make_security_context(
+        effective_trust_zone=str(_first(payload.get("trust_zone"), "internet")),
+        effective_route_profile=str(_first(payload.get("route_profile"), "inference")),
+        effective_threat_kind=payload.get("threat_kind"),
+        effective_pq_required=bool(_coerce_bool(payload.get("pq_required")) or False),
+        pq_ok=_coerce_bool(payload.get("pq_ok")) if payload.get("pq_ok") is not None else None,
+        policy_ref=payload.get("policy_ref"),
+        policyset_ref=payload.get("policyset_ref"),
+    )
+    stream = make_stream_context(
+        state_domain_id=payload.get("state_domain_id"),
+        adapter_registry_fp=_first(payload.get("adapter_registry_fp"), _submap(payload, "evidence_identity").get("adapter_registry_fp")),
+        selected_source=_first(payload.get("selected_source"), _submap(payload, "evidence_identity").get("selected_source")),
+        controller_mode=payload.get("controller_mode"),
+        statistical_guarantee_scope=payload.get("statistical_guarantee_scope"),
+    )
+
+    return RiskDecisionSignal(
+        envelope=_service_http_envelope(payload, signal_kind="risk_decision"),
+        subject=subject,
+        model=model,
+        security=security,
+        stream=stream,
+        verdict=bool(_coerce_bool(payload.get("verdict")) or False),
+        allowed=_coerce_bool(payload.get("allowed")) if payload.get("allowed") is not None else None,
+        decision=payload.get("decision"),
+        required_action=payload.get("required_action"),
+        enforcement_mode=payload.get("enforcement_mode"),
+        cause=payload.get("cause"),
+        action=payload.get("action"),
+        score=float(_coerce_float(payload.get("score")) or 0.0),
+        threshold=float(_coerce_float(payload.get("threshold")) or 0.0),
+        budget_remaining=float(_coerce_float(payload.get("budget_remaining")) or 0.0),
+        e_value=float(_coerce_float(payload.get("e_value")) or 1.0),
+        alpha_alloc=float(_coerce_float(payload.get("alpha_alloc")) or 0.0),
+        alpha_spent=float(_coerce_float(payload.get("alpha_spent")) or 0.0),
+        step=max(0, _coerce_int(payload.get("step")) or 0),
+        selected_source=stream.selected_source,
+        controller_mode=payload.get("controller_mode"),
+        statistical_guarantee_scope=payload.get("statistical_guarantee_scope"),
+        state_domain_id=payload.get("state_domain_id"),
+        adapter_registry_fp=stream.adapter_registry_fp,
+        primary_reason_code=payload.get("cause"),
+        reason_codes=tuple(x for x in (payload.get("cause"), terminal.get("reason_code")) if x),
+        detector_components=_submap(comps, "detector"),
+        multivar_components=_submap(comps, "multivariate"),
+        e_process_state=_submap(comps, "e_process"),
+        route_info=_submap(comps, "route"),
+    )
+
+
+def make_service_http_receipt_signal(response: Any) -> Optional[ReceiptSignal]:
+    payload = _obj_map(response)
+    pub = _submap(payload, "receipt_public")
+    ver = _submap(payload, "receipt_verification")
+    raw = _submap(payload, "receipt_private")
+    src = {**raw, **pub, **ver}
+    head = _first(src.get("head"), src.get("receipt"), src.get("receipt_head"), payload.get("receipt"))
+    body = _first(ver.get("body"), ver.get("receipt_body"), raw.get("body"), raw.get("receipt_body"), payload.get("receipt_body"))
+    if not head and not body and not _first(src.get("sig"), src.get("verify_key"), pub.get("receipt_ref"), payload.get("receipt_ref")):
+        return None
+
+    return ReceiptSignal(
+        envelope=_service_http_envelope(payload, signal_kind="receipt", phase="materialized"),
+        head=head,
+        body=body,
+        sig=_first(src.get("sig"), src.get("receipt_sig"), payload.get("receipt_sig")),
+        verify_key=_first(src.get("verify_key"), payload.get("verify_key")),
+        receipt_ref=_first(pub.get("receipt_ref"), raw.get("receipt_ref"), payload.get("receipt_ref"), head),
+        audit_ref=_first(pub.get("audit_ref"), raw.get("audit_ref"), payload.get("audit_ref")),
+        request_id=payload.get("request_id"),
+        event_id=_first(src.get("event_id"), payload.get("event_id")),
+        decision_id=_first(src.get("decision_id"), payload.get("decision_id")),
+        route_plan_id=_first(src.get("route_plan_id"), payload.get("route_plan_id")),
+        policy_ref=_first(src.get("policy_ref"), payload.get("policy_ref")),
+        policyset_ref=_first(src.get("policyset_ref"), payload.get("policyset_ref")),
+        cfg_fp=_first(src.get("cfg_fp"), payload.get("config_fingerprint")),
+        state_domain_id=_first(src.get("state_domain_id"), payload.get("state_domain_id")),
+        adapter_registry_fp=_first(src.get("adapter_registry_fp"), _submap(payload, "evidence_identity").get("adapter_registry_fp")),
+        verify_key_id=src.get("verify_key_id"),
+        sig_key_id=src.get("sig_key_id"),
+        verify_key_fp=src.get("verify_key_fp"),
+        receipt_integrity=src.get("receipt_integrity"),
+        body_kind=src.get("body_kind") or ("canonical_json" if body else "opaque"),
+        body_digest=src.get("body_digest"),
+        ledger_ref=_first(payload.get("ledger_ref"), _submap(payload, "artifacts").get("ledger_ref")),
+        attestation_ref=_first(payload.get("attestation_ref"), _submap(payload, "artifacts").get("attestation_ref")),
+        prepare_ref=_first(payload.get("prepare_ref"), _submap(payload, "artifacts").get("prepare_ref")),
+        commit_ref=_first(payload.get("commit_ref"), _submap(payload, "artifacts").get("commit_ref")),
+        outbox_ref=_first(payload.get("outbox_ref"), _submap(payload, "artifacts").get("outbox_ref")),
+        outbox_status=_first(payload.get("outbox_status"), _submap(payload, "artifacts").get("outbox_status"), pub.get("outbox_status")),
+        ledger_stage=_first(payload.get("ledger_stage"), _submap(payload, "artifacts").get("ledger_stage"), pub.get("ledger_stage")),
+        payload_digest=_submap(payload, "artifacts").get("payload_digest"),
+        event_digest=_submap(payload, "artifacts").get("event_digest"),
+        receipt_surface_kind=pub.get("receipt_surface_kind"),
+        receipt_delivery_state=pub.get("receipt_delivery_state"),
+        evidence_durable=pub.get("evidence_durable"),
+        evidence_storage_ready=pub.get("evidence_storage_ready"),
+        governance_terminal=pub.get("governance_terminal"),
+        receipt_governance_ready=pub.get("receipt_governance_ready"),
+        pq_required=src.get("pq_required"),
+        pq_ok=src.get("pq_ok"),
+        head_verified=ver.get("head_verified"),
+        body_canonical_verified=ver.get("body_canonical_verified"),
+        integrity_hash_verified=ver.get("integrity_hash_verified"),
+        signature_verified=ver.get("signature_verified"),
+        verify_key_allowed=ver.get("verify_key_allowed"),
+        policy_binding_verified=ver.get("policy_binding_verified"),
+        cfg_binding_verified=ver.get("cfg_binding_verified"),
+        pq_signature_required=src.get("pq_signature_required"),
+        pq_signature_ok=src.get("pq_signature_ok"),
+        integrity_ok=bool(_coerce_bool(src.get("integrity_ok")) if src.get("integrity_ok") is not None else True),
+        integrity_errors=tuple(src.get("integrity_errors") or ()),
+        meta={"request_id": payload.get("request_id"), "source": "service_http"},
+    )
+
+
+def signals_from_service_http_response(response: Any, *, include_receipt: bool = True) -> Tuple[GovernedSignal, ...]:
+    payload = _obj_map(response)
+    out: List[GovernedSignal] = [make_service_http_risk_signal(payload)]
+    if include_receipt:
+        rec = make_service_http_receipt_signal(payload)
+        if rec is not None:
+            out.append(rec)
+    return tuple(out)
+
+
+def _bus_emit_service_http_response(self: SignalBus, response: Any, *, include_receipt: bool = True) -> Tuple[SignalEmitResult, ...]:
+    return self.emit_many(signals_from_service_http_response(response, include_receipt=include_receipt))
+
+
+def _provider_emit_service_http_response(self: DefaultSignalProvider, response: Any, *, include_receipt: bool = True) -> Tuple[SignalEmitResult, ...]:
+    return self.emit_many(signals_from_service_http_response(response, include_receipt=include_receipt))
+
+
+SignalBus.emit_service_http_response = _bus_emit_service_http_response  # type: ignore[attr-defined]
+DefaultSignalProvider.emit_service_http_response = _provider_emit_service_http_response  # type: ignore[attr-defined]
+SignalEvidenceTranslator.from_service_http_response = staticmethod(signals_from_service_http_response)  # type: ignore[attr-defined]
+
+for _n in ("signals_from_service_http_response", "make_service_http_risk_signal", "make_service_http_receipt_signal"):
+    if _n not in __all__:
+        __all__.append(_n)
+
+# --- TCD signals compatibility overlay END ---
+
+
+# --- TCD dataclass diagnostics compatibility patch START ---
+def _signal_diag_tuple(signal: Any, name: str) -> Tuple[str, ...]:
+    """
+    Compatibility helper for GovernedSignal diagnostics.
+
+    Some concrete dataclass signals define fields named:
+      - normalization_warnings
+      - compatibility_warnings
+      - integrity_errors
+
+    Those instance fields intentionally shadow GovernedSignal methods with the
+    same names. SignalBus must therefore read the field if present, and only call
+    it when the attribute is callable.
+    """
+    try:
+        val = getattr(signal, name, tuple())
+    except Exception:
+        return tuple()
+
+    if callable(val):
+        with contextlib.suppress(Exception):
+            val = val()
+
+    if val is None:
+        return tuple()
+    if isinstance(val, str):
+        return (val,)
+    if isinstance(val, (list, tuple, set, frozenset)):
+        out = []
+        seen = set()
+        for item in list(val)[:64]:
+            txt = _safe_text(item, max_len=256, redact_mode="strict")
+            if not txt or txt in seen:
+                continue
+            seen.add(txt)
+            out.append(txt)
+        return tuple(out)
+    txt = _safe_text(val, max_len=256, redact_mode="strict")
+    return (txt,) if txt else tuple()
+# --- TCD dataclass diagnostics compatibility patch END ---
+

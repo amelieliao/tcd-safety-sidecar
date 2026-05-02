@@ -15,11 +15,21 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from pydantic import BaseModel, Field, ValidationError, ConfigDict, field_validator, model_validator
 
 from .crypto import Blake3Hash
-from .detector import TCDConfig
+try:
+    from .detector import DetectorConfig as DetectorRuntimeConfig, CalibratorConfig, HardBlockPolicy, EvidencePolicy, IsotonicKnots  # type: ignore
+except Exception:  # pragma: no cover
+    from .detector import TCDConfig as DetectorRuntimeConfig  # type: ignore
+    CalibratorConfig = None  # type: ignore[assignment]
+    HardBlockPolicy = None  # type: ignore[assignment]
+    EvidencePolicy = None  # type: ignore[assignment]
+    IsotonicKnots = None  # type: ignore[assignment]
 from .risk_av import AlwaysValidConfig
 
 __all__ = [
     "MatchSpec",
+    "DetectorCalibratorOverrides",
+    "DetectorHardBlockOverrides",
+    "DetectorEvidenceOverrides",
     "DetectorOverrides",
     "AVOverrides",
     "RoutingOverrides",
@@ -171,6 +181,229 @@ def _safe_id(s: Any, *, default: Optional[str] = None, max_len: int = 256) -> Op
     if not _SAFE_ID_RE.fullmatch(x):
         return default
     return x
+
+
+_SAFE_HEAD_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,47}$")
+
+
+def _safe_head_name(s: Any, *, default: Optional[str] = None) -> Optional[str]:
+    if not isinstance(s, str):
+        return default
+    x = _strip_unsafe_text(s.lower(), max_len=48)
+    if not x:
+        return default
+    x = re.sub(r"[^a-z0-9_:-]+", "_", x).strip("_")
+    if not x or not _SAFE_HEAD_NAME_RE.fullmatch(x):
+        return default
+    return x
+
+
+def _normalize_safe_label_tuple(values: Any, *, max_items: int = 64) -> Tuple[str, ...]:
+    if values is None:
+        return tuple()
+    if isinstance(values, str):
+        seq: Sequence[Any] = [values]
+    elif isinstance(values, (list, tuple, set, frozenset)):
+        seq = list(values)
+    else:
+        return tuple()
+    out: List[str] = []
+    seen = set()
+    for item in seq:
+        if len(out) >= max_items:
+            break
+        s = _safe_label(item, default=None)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return tuple(out)
+
+
+def _normalize_head_weights_value(values: Any, *, max_items: int = 32) -> Tuple[Tuple[str, float], ...]:
+    if values is None:
+        return tuple()
+    pairs: List[Tuple[str, float]] = []
+    if isinstance(values, Mapping):
+        items = list(values.items())
+    elif isinstance(values, (list, tuple)):
+        items = list(values)
+    else:
+        return tuple()
+    for item in items[:max_items]:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            name, weight = item
+        elif isinstance(item, tuple) and len(item) == 2:
+            name, weight = item
+        elif isinstance(values, Mapping):
+            name, weight = item  # type: ignore[misc]
+        else:
+            continue
+        safe_name = _safe_head_name(name, default=None)
+        if not safe_name:
+            continue
+        wf = _finite_float(weight)
+        if wf is None or wf <= 0.0:
+            continue
+        pairs.append((safe_name, max(0.05, min(10.0, float(wf)))))
+    pairs.sort(key=lambda x: x[0])
+    dedup: Dict[str, float] = {}
+    for name, weight in pairs:
+        dedup[name] = weight
+    return tuple((k, dedup[k]) for k in sorted(dedup.keys()))
+
+
+def _normalize_isotonic_knots_value(values: Any, *, max_items: int = 512) -> Optional[List[Tuple[float, float]]]:
+    if values is None:
+        return None
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("isotonic_knots must be a list of [score, p] pairs")
+    if len(values) > max_items:
+        raise ValueError(f"too many isotonic knots: {len(values)}")
+    out: List[Tuple[float, float]] = []
+    for item in values:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("each isotonic knot must be [score, p]")
+        xf = _finite_float(item[0])
+        yf = _finite_float(item[1])
+        if xf is None or yf is None:
+            raise ValueError("isotonic knot values must be finite")
+        out.append((float(xf), float(yf)))
+    return out
+
+
+def _build_detector_config(base: Any, override: Optional["DetectorOverrides"]) -> Any:
+    """
+    Merge rule-level detector overrides into DetectorConfig.
+    Keeps backward compatibility: if the imported detector module does not expose
+    the richer DetectorConfig/CalibratorConfig/HardBlockPolicy/EvidencePolicy
+    dataclasses, the base detector config is returned unchanged.
+    """
+    base_cfg = _copy_config(base)
+    if base_cfg is None or override is None:
+        return base_cfg
+    if CalibratorConfig is None or HardBlockPolicy is None or EvidencePolicy is None:
+        return base_cfg
+    if not all(hasattr(base_cfg, fld) for fld in ("calibrator", "hard_block", "head_weights", "evidence_policy", "normalized")):
+        return base_cfg
+
+    ov = override.model_dump(exclude_none=True) if hasattr(override, "model_dump") else {}
+    if not isinstance(ov, dict):
+        return base_cfg
+
+    legacy_keys = {
+        "window_size",
+        "ewma_alpha",
+        "entropy_floor",
+        "spread_threshold",
+        "rel_drop_threshold",
+        "z_threshold",
+        "min_calibration_steps",
+        "hard_fail_on_floor",
+        "combine_mode",
+        "on_threshold",
+        "off_threshold",
+        "cooldown_steps",
+        "multi_var_enabled",
+        "multi_var_window",
+        "multi_var_dim_limit",
+        "apt_profile",
+    }
+    for k in list(ov.keys()):
+        if k in legacy_keys:
+            ov.pop(k, None)
+
+    cal_base = getattr(base_cfg, "calibrator")
+    cal_ov = ov.pop("calibrator", None) or {}
+    if isinstance(cal_ov, Mapping):
+        iso_knots = getattr(cal_base, "isotonic_knots", None)
+        if "isotonic_knots" in cal_ov:
+            knots_list = _normalize_isotonic_knots_value(cal_ov.get("isotonic_knots"))
+            if knots_list is not None and IsotonicKnots is not None:
+                iso_knots = IsotonicKnots(pairs=tuple(knots_list))
+            else:
+                iso_knots = None
+        cal_cfg = CalibratorConfig(
+            mode=str(cal_ov.get("mode", getattr(cal_base, "mode", "isotonic")) or "isotonic").strip().lower(),
+            isotonic_knots=iso_knots,
+            conformal_window=int(cal_ov.get("conformal_window", getattr(cal_base, "conformal_window", 1024))),
+            alpha=float(cal_ov.get("alpha", getattr(cal_base, "alpha", 0.05))),
+            version=_safe_id(cal_ov.get("version", getattr(cal_base, "version", "3.0.0")), default=getattr(cal_base, "version", "3.0.0"), max_len=64) or getattr(cal_base, "version", "3.0.0"),
+        )
+    else:
+        cal_cfg = cal_base
+
+    hb_base = getattr(base_cfg, "hard_block")
+    hb_ov = ov.pop("hard_block", None) or {}
+    if isinstance(hb_ov, Mapping):
+        hb_cfg = HardBlockPolicy(
+            hard_block_risk=float(hb_ov.get("hard_block_risk", getattr(hb_base, "hard_block_risk", 0.93))),
+            min_coverage=float(hb_ov.get("min_coverage", getattr(hb_base, "min_coverage", 0.60))),
+            min_confidence=float(hb_ov.get("min_confidence", getattr(hb_base, "min_confidence", 0.55))),
+            low_coverage_floor=float(hb_ov.get("low_coverage_floor", getattr(hb_base, "low_coverage_floor", 0.35))),
+            low_coverage_block_risk=float(hb_ov.get("low_coverage_block_risk", getattr(hb_base, "low_coverage_block_risk", 0.70))),
+        )
+    else:
+        hb_cfg = hb_base
+
+    sources = tuple(getattr(base_cfg, "conformal_allowed_sources", tuple()))
+    if "conformal_allowed_sources" in ov:
+        srcs = _normalize_safe_label_tuple(ov.get("conformal_allowed_sources"), max_items=32)
+        if srcs:
+            sources = tuple(sorted(set(srcs)))
+
+    head_weights = tuple(getattr(base_cfg, "head_weights", tuple()))
+    if "head_weights" in ov:
+        hw = _normalize_head_weights_value(ov.get("head_weights"), max_items=32)
+        if hw:
+            head_weights = hw
+
+    ep_base = getattr(base_cfg, "evidence_policy")
+    ep_ov = ov.pop("evidence_policy", None) or {}
+    if isinstance(ep_ov, Mapping):
+        ep_cfg = EvidencePolicy(
+            sanitize_evidence=bool(ep_ov.get("sanitize_evidence", getattr(ep_base, "sanitize_evidence", True))),
+            strip_pii=bool(ep_ov.get("strip_pii", getattr(ep_base, "strip_pii", True))),
+            hash_pii_tags=bool(ep_ov.get("hash_pii_tags", getattr(ep_base, "hash_pii_tags", True))),
+            pii_mode=("strict" if str(ep_ov.get("pii_mode", getattr(ep_base, "pii_mode", "light")) or "light").strip().lower() == "strict" else "light"),
+            allow_raw_tenant=bool(ep_ov.get("allow_raw_tenant", getattr(ep_base, "allow_raw_tenant", False))),
+            max_evidence_keys=int(ep_ov.get("max_evidence_keys", getattr(ep_base, "max_evidence_keys", 64))),
+            max_evidence_string=int(ep_ov.get("max_evidence_string", getattr(ep_base, "max_evidence_string", 512))),
+            max_depth=int(ep_ov.get("max_depth", getattr(ep_base, "max_depth", 4))),
+            max_keys_per_dict=int(ep_ov.get("max_keys_per_dict", getattr(ep_base, "max_keys_per_dict", 64))),
+            max_list_items=int(ep_ov.get("max_list_items", getattr(ep_base, "max_list_items", 64))),
+            max_total_nodes=int(ep_ov.get("max_total_nodes", getattr(ep_base, "max_total_nodes", 512))),
+            max_scan_per_dict=int(ep_ov.get("max_scan_per_dict", getattr(ep_base, "max_scan_per_dict", 256))),
+            pii_hmac_key=getattr(ep_base, "pii_hmac_key", None),
+            pii_hmac_key_id=getattr(ep_base, "pii_hmac_key_id", ""),
+            evidence_hmac_key=getattr(ep_base, "evidence_hmac_key", None),
+            evidence_hmac_key_id=getattr(ep_base, "evidence_hmac_key_id", ""),
+        )
+    else:
+        ep_cfg = ep_base
+
+    patch = {
+        "t_low": float(ov.get("t_low", getattr(base_cfg, "t_low", 0.2))),
+        "t_high": float(ov.get("t_high", getattr(base_cfg, "t_high", 0.8))),
+        "time_budget_ms": float(ov.get("time_budget_ms", getattr(base_cfg, "time_budget_ms", 3.0))),
+        "max_tokens": int(ov.get("max_tokens", getattr(base_cfg, "max_tokens", 2048))),
+        "max_bytes": int(ov.get("max_bytes", getattr(base_cfg, "max_bytes", 100_000))),
+        "calibrator": cal_cfg,
+        "conformal_ref_max": float(ov.get("conformal_ref_max", getattr(base_cfg, "conformal_ref_max", 0.5))),
+        "conformal_min_p_update": float(ov.get("conformal_min_p_update", getattr(base_cfg, "conformal_min_p_update", 0.8))),
+        "conformal_allowed_sources": sources,
+        "hard_block": hb_cfg,
+        "head_weights": head_weights,
+        "evidence_policy": ep_cfg,
+    }
+    try:
+        cfg = replace(base_cfg, **patch)
+    except Exception:
+        return base_cfg
+    try:
+        return cfg.normalized()
+    except Exception:
+        return cfg
 
 
 # Keys allowed in ctx (MatchSpec fields)
@@ -357,7 +590,6 @@ def _normalize_regex_policy(rp: RegexPolicy, *, strict: bool) -> Tuple[RegexPoli
     allow_on_re = bool(rp.allow_regex_on_re_engine)
     if eff == "re" and allow_regex and not allow_on_re:
         allow_regex = False
-        errors.append("regex_disabled_on_re_engine: stdlib re has no timeout; set allow_regex_on_re_engine=True to override")
 
     # Require timeout when using regex engine in strict mode
     req_timeout = bool(rp.require_timeout_enforced)
@@ -590,7 +822,119 @@ class MatchSpec(_StrictModel):
         return _sanitize_pat_str(v)
 
 
+class DetectorCalibratorOverrides(_StrictModel):
+    mode: Optional[str] = None
+    isotonic_knots: Optional[List[Tuple[float, float]]] = None
+    conformal_window: Optional[int] = Field(default=None, ge=32, le=16384)
+    alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    version: Optional[str] = None
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _v_mode(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        s = _strip_unsafe_text(v, max_len=32).lower()
+        if s not in {"isotonic", "conformal", "identity"}:
+            return None
+        return s
+
+    @field_validator("alpha", mode="before")
+    @classmethod
+    def _v_alpha(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        fv = _finite_float(v)
+        if fv is None:
+            raise ValueError("alpha must be finite")
+        return fv
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _v_version(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        return _safe_id(v, default=None, max_len=64)
+
+    @field_validator("isotonic_knots", mode="before")
+    @classmethod
+    def _v_knots(cls, v: Any) -> Any:
+        return _normalize_isotonic_knots_value(v)
+
+
+class DetectorHardBlockOverrides(_StrictModel):
+    hard_block_risk: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_coverage: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    low_coverage_floor: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    low_coverage_block_risk: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    @field_validator(
+        "hard_block_risk",
+        "min_coverage",
+        "min_confidence",
+        "low_coverage_floor",
+        "low_coverage_block_risk",
+        mode="before",
+    )
+    @classmethod
+    def _v_finite_float(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        fv = _finite_float(v)
+        if fv is None:
+            raise ValueError("float must be finite")
+        return fv
+
+
+class DetectorEvidenceOverrides(_StrictModel):
+    sanitize_evidence: Optional[bool] = None
+    strip_pii: Optional[bool] = None
+    hash_pii_tags: Optional[bool] = None
+    pii_mode: Optional[str] = None
+    allow_raw_tenant: Optional[bool] = None
+
+    max_evidence_keys: Optional[int] = Field(default=None, ge=16, le=256)
+    max_evidence_string: Optional[int] = Field(default=None, ge=128, le=2048)
+    max_depth: Optional[int] = Field(default=None, ge=1, le=8)
+    max_keys_per_dict: Optional[int] = Field(default=None, ge=8, le=256)
+    max_list_items: Optional[int] = Field(default=None, ge=8, le=256)
+    max_total_nodes: Optional[int] = Field(default=None, ge=64, le=4096)
+    max_scan_per_dict: Optional[int] = Field(default=None, ge=8, le=2048)
+
+    @field_validator("pii_mode", mode="before")
+    @classmethod
+    def _v_pii_mode(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        s = _strip_unsafe_text(v, max_len=16).lower()
+        if s not in {"light", "strict"}:
+            return None
+        return s
+
+
 class DetectorOverrides(_StrictModel):
+    # New detector_v3 / multi-head DetectorConfig overrides
+    t_low: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    t_high: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    time_budget_ms: Optional[float] = Field(default=None, ge=0.5, le=50.0)
+    max_tokens: Optional[int] = Field(default=None, ge=64, le=8192)
+    max_bytes: Optional[int] = Field(default=None, ge=1024, le=2_000_000)
+    calibrator: Optional[DetectorCalibratorOverrides] = None
+    conformal_ref_max: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    conformal_min_p_update: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    conformal_allowed_sources: Optional[List[str]] = None
+    hard_block: Optional[DetectorHardBlockOverrides] = None
+    head_weights: Optional[Dict[str, float]] = None
+    evidence_policy: Optional[DetectorEvidenceOverrides] = None
+
+    # Legacy compatibility shims (accepted but ignored by DetectorConfig merge)
     window_size: Optional[int] = Field(default=None, ge=1, le=10_000_000)
     ewma_alpha: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     entropy_floor: Optional[float] = Field(default=None, ge=0.0, le=1e9)
@@ -599,18 +943,21 @@ class DetectorOverrides(_StrictModel):
     z_threshold: Optional[float] = Field(default=None, ge=0.0, le=1e6)
     min_calibration_steps: Optional[int] = Field(default=None, ge=0, le=10_000_000)
     hard_fail_on_floor: Optional[bool] = None
-
     combine_mode: Optional[str] = None
     on_threshold: Optional[float] = Field(default=None, ge=0.0, le=1e9)
     off_threshold: Optional[float] = Field(default=None, ge=0.0, le=1e9)
     cooldown_steps: Optional[int] = Field(default=None, ge=0, le=10_000_000)
-
     multi_var_enabled: Optional[bool] = None
     multi_var_window: Optional[int] = Field(default=None, ge=1, le=10_000_000)
     multi_var_dim_limit: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     apt_profile: Optional[str] = None
 
     @field_validator(
+        "t_low",
+        "t_high",
+        "time_budget_ms",
+        "conformal_ref_max",
+        "conformal_min_p_update",
         "ewma_alpha",
         "entropy_floor",
         "spread_threshold",
@@ -629,6 +976,31 @@ class DetectorOverrides(_StrictModel):
             raise ValueError("float must be finite")
         return fv
 
+    @field_validator("conformal_allowed_sources", mode="before")
+    @classmethod
+    def _v_sources(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        vals = _normalize_safe_label_tuple(v, max_items=32)
+        return list(vals) if vals else None
+
+    @field_validator("head_weights", mode="before")
+    @classmethod
+    def _v_head_weights(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, Mapping):
+            out: Dict[str, float] = {}
+            for k, w in _normalize_head_weights_value(v, max_items=32):
+                out[k] = float(w)
+            return out or None
+        if isinstance(v, (list, tuple)):
+            out2: Dict[str, float] = {}
+            for k, w in _normalize_head_weights_value(v, max_items=32):
+                out2[k] = float(w)
+            return out2 or None
+        raise ValueError("head_weights must be a mapping or list of [name, weight] pairs")
+
     @field_validator("combine_mode", "apt_profile", mode="before")
     @classmethod
     def _v_lbl(cls, v: Any) -> Any:
@@ -640,6 +1012,8 @@ class DetectorOverrides(_StrictModel):
 
     @model_validator(mode="after")
     def _cross_checks(self) -> "DetectorOverrides":
+        if self.t_low is not None and self.t_high is not None and self.t_low > self.t_high:
+            raise ValueError("detector t_low must be <= t_high")
         # Example cross-field sanity: off_threshold should not exceed on_threshold if both exist.
         if self.on_threshold is not None and self.off_threshold is not None:
             if self.off_threshold > self.on_threshold:
@@ -793,6 +1167,11 @@ class PolicyRule(_StrictModel):
     compliance_profile: Optional[str] = None
     risk_label: Optional[str] = None
 
+    # SecurityRouter reads these from BoundPolicy via getattr(...).
+    # Without these fields, JSON policies cannot actually allow/deny/degrade.
+    decision: Optional[str] = None
+    enforcement: Optional[str] = None
+
     origin: Optional[str] = None
     policy_patch_id: Optional[str] = None
     commit_hash: Optional[str] = None
@@ -828,6 +1207,32 @@ class PolicyRule(_StrictModel):
         if not isinstance(v, str):
             return None
         return _safe_label(v, default=None)
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _v_decision(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        s = _safe_label(v, default=None)
+        if s == "block":
+            return "deny"
+        if s in {"inherit", "allow", "deny", "degrade"}:
+            return s
+        return None
+
+    @field_validator("enforcement", mode="before")
+    @classmethod
+    def _v_enforcement(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return None
+        s = _safe_label(v, default=None)
+        if s in {"allow", "block", "deny", "fail_closed", "degrade", "advisory", "must_enforce"}:
+            return s
+        return None
 
     @field_validator("origin", mode="before")
     @classmethod
@@ -901,6 +1306,8 @@ class PolicyRule(_StrictModel):
                 "audit": self.audit.model_dump() if self.audit else {},
                 "compliance_profile": self.compliance_profile,
                 "risk_label": self.risk_label,
+                "decision": self.decision,
+                "enforcement": self.enforcement,
                 "origin": self.origin,
                 "policy_patch_id": self.policy_patch_id,
                 "commit_hash": self.commit_hash,
@@ -936,7 +1343,7 @@ class BoundPolicy:
     policy_ref: str
     priority: int
 
-    detector_cfg: TCDConfig
+    detector_cfg: DetectorRuntimeConfig
     av_cfg: AlwaysValidConfig
 
     t_low: Optional[float]
@@ -1240,7 +1647,7 @@ def _parse_policy_obj(obj: Any, *, strict_schema: bool) -> Tuple[List[PolicyRule
 
 class PolicyStore:
     """
-    L6–L7+ PolicyStore:
+    L6âL7+ PolicyStore:
 
       - load/parse/compile errors are NEVER silently swallowed (recorded in bundle.errors)
       - fail-closed is enforceable and optionally strict (fail_closed_on_any_error)
@@ -1257,7 +1664,7 @@ class PolicyStore:
         self,
         rules: List[PolicyRule],
         *,
-        base_detector: Optional[TCDConfig] = None,
+        base_detector: Optional[DetectorRuntimeConfig] = None,
         base_av: Optional[AlwaysValidConfig] = None,
         default_token_cost_divisor: float = 50.0,
         # Load/compile error semantics
@@ -1291,7 +1698,7 @@ class PolicyStore:
     ):
         self._lock = threading.RLock()
 
-        self._base_detector = _copy_config(base_detector or TCDConfig())
+        self._base_detector = _copy_config(base_detector or DetectorRuntimeConfig())
         self._base_av = _copy_config(base_av or AlwaysValidConfig())
         self._default_token_cost_divisor = float(default_token_cost_divisor)
 
@@ -2113,9 +2520,8 @@ class PolicyStore:
         spec = _specificity_from_match(m, rp)
         prio = int(rule.priority)
 
-        det_override = rule.detector.model_dump(exclude_none=True) if rule.detector else {}
         av_override = rule.av.model_dump(exclude_none=True) if rule.av else {}
-        det_eff = _dc_update(self._base_detector, det_override)
+        det_eff = _build_detector_config(self._base_detector, rule.detector)
         av_eff = _dc_update(self._base_av, av_override)
 
         r = rule.routing.model_dump(exclude_none=True) if rule.routing else {}
@@ -2222,8 +2628,8 @@ class PolicyStore:
             policy_patch_id=rule.policy_patch_id,
             commit_hash=rule.commit_hash,
             change_ticket_id=rule.change_ticket_id,
-            decision="inherit",
-            enforcement=None,
+            decision=(rule.decision or "inherit"),
+            enforcement=rule.enforcement,
         )
 
         return (

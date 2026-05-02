@@ -14,7 +14,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, Literal
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, Literal
 from urllib.parse import urlsplit
 
 from starlette.datastructures import MutableHeaders
@@ -394,6 +394,28 @@ def _header_budget_from_scope(scope: Mapping[str, Any]) -> Tuple[int, int]:
             total += len(v)
         count += 1
     return count, total
+
+
+def _raw_header_value_lengths_from_scope(scope: Mapping[str, Any], names: Iterable[str]) -> Dict[str, int]:
+    wanted = {str(x).lower() for x in names}
+    out: Dict[str, int] = {}
+    raw_headers = scope.get("headers") or []
+    if not isinstance(raw_headers, list):
+        return out
+    for item in raw_headers:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        k, v = item
+        if not isinstance(k, (bytes, bytearray)) or not isinstance(v, (bytes, bytearray)):
+            continue
+        ks = k.decode("latin-1", errors="ignore").lower().strip()
+        if ks not in wanted:
+            continue
+        add = len(v)
+        if ks in out:
+            add += 2
+        out[ks] = out.get(ks, 0) + add
+    return out
 
 
 def _headers_from_scope(scope: Mapping[str, Any]) -> Dict[str, str]:
@@ -1089,6 +1111,9 @@ class _BucketShard:
 
             bucket = self.items.get(ip)
             if bucket is None:
+                if limit > 0:
+                    while len(self.items) >= limit and self.items:
+                        self.items.popitem(last=False)
                 bucket = _IpBucket(capacity, refill)
                 self.items[ip] = bucket
             else:
@@ -1638,12 +1663,28 @@ class _SecurityEngine:
             return 431, "headers_too_many"
         if hbytes > self._cfg.max_header_bytes:
             return 431, "headers_too_large"
+        raw_lengths = _raw_header_value_lengths_from_scope(scope, ("origin", "x-forwarded-for"))
+
         origin = headers.get("origin")
-        if origin is not None and len(origin.encode("utf-8", errors="ignore")) > self._cfg.max_origin_bytes:
+        origin_raw_len = raw_lengths.get("origin")
+        if origin_raw_len is not None and origin_raw_len > self._cfg.max_origin_bytes:
             return 400, "origin_too_large"
+        if origin_raw_len is None and origin is not None and len(origin.encode("utf-8", errors="ignore")) > self._cfg.max_origin_bytes:
+            return 400, "origin_too_large"
+
         xff = headers.get("x-forwarded-for")
-        if xff is not None and len(xff.encode("utf-8", errors="ignore")) > self._cfg.max_xff_bytes:
+        xff_raw_len = raw_lengths.get("x-forwarded-for")
+        if xff_raw_len is not None and xff_raw_len > self._cfg.max_xff_bytes:
             return 400, "xff_too_large"
+        if xff_raw_len is None and xff is not None and len(xff.encode("utf-8", errors="ignore")) > self._cfg.max_xff_bytes:
+            return 400, "xff_too_large"
+
+        raw_path = scope.get("raw_path")
+        if isinstance(raw_path, (bytes, bytearray)) and len(raw_path) > self._cfg.max_path_bytes:
+            return 414, "path_too_large"
+        scope_path = scope.get("path")
+        if isinstance(scope_path, str) and len(scope_path.encode("utf-8", errors="ignore")) > self._cfg.max_path_bytes:
+            return 414, "path_too_large"
         if len(path.encode("utf-8", errors="ignore")) > self._cfg.max_path_bytes:
             return 414, "path_too_large"
         return None
@@ -1782,6 +1823,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         request_id = _request_id_from_state_or_headers(request)
         trust_profile = _trusted_profile_from_state_or_default(request.state, self._engine._cfg.security_profile)
         origin = _normalize_origin(headers.get("origin"))
+        origin_invalid_reason = "origin_invalid" if headers.get("origin") is not None and origin is None else None
         request_private_network = (headers.get("access-control-request-private-network") or "").strip().lower() == "true"
         is_secure_transport = self._engine._is_secure_transport(scheme=request.url.scheme, peer_ip=peer_ip, headers=headers)
 
@@ -1795,7 +1837,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             request_path=path,
             request_method=method,
         )
-        edge_info["origin_ok"] = bool(origin_ok)
+        edge_info["origin_ok"] = bool(origin_ok and origin_invalid_reason is None)
         self._engine._prepare_state(
             state=request.state,
             edge_info=edge_info,
@@ -1826,6 +1868,32 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 trust_profile=trust_profile,
                 normalized_origin=origin,
                 origin_allowed=origin_ok,
+                is_secure_transport=is_secure_transport,
+                request_private_network=request_private_network,
+            )
+
+        if origin_invalid_reason is not None:
+            self._engine._log_security_event(
+                event_type="edge_reject",
+                method=method,
+                path=path,
+                peer_ip=peer_ip,
+                client_ip=client_ip,
+                xff_reason=xff_reason,
+                request_id=request_id,
+                origin=origin,
+                edge_info=edge_info,
+                reason=origin_invalid_reason,
+                trust_profile=trust_profile,
+            )
+            return self._engine._build_error_response(
+                request_id=request_id,
+                status_code=400,
+                error="bad_request",
+                edge_reason=origin_invalid_reason,
+                trust_profile=trust_profile,
+                normalized_origin=origin,
+                origin_allowed=False,
                 is_secure_transport=is_secure_transport,
                 request_private_network=request_private_network,
             )
@@ -2179,6 +2247,7 @@ class SecurityASGIMiddleware:
         )
         trust_profile = _trusted_profile_from_state_or_default(state, self._engine._cfg.security_profile)
         origin = _normalize_origin(headers.get("origin"))
+        origin_invalid_reason = "origin_invalid" if headers.get("origin") is not None and origin is None else None
         request_private_network = (headers.get("access-control-request-private-network") or "").strip().lower() == "true"
         is_secure_transport = self._engine._is_secure_transport(scheme=scope.get("scheme"), peer_ip=peer_ip, headers=headers)
 
@@ -2193,7 +2262,7 @@ class SecurityASGIMiddleware:
             request_path=path,
             request_method=method,
         )
-        edge_info["origin_ok"] = bool(origin_ok)
+        edge_info["origin_ok"] = bool(origin_ok and origin_invalid_reason is None)
         self._engine._prepare_state(
             state=state,
             edge_info=edge_info,
@@ -2228,6 +2297,34 @@ class SecurityASGIMiddleware:
                     trust_profile=trust_profile,
                     normalized_origin=origin,
                     origin_allowed=origin_ok,
+                    is_secure_transport=is_secure_transport,
+                    request_private_network=request_private_network,
+                )
+            )
+
+        if origin_invalid_reason is not None:
+            self._engine._log_security_event(
+                event_type="edge_reject",
+                method=method,
+                path=path,
+                peer_ip=peer_ip,
+                client_ip=client_ip,
+                xff_reason=xff_reason,
+                request_id=request_id,
+                origin=origin,
+                edge_info=edge_info,
+                reason=origin_invalid_reason,
+                trust_profile=trust_profile,
+            )
+            return await _asgi_response(
+                self._engine._build_error_response(
+                    request_id=request_id,
+                    status_code=400,
+                    error="bad_request",
+                    edge_reason=origin_invalid_reason,
+                    trust_profile=trust_profile,
+                    normalized_origin=origin,
+                    origin_allowed=False,
                     is_secure_transport=is_secure_transport,
                     request_private_network=request_private_network,
                 )

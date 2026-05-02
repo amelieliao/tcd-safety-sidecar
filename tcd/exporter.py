@@ -669,6 +669,8 @@ _ALLOWED_SLO_KEYS: FrozenSet[str] = frozenset(
         "fdr_violation",
         "alpha_budget_overshoot",
         "pq_violation",
+        "verify_fail",
+        "diagnose_latency",
         "unknown",
         "other",
     }
@@ -1570,6 +1572,10 @@ class TCDPrometheusExporter:
             self._record_dropped_sample("unknown_metric")
             return None
 
+        if not isinstance(label_values, Mapping):
+            self._record_dropped_sample("invalid_payload")
+            return None
+
         # DoS guard: huge label dicts
         try:
             if label_values is not None and len(label_values) > self._cfg.max_label_input_keys:
@@ -1698,6 +1704,14 @@ class TCDPrometheusExporter:
             return self._normalize_code(metric_name=metric_name, key=k, value=v, allowed=_ALLOWED_SLO_KEYS, default="other")
 
         if k == "reason":
+            if metric_name == "tcd_metrics_dropped_samples_total":
+                return self._normalize_code(
+                    metric_name=metric_name,
+                    key=k,
+                    value=v,
+                    allowed=_DROPPED_REASONS,
+                    default="invalid_value",
+                )
             return self._normalize_code(metric_name=metric_name, key=k, value=v, allowed=_ALLOWED_REASONS, default="other")
 
         if k == "stage":
@@ -1748,6 +1762,10 @@ class TCDPrometheusExporter:
             if self._cfg.profile == "external":
                 return self._hash_or_fallback(vv, ctx="path", fallback="other")
             return _template_path(vv)[:128]
+
+        if k == "label_key":
+            vv = _safe_text(v, max_len=64, kind="id").strip().lower()
+            return vv if vv in _CODE_KEYS else "other"
 
         if k == "metric_name":
             # strictly bound to known metrics (prevents label drift)
@@ -2160,7 +2178,11 @@ class TCDPrometheusExporter:
             return
         self._init_metrics_if_needed()
 
-        base = labels or {}
+        if not isinstance(event, DecisionMetricsEvent):
+            self._record_dropped_sample("invalid_payload")
+            return
+
+        base = labels if isinstance(labels, Mapping) else {}
 
         action = base.get("action", event.action)
         model_id = base.get("model_id", event.model_id)
@@ -2281,13 +2303,41 @@ class TCDPrometheusExporter:
         )
         self.push_decision(ev, labels=labels)
 
-    def push_eprocess(self, *, tenant: str = "", policy: str = "", wealth: float = 0.0, p_value: Optional[float] = None) -> None:
+    def push_eprocess(
+        self,
+        *,
+        tenant: str = "",
+        policy: str = "",
+        wealth: Any = None,
+        p_value: Optional[float] = None,
+        e_value: Any = None,
+        alpha_wealth: Any = None,
+        alpha_alloc: Any = None,
+        model_id: Any = None,
+        gpu_id: Any = None,
+        user: Any = None,
+        session: Any = None,
+        **_compat: Any,
+    ) -> None:
+        """
+        Backwards/service_http-compatible e-process metrics.
+
+        service_http.HttpMetrics.push_eprocess forwards model_id/gpu_id/user/session/
+        e_value/alpha_alloc/alpha_wealth. Those fields are accepted here so the
+        compatibility wrapper does not silently drop the update.
+        """
         if not self._metrics_enabled():
             self._record_dropped_sample(self._disabled_reason_str() or "backend_unavailable")
             return
         self._init_metrics_if_needed()
 
-        w = self._safe_nonneg_float(wealth, max_v=1e12)
+        wealth_source = wealth
+        if wealth_source is None:
+            wealth_source = alpha_wealth
+        if wealth_source is None:
+            wealth_source = 0.0
+
+        w = self._safe_nonneg_float(wealth_source, max_v=1e12)
         if w is None:
             self._record_dropped_sample("invalid_value")
             return
@@ -2321,6 +2371,21 @@ class TCDPrometheusExporter:
             return
         self._init_metrics_if_needed()
         self._counter_inc("tcd_action_total", {"model_id": model_id, "gpu_id": gpu_id, "action": action})
+
+    def throttle(self, tenant: str, user: str, session: str, *, reason: str = "unspecified") -> None:
+        """
+        service_http compatibility hook.
+
+        Records a subject-scoped budget-spent signal and a low-cardinality
+        throttle action. The reason is accepted for API compatibility; this
+        exporter surface has no reason-labelled throttle metric.
+        """
+        if not self._metrics_enabled():
+            self._record_dropped_sample(self._disabled_reason_str() or "backend_unavailable")
+            return
+        self._init_metrics_if_needed()
+        self._counter_inc("tcd_budget_spent_total", {"tenant": tenant, "user": user, "session": session})
+        self._counter_inc("tcd_action_total", {"model_id": "", "gpu_id": "", "action": "throttle"})
 
     def slo_violation_by_model(self, key: str, model_id: str, gpu_id: str) -> None:
         if not self._metrics_enabled():

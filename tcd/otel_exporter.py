@@ -212,6 +212,41 @@ def _finite_float(x: Any) -> Optional[float]:
     return v
 
 
+_INT_STR_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _finite_int_default(x: Any, default: int) -> int:
+    if isinstance(x, bool):
+        return int(default)
+    if isinstance(x, int):
+        return int(x)
+    if isinstance(x, float):
+        return int(x) if math.isfinite(x) else int(default)
+    if isinstance(x, str):
+        ss = x.strip()
+        if not ss or len(ss) > 64 or not _INT_STR_RE.fullmatch(ss):
+            return int(default)
+        try:
+            return int(ss, 10)
+        except Exception:
+            return int(default)
+    return int(default)
+
+
+def _coerce_bool_default(x: Any, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int) and not isinstance(x, bool):
+        return bool(x)
+    if isinstance(x, str):
+        ss = x.strip().lower()
+        if ss in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if ss in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return bool(default)
+
+
 def _clamp_float(v: float, lo: float, hi: float) -> float:
     if v < lo:
         return lo
@@ -557,6 +592,28 @@ def _stable_str_for_hashing(value: Any, *, max_len: int) -> str:
     return f"type:{type(value).__name__}"[:max_len]
 
 
+def _safe_exception_message(exc: Any, *, max_len: int = 512) -> str:
+    if not isinstance(exc, Exception):
+        return ""
+    args = getattr(exc, "args", ())
+    if not isinstance(args, tuple) or not args:
+        return ""
+    first = args[0]
+    if isinstance(first, str):
+        return _strip_unsafe_text(first, max_len=max_len).strip()[:max_len]
+    if first is None:
+        return ""
+    if isinstance(first, bool):
+        return "true" if first else "false"
+    if isinstance(first, int):
+        return str(first)[:max_len]
+    if isinstance(first, float):
+        return f"{first:.12g}"[:max_len] if math.isfinite(first) else ""
+    if isinstance(first, (bytes, bytearray, memoryview)):
+        return "[bytes]"
+    return f"[type:{type(first).__name__}]"[:max_len]
+
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -664,6 +721,7 @@ class OtelExporterConfig:
     attribute_policy: Dict[str, str] = field(
         default_factory=lambda: {
             "request_id": "allow",
+            "session": "hash",
             "session_id": "hash",
             "tenant": "hash",
             "tenant_id": "hash",
@@ -726,7 +784,7 @@ class OtelExporterConfig:
     def normalized_copy(self) -> "OtelExporterConfig":
         c = OtelExporterConfig()
 
-        c.schema_version = int(self.schema_version) if isinstance(self.schema_version, int) else 3
+        c.schema_version = _finite_int_default(self.schema_version, 3)
         c.enabled = bool(self.enabled)
 
         c.service_name = _safe_str_only(self.service_name, max_len=128, default="tcd-safety-sidecar")
@@ -762,19 +820,19 @@ class OtelExporterConfig:
             c.sample_events = max(c.sample_events, 0.1)
 
         if c.compliance_profile == "LOCKDOWN":
-            c.max_attr_len = min(int(self.max_attr_len or 64), 64)
-            c.max_attr_depth = min(int(self.max_attr_depth or 4), 4)
-            c.max_attr_items = min(int(self.max_attr_items or 64), 64)
+            c.max_attr_len = min(_finite_int_default(self.max_attr_len, 64), 64)
+            c.max_attr_depth = min(_finite_int_default(self.max_attr_depth, 4), 4)
+            c.max_attr_items = min(_finite_int_default(self.max_attr_items, 64), 64)
         else:
-            c.max_attr_len = _clamp_int(int(self.max_attr_len or 256), 16, 32_768)
-            c.max_attr_depth = _clamp_int(int(self.max_attr_depth or 5), 1, 16)
-            c.max_attr_items = _clamp_int(int(self.max_attr_items or 256), 16, 4096)
+            c.max_attr_len = _clamp_int(_finite_int_default(self.max_attr_len, 256), 16, 32_768)
+            c.max_attr_depth = _clamp_int(_finite_int_default(self.max_attr_depth, 5), 1, 16)
+            c.max_attr_items = _clamp_int(_finite_int_default(self.max_attr_items, 256), 16, 4096)
 
-        c.max_attr_nodes = _clamp_int(int(self.max_attr_nodes or 2048), 256, 1_000_000)
-        c.max_attr_scan = _clamp_int(int(self.max_attr_scan or 4096), c.max_attr_items, 1_000_000)
-        c.max_attr_total_str = _clamp_int(int(self.max_attr_total_str or 64_000), 256, 10_000_000)
+        c.max_attr_nodes = _clamp_int(_finite_int_default(self.max_attr_nodes, 2048), 256, 1_000_000)
+        c.max_attr_scan = _clamp_int(_finite_int_default(self.max_attr_scan, 4096), c.max_attr_items, 1_000_000)
+        c.max_attr_total_str = _clamp_int(_finite_int_default(self.max_attr_total_str, 64_000), 256, 10_000_000)
 
-        c.output_max_bytes = _clamp_int(int(self.output_max_bytes or 16_384), 1024, 1_000_000)
+        c.output_max_bytes = _clamp_int(_finite_int_default(self.output_max_bytes, 16_384), 1024, 1_000_000)
 
         # Redaction lists normalized to lower tokens
         rk: Sequence[str] = self.redact_keys or tuple()
@@ -842,7 +900,7 @@ class OtelExporterConfig:
         c.include_status_description_strict = bool(self.include_status_description_strict)
 
         c.async_enabled = bool(self.async_enabled)
-        c.async_queue_maxsize = _clamp_int(int(self.async_queue_maxsize or 10_000), 1, 1_000_000)
+        c.async_queue_maxsize = _clamp_int(_finite_int_default(self.async_queue_maxsize, 10_000), 1, 1_000_000)
         c.async_drop_on_full = bool(self.async_drop_on_full)
 
         c.sink = self.sink
@@ -852,7 +910,7 @@ class OtelExporterConfig:
         ferk: Sequence[str] = self.fingerprint_exclude_resource_keys or tuple()
         c.fingerprint_exclude_resource_keys = tuple(sorted({x.lower() for x in ferk if isinstance(x, str)}))
 
-        c.min_key_bytes_strict = _clamp_int(int(self.min_key_bytes_strict or 16), 8, 64)
+        c.min_key_bytes_strict = _clamp_int(_finite_int_default(self.min_key_bytes_strict, 16), 8, 64)
 
         c.time_fn = self.time_fn if callable(self.time_fn) else time.time
         c.monotonic_fn = self.monotonic_fn if callable(self.monotonic_fn) else time.perf_counter
@@ -1253,6 +1311,18 @@ class TCDOtelExporter:
         )
 
     @property
+    def enabled(self) -> bool:
+        with self._bundle_lock:
+            return bool(self._bundle.cfg.enabled)
+
+    @enabled.setter
+    def enabled(self, value: Any) -> None:
+        with self._bundle_lock:
+            cfg = self._bundle.cfg.normalized_copy()
+        cfg.enabled = _coerce_bool_default(value, default=bool(cfg.enabled))
+        self.set_config(cfg)
+
+    @property
     def config(self) -> OtelExporterConfig:
         with self._bundle_lock:
             return self._bundle.cfg.normalized_copy()
@@ -1607,7 +1677,7 @@ class TCDOtelExporter:
             return exc_name
 
         # Non-strict: include message but sanitize/redact
-        msg = _safe_str_only(str(exc) if isinstance(exc, Exception) else "", max_len=512, default="")
+        msg = _safe_exception_message(exc, max_len=512)
         if _looks_like_secret_token(msg) or (bundle.strict and _looks_like_high_entropy(msg)):
             msg = "[redacted]"
         if len(msg) > 256:

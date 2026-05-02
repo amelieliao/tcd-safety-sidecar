@@ -25,6 +25,7 @@ Design contract:
 
 import bisect
 import collections
+import contextlib
 import hashlib
 import hmac  # (1.1) required: used for salted digests and snapshot signing
 import math
@@ -754,6 +755,17 @@ def _is_invalid_score(x: Any) -> bool:
     return f < 0.0 or f > 1.0
 
 
+def _score_to_clipped01(x: Any) -> float:
+    """
+    Convert arbitrary score-like input into [0,1].
+    Non-convertible values are treated as maximally conservative edge=1.0.
+    """
+    try:
+        return _clip01(float(x))
+    except Exception:
+        return 1.0
+
+
 # ---------------------------------------------------------------------------
 # Tail counting + tie handling (2.1, 3.4)
 # ---------------------------------------------------------------------------
@@ -1196,7 +1208,7 @@ class EmpiricalTailCalibrator:
         self._exact_max_n = int(max(0, exact_max_n))
         self._fallback_bound = fallback_bound if fallback_bound in _ALLOWED_FALLBACK_BOUNDS else "hoeffding"
 
-        self._p_floor = max(0.0, float(p_value_floor)) if _is_finite(p_value_floor) else 0.0
+        self._p_floor = min(1.0, max(0.0, float(p_value_floor))) if _is_finite(p_value_floor) else 0.0
         self._on_exact_abandon = on_exact_abandon
         self._on_fallback_bound = on_fallback_bound
 
@@ -1246,7 +1258,7 @@ class ConformalUpperEnvelope:
         self._n = len(scores_sorted_immutable)
         self._tail = tail if tail in _ALLOWED_TAILS else "upper"
         self._tie_mode = tie_mode if tie_mode in _ALLOWED_TIE_MODES else "inclusive"
-        self._p_floor = max(0.0, float(p_value_floor)) if _is_finite(p_value_floor) else 0.0
+        self._p_floor = min(1.0, max(0.0, float(p_value_floor))) if _is_finite(p_value_floor) else 0.0
         self._ms = ms
 
     def n(self) -> int:
@@ -1386,7 +1398,7 @@ class CalibConfig:
             mode = "auto"
         perm = self.permitted_modes
         if perm is not None:
-            cleaned = tuple(m for m in (str(x).strip().lower() for x in perm) if m in _ALLOWED_MODES)
+            cleaned = tuple(sorted({m for m in (str(x).strip().lower() for x in perm) if m in _ALLOWED_MODES}))
             if not cleaned:
                 cleaned = tuple(sorted(_ALLOWED_MODES))
             object.__setattr__(self, "permitted_modes", cleaned)
@@ -1419,9 +1431,14 @@ class CalibConfig:
         object.__setattr__(self, "cp_fallback_bound", fb)
 
         # p floor
-        pf = float(self.p_value_floor)
+        try:
+            pf = float(self.p_value_floor)
+        except Exception:
+            pf = 0.0
         if not math.isfinite(pf) or pf < 0.0:
             pf = 0.0
+        if pf > 1.0:
+            pf = 1.0
         object.__setattr__(self, "p_value_floor", pf)
 
         # time_rotate_s
@@ -2128,12 +2145,12 @@ class PredictableCalibrator:
                 return None, "invalid_fail_closed"
             # clip_to_edge
             # still record that we clipped for predict? we only have clipped metric for update; keep minimal.
-        s = _clip01(float(score))
+        s = _score_to_clipped01(score)
         if self.cfg.quantize_eps > 0.0:
             s = _quantize01(s, float(self.cfg.quantize_eps))
         return s, "ok"
 
-    def _normalize_for_update_unlocked(self, score: Any) -> Optional[float]:
+    def _normalize_for_update_unlocked(self, score: Any, *, count_invalid: bool = True) -> Optional[float]:
         """
         Normalize and apply invalid_update_policy:
           - drop: invalid scores are NOT fed into training
@@ -2141,14 +2158,15 @@ class PredictableCalibrator:
         """
         invalid = _is_invalid_score(score)
         if invalid:
-            self._invalid_bump_unlocked()
+            if count_invalid:
+                self._invalid_bump_unlocked()
             if self.cfg.invalid_update_policy == "drop":
                 self._ms.invalid_dropped()
                 return None
             # clip
             self._ms.invalid_clipped()
 
-        s = _clip01(float(score))
+        s = _score_to_clipped01(score)
         if self.cfg.quantize_eps > 0.0:
             s = _quantize01(s, float(self.cfg.quantize_eps))
         return s
@@ -2209,11 +2227,11 @@ class PredictableCalibrator:
         p = self._cal_conf.p_value(s_norm, tie_u=tie_u) if self._cal_conf else 1.0
         return max(float(self.cfg.p_value_floor), _clip01(p))
 
-    def _update_unlocked(self, score: Any) -> None:
+    def _update_unlocked(self, score: Any, *, invalid_already_counted: bool = False) -> None:
         """
         Feed a normalized score into cur block.
         """
-        s = self._normalize_for_update_unlocked(score)
+        s = self._normalize_for_update_unlocked(score, count_invalid=not invalid_already_counted)
         if s is None:
             # dropped
             return
@@ -2264,8 +2282,9 @@ class PredictableCalibrator:
                 privileged_force = False
                 if force_fallback:
                     privileged_force = self._check_privileged(priv, kind="force_fallback_denied")
+                invalid_for_accounting = _is_invalid_score(score)
                 p = self._predict_unlocked(score, tie_u=tie_u, privileged_force=privileged_force)
-                self._update_unlocked(score)
+                self._update_unlocked(score, invalid_already_counted=invalid_for_accounting)
                 self._ms.p_value(p)
                 return p
         finally:
@@ -2324,11 +2343,18 @@ class PredictableCalibrator:
             return
 
         with self._lock:
-            if not self._cur_scores and not force:
-                self._ms.rotate_noop("forced")
-                self._emit_event("rotate_noop", {"reason": "forced"})
+            if not self._cur_scores:
+                if not force:
+                    self._ms.rotate_noop("forced")
+                    self._emit_event("rotate_noop", {"reason": "forced"})
+                    return
+                self._rotate_count += 1
+                self._last_rotation_ts = float(self._time())
+                self._last_rotation_reason = "forced"
+                self._rebuild_prev_unlocked(commit_meta=True)
+                self._ms.rotate("forced")
+                self._emit_event("rotate_commit", {"reason": "forced", "prev_n": len(self._prev_sorted), "empty": True})
                 return
-            # enqueue a forced rotation; if cur empty and force=True, still rebuild metadata
             self._queue_rotation_unlocked("forced")
             self._emit_event("rotate_now", {"reason": "forced", "force": bool(force)})
 
@@ -2541,7 +2567,17 @@ class PredictableCalibrator:
         return out
 
     @classmethod
-    def from_snapshot(cls, snap: Mapping[str, object]) -> "PredictableCalibrator":
+    def from_snapshot(
+        cls,
+        snap: Mapping[str, object],
+        *,
+        metrics: Optional[_MetricsFamilies] = None,
+        digest_salt_hex: Optional[str] = None,
+        snapshot_hmac_key_hex: Optional[str] = None,
+        require_snapshot_hmac: Optional[bool] = None,
+        time_provider: Optional[Callable[[], float]] = None,
+        monotonic_provider: Optional[Callable[[], float]] = None,
+    ) -> "PredictableCalibrator":
         """
         Hardened restore: never throws (1.5).
         Enforces snapshot digest/hmac if configured; validates version; bounds resources; verifies invariants (9.4).
@@ -2593,13 +2629,26 @@ class PredictableCalibrator:
         except Exception:
             cfg = CalibConfig()
 
-        inst = cls(cfg)
+        try:
+            inst = cls(
+                cfg,
+                metrics=metrics,
+                digest_salt_hex=digest_salt_hex,
+                snapshot_hmac_key_hex=snapshot_hmac_key_hex,
+                time_provider=time_provider,
+                monotonic_provider=monotonic_provider,
+            )
+        except Exception:
+            try:
+                return cls(CalibConfig(), metrics=metrics, time_provider=time_provider, monotonic_provider=monotonic_provider)
+            except Exception:
+                return cls(CalibConfig())
 
         try:
             with inst._lock:
                 # Version governance (9.2)
                 snap_ver = snap.get("engine_version")
-                if isinstance(snap_ver, str) and snap_ver != _CALIB_ENGINE_VERSION:
+                if not isinstance(snap_ver, str) or snap_ver != _CALIB_ENGINE_VERSION:
                     inst._ms.restore_failed("version_mismatch")
                     # start fresh
                     inst._prev_sorted = array("d")
@@ -2612,26 +2661,45 @@ class PredictableCalibrator:
 
             # Snapshot digest verification (9.1)
             snap_digest = snap.get("snapshot_digest")
-            if isinstance(snap_digest, str):
-                # recompute digest from payload fields we expect
-                # build minimal payload (ignore hmac fields)
-                payload = {k: snap.get(k) for k in snap.keys() if k not in ("snapshot_hmac",)}
-                recomputed = canonical_kv_hash(payload, ctx=f"tcd:calib_snapshot:{cfg.scope}", label="calib_snapshot")
-                if recomputed != snap_digest:
-                    inst._ms.restore_failed("bad_snapshot_digest")
-                    with inst._lock:
-                        inst._prev_sorted = array("d")
-                        inst._prev_sum = 0.0
-                        inst._cur_scores = array("d")
-                        inst._cur_sum = 0.0
-                        inst._rotate_count = 0
-                        inst._rebuild_prev_unlocked(commit_meta=True)
-                    return inst
+            if not isinstance(snap_digest, str):
+                inst._ms.restore_failed("bad_snapshot_digest")
+                return inst
 
-            # HMAC verification if required by cfg
-            if cfg.require_snapshot_hmac:
+            _snapshot_payload_keys = (
+                "engine_version",
+                "cfg",
+                "cfg_digest",
+                "prev_scores_sorted",
+                "cur_scores",
+                "rotate_count",
+                "cur_started_wall",
+                "invalid_total",
+                "last_rotation_ts",
+                "last_rotation_reason",
+                "last_fallback_ts",
+                "last_fallback_reason",
+                "last_forced_fallback_ts",
+                "last_forced_fallback_reason",
+                "digest_salt_id",
+            )
+            payload = {k: snap.get(k) for k in _snapshot_payload_keys}
+            recomputed = canonical_kv_hash(payload, ctx=f"tcd:calib_snapshot:{cfg.scope}", label="calib_snapshot")
+            if recomputed != snap_digest:
+                inst._ms.restore_failed("bad_snapshot_digest")
+                with inst._lock:
+                    inst._prev_sorted = array("d")
+                    inst._prev_sum = 0.0
+                    inst._cur_scores = array("d")
+                    inst._cur_sum = 0.0
+                    inst._rotate_count = 0
+                    inst._rebuild_prev_unlocked(commit_meta=True)
+                return inst
+
+            # HMAC verification if required by trusted caller policy or embedded cfg.
+            require_hmac_eff = bool(cfg.require_snapshot_hmac if require_snapshot_hmac is None else require_snapshot_hmac)
+            if require_hmac_eff:
                 h = snap.get("snapshot_hmac")
-                if not (isinstance(h, str) and inst._snapshot_hmac_key is not None and isinstance(snap_digest, str)):
+                if not (isinstance(h, str) and inst._snapshot_hmac_key is not None):
                     inst._ms.restore_failed("bad_hmac")
                     return inst
                 calc = hmac_sha256_hex(inst._snapshot_hmac_key, snap_digest.encode("utf-8"))
@@ -2734,8 +2802,13 @@ class PredictableCalibrator:
 
         except Exception:
             inst._ms.restore_failed("exception")
+            with contextlib.suppress(Exception):
+                inst.close()
             # return fresh instance (never throw)
-            return cls(CalibConfig())
+            try:
+                return cls(CalibConfig(), metrics=metrics, time_provider=time_provider, monotonic_provider=monotonic_provider)
+            except Exception:
+                return cls(CalibConfig())
 
 # ---------------------------------------------------------------------------
 # Env factory (11.1): build config & calibrator with governance

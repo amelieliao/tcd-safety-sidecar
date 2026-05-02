@@ -660,6 +660,15 @@ class MultiVarConfig:
 
     schema_version: int = 2
 
+    # Backward-compatible knobs used by service_http's legacy multivariate path:
+    #   MultiVarConfig(estimator="lw", alpha=0.01)
+    # These are intentionally lightweight compatibility fields. The modern API
+    # remains detect(MultiVarInput | Mapping).
+    estimator: str = "lw"
+    alpha: float = 0.01
+    compat_vector_max_len: int = 2048
+    max_batch_items: int = 1024
+
     enabled: bool = False
     window: int = 10
     profile: str = "DEV"  # "DEV" | "PROD" | "HIGH_SEC"
@@ -773,6 +782,23 @@ class MultiVarConfig:
         c = MultiVarConfig()
 
         c.schema_version = int(_finite_int_strict(self.schema_version) or 2)
+
+        est = _safe_str(self.estimator, max_len=32, redaction="token") or "lw"
+        c.estimator = est if est != "<redacted>" else "lw"
+
+        alpha_v = _finite_float(self.alpha)
+        c.alpha = _clamp_float(float(0.01 if alpha_v is None else alpha_v), 1e-12, 1.0)
+        c.compat_vector_max_len = _clamp_int(
+            int(_finite_int_strict(self.compat_vector_max_len) or 2048),
+            1,
+            1_000_000,
+        )
+        c.max_batch_items = _clamp_int(
+            int(_finite_int_strict(self.max_batch_items) or 1024),
+            1,
+            1_000_000,
+        )
+
         c.enabled = _parse_bool(self.enabled, default=False)
 
         c.window = _clamp_int(int(_finite_int_strict(self.window) or 10), 1, 4096)
@@ -895,6 +921,10 @@ class MultiVarConfig:
         c = self.normalized_copy()
         return {
             "schema_version": c.schema_version,
+            "estimator": c.estimator,
+            "alpha": c.alpha,
+            "compat_vector_max_len": c.compat_vector_max_len,
+            "max_batch_items": c.max_batch_items,
             "enabled": c.enabled,
             "window": c.window,
             "profile": c.profile,
@@ -975,6 +1005,10 @@ class MultiVarConfig:
 
         return {
             "schema_version": c.schema_version,
+            "estimator": c.estimator,
+            "alpha": c.alpha,
+            "compat_vector_max_len": c.compat_vector_max_len,
+            "max_batch_items": c.max_batch_items,
             "enabled": c.enabled,
             "window": c.window,
             "profile": c.profile,

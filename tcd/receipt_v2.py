@@ -2137,3 +2137,390 @@ class AlwaysValidRiskController:
             "stats": stats,
             "validity": validity,
         }
+
+# ---------------------------------------------------------------------------
+# receipt v2 body builder shim for service_http.py
+# ---------------------------------------------------------------------------
+
+try:
+    if "build_v2_body" not in __all__:  # type: ignore[name-defined]
+        __all__ = list(__all__) + ["build_v2_body"]  # type: ignore[name-defined]
+except Exception:
+    __all__ = ["build_v2_body"]
+
+_RV2_RE = __import__("re")
+
+_RECEIPT_V2_META_SCHEMA = "tcd.receipt.meta.v2"
+_RECEIPT_V2_META_VERSION = 2
+
+_RV2_SAFE_KEY_RE = _RV2_RE.compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,63}$")
+
+# 注意：这里故意把 request/body/payload/header/auth 等 token 直接禁掉，
+# 避免被现有 receipt/meta sanitize 逻辑打掉或引入内容面字段。
+_RV2_FORBIDDEN_KEY_TOKENS = frozenset(
+    {
+        "prompt",
+        "completion",
+        "message",
+        "messages",
+        "content",
+        "body",
+        "payload",
+        "request",
+        "response",
+        "header",
+        "headers",
+        "cookie",
+        "cookies",
+        "authorization",
+        "auth",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "api",
+        "apikey",
+        "api_key",
+        "private",
+        "privatekey",
+    }
+)
+
+# service_http 传入的 e_snapshot 字段做安全改名，避免 request/body 之类 token
+_RV2_EPROC_KEY_MAP = {
+    "event_id": "eid",
+    "request_id": "rid",
+    "body_digest": "io_digest",
+    "e_value": "e_value",
+    "p_final": "p_final",
+    "drift_score": "drift_score",
+    "alpha_alloc": "alpha_alloc",
+    "alpha_spent": "alpha_spent",
+    "alpha_wealth": "alpha_wealth",
+    "threshold": "threshold",
+    "trigger": "trigger",
+    "state_domain_id": "state_domain_id",
+    "controller_mode": "controller_mode",
+    "statistical_guarantee_scope": "guarantee_scope",
+    "selected_source": "selected_source",
+    "audit_ref": "audit_ref",
+    "receipt_ref": "receipt_ref",
+}
+
+
+def _rv2_scalar_text(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return ""
+        return f"{v:.12g}"
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return "<bytes>"
+    return f"<{type(v).__name__}>"
+
+
+def _rv2_safe_text(v: Any, *, max_len: int = 256) -> str:
+    return _strip_unsafe_text(_rv2_scalar_text(v), max_len=max_len)
+
+
+def _rv2_safe_id(v: Any, *, default: Optional[str] = None, max_len: int = 256) -> Optional[str]:
+    s = _rv2_safe_text(v, max_len=max_len)
+    if not s or s == "[redacted]" or _looks_like_secret(s):
+        return default
+    if not _SAFE_ID_RE.fullmatch(s):
+        return default
+    return s
+
+
+def _rv2_key_tokens(k: str) -> Tuple[str, ...]:
+    s = _rv2_safe_text(k, max_len=64)
+    if not s:
+        return tuple()
+    s = _RV2_RE.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
+    s = _RV2_RE.sub(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])", " ", s)
+    s = _RV2_RE.sub(r"[^A-Za-z0-9]+", " ", s).strip().lower()
+    if not s:
+        return tuple()
+    parts = tuple(p for p in s.split(" ") if p)
+    fused = "".join(parts)
+    return parts + ((fused,) if fused and fused not in parts else tuple())
+
+
+def _rv2_safe_key(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    s = _rv2_safe_text(v, max_len=64)
+    if not s or not _RV2_SAFE_KEY_RE.fullmatch(s):
+        return None
+    toks = _rv2_key_tokens(s)
+    if any(tok in _RV2_FORBIDDEN_KEY_TOKENS for tok in toks):
+        return None
+    return s
+
+
+def _rv2_scalar(v: Any, *, max_str_len: int = 256) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, int) and not isinstance(v, bool):
+        return int(v)
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        return round(float(v), 12)
+    if isinstance(v, str):
+        s = _rv2_safe_text(v, max_len=max_str_len)
+        if not s:
+            return None
+        if _looks_like_secret(s):
+            return "[redacted]"
+        return s
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return f"[bytes:{len(v)}]"
+    return _rv2_safe_text(f"<{type(v).__name__}>", max_len=32)
+
+
+def _rv2_sanitize_mapping(
+    obj: Optional[Mapping[str, Any]],
+    *,
+    allowed_keys: Optional[Sequence[str]] = None,
+    rename_map: Optional[Mapping[str, str]] = None,
+    max_items: int = 32,
+    max_str_len: int = 256,
+) -> Dict[str, Any]:
+    if not isinstance(obj, Mapping):
+        return {}
+
+    allowed = set(allowed_keys) if allowed_keys is not None else None
+    rename = dict(rename_map or {})
+    out: Dict[str, Any] = {}
+
+    for raw_k, raw_v in list(obj.items())[: max(0, int(max_items))]:
+        if not isinstance(raw_k, str):
+            continue
+
+        dst = rename.get(raw_k)
+        if dst is None:
+            dst = _rv2_safe_key(raw_k)
+        if not dst:
+            continue
+        if allowed is not None and dst not in allowed:
+            continue
+
+        # numeric fields
+        if dst in {
+            "temperature",
+            "top_p",
+            "latency_ms",
+            "throughput_tok_s",
+            "e_value",
+            "p_final",
+            "drift_score",
+            "alpha_alloc",
+            "alpha_spent",
+            "alpha_wealth",
+            "threshold",
+        }:
+            fv = _coerce_float(raw_v)
+            if fv is None:
+                continue
+            out[dst] = round(float(fv), 12)
+            continue
+
+        # int-like fields
+        if dst in {"context_len", "batch_index", "batch_size", "seed", "max_tokens"}:
+            iv = _coerce_int(raw_v)
+            if iv is None:
+                continue
+            out[dst] = int(iv)
+            continue
+
+        # bool-like fields
+        if dst in {"trigger", "pq_required", "pq_ok"}:
+            bv = _coerce_bool(raw_v)
+            if bv is None:
+                continue
+            out[dst] = bool(bv)
+            continue
+
+        # identifier / digest-ish fields
+        if dst in {
+            "model_hash",
+            "tokenizer_hash",
+            "kv_digest",
+            "eid",
+            "rid",
+            "io_digest",
+            "state_domain_id",
+            "controller_mode",
+            "guarantee_scope",
+            "selected_source",
+            "audit_ref",
+            "receipt_ref",
+            "decoder",
+            "strategy",
+        }:
+            sv = _rv2_safe_id(raw_v, default=None, max_len=max_str_len)
+            if sv is not None:
+                out[dst] = sv
+            continue
+
+        # bounded nested mapping
+        if isinstance(raw_v, Mapping):
+            nested = _rv2_sanitize_mapping(
+                raw_v,
+                max_items=16,
+                max_str_len=max_str_len,
+            )
+            if nested:
+                out[dst] = nested
+            continue
+
+        # bounded flat sequence
+        if isinstance(raw_v, (list, tuple)):
+            arr = []
+            for item in list(raw_v)[:16]:
+                sv = _rv2_scalar(item, max_str_len=max_str_len)
+                if sv is None:
+                    continue
+                arr.append(sv)
+            if arr:
+                out[dst] = arr
+            continue
+
+        sv = _rv2_scalar(raw_v, max_str_len=max_str_len)
+        if sv is not None:
+            out[dst] = sv
+
+    return out
+
+
+def build_v2_body(
+    *,
+    model_hash: Optional[str] = None,
+    tokenizer_hash: Optional[str] = None,
+    sampler_cfg: Optional[Mapping[str, Any]] = None,
+    context_len: Optional[int] = None,
+    kv_digest: Optional[str] = None,
+    rng_seed: Optional[int] = None,
+    latency_ms: Optional[float] = None,
+    throughput_tok_s: Optional[float] = None,
+    batch_index: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    e_snapshot: Optional[Mapping[str, Any]] = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """
+    Build a compact, content-agnostic, JSON-safe receipt-v2 metadata body.
+
+    This function is intentionally:
+      - deterministic (no hidden timestamps / random data)
+      - bounded
+      - free of raw request/response/body/header/content fields
+      - tolerant to unknown kwargs via **extra
+
+    service_http.py relies only on:
+      - import success
+      - callable signature compatibility
+      - returned value is a dict
+    """
+
+    out: Dict[str, Any] = {
+        "schema": _RECEIPT_V2_META_SCHEMA,
+        "version": _RECEIPT_V2_META_VERSION,
+        "kind": "receipt_meta",
+    }
+
+    model_block = _rv2_sanitize_mapping(
+        {
+            "model_hash": model_hash,
+            "tokenizer_hash": tokenizer_hash,
+        },
+        allowed_keys=("model_hash", "tokenizer_hash"),
+        max_items=4,
+        max_str_len=256,
+    )
+    if model_block:
+        out["model"] = model_block
+
+    sampling = _rv2_sanitize_mapping(
+        sampler_cfg,
+        allowed_keys=("temperature", "top_p", "decoder", "seed", "max_tokens", "strategy"),
+        max_items=8,
+        max_str_len=128,
+    )
+    if sampling:
+        out["sampling"] = sampling
+
+    runtime = _rv2_sanitize_mapping(
+        {
+            "context_len": context_len,
+            "kv_digest": kv_digest,
+            "latency_ms": latency_ms,
+            "throughput_tok_s": throughput_tok_s,
+        },
+        allowed_keys=("context_len", "kv_digest", "latency_ms", "throughput_tok_s"),
+        max_items=8,
+        max_str_len=256,
+    )
+    if runtime:
+        out["runtime"] = runtime
+
+    batch = _rv2_sanitize_mapping(
+        {
+            "batch_index": batch_index,
+            "batch_size": batch_size,
+            "seed": rng_seed,
+        },
+        allowed_keys=("batch_index", "batch_size", "seed"),
+        max_items=8,
+        max_str_len=64,
+    )
+    if batch:
+        out["batch"] = batch
+
+    eproc = _rv2_sanitize_mapping(
+        e_snapshot,
+        rename_map=_RV2_EPROC_KEY_MAP,
+        allowed_keys=tuple(set(_RV2_EPROC_KEY_MAP.values())),
+        max_items=24,
+        max_str_len=256,
+    )
+    if eproc:
+        out["eproc"] = eproc
+
+    # future-proof: accept extra kwargs but keep them bounded / sanitized
+    if extra:
+        x = _rv2_sanitize_mapping(
+            extra,
+            max_items=16,
+            max_str_len=256,
+        )
+        if x:
+            out["extra"] = x
+
+    # final JSON round-trip to guarantee pure dict / JSON-safe output
+    try:
+        return json.loads(
+            json.dumps(
+                out,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except Exception:
+        return {
+            "schema": _RECEIPT_V2_META_SCHEMA,
+            "version": _RECEIPT_V2_META_VERSION,
+            "kind": "receipt_meta",
+        }

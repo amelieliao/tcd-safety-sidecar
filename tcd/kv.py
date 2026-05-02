@@ -734,6 +734,21 @@ def _encode_u64_le(value: int) -> bytes:
     return iv.to_bytes(8, "little", signed=False)
 
 
+def _encode_i64_le(value: int) -> bytes:
+    """
+    Signed fixed-width integer encoding for telemetry vectors.
+
+    Kept separate from _encode_u64_le/update_ints so legacy unsigned streams
+    remain byte-for-byte compatible.
+    """
+    if isinstance(value, bool):
+        raise HashError("invalid_payload")
+    iv = int(value)
+    if iv < -0x8000000000000000 or iv > 0x7FFFFFFFFFFFFFFF:
+        raise HashError("int_too_large")
+    return iv.to_bytes(8, "little", signed=True)
+
+
 class RollingHasher:
     """
     Streaming hasher for building stable digests over simple structures.
@@ -783,8 +798,13 @@ class RollingHasher:
                 self.update_str(ctx, legacy_utf8=True)
 
     def _consume(self, n: int) -> None:
-        self._written += int(n)
-        if self._max_bytes > 0 and self._written > self._max_bytes:
+        nn = int(n)
+        if nn <= 0:
+            return
+        if self._max_bytes <= 0:
+            raise HashError("bytes_budget")
+        self._written += nn
+        if self._written > self._max_bytes:
             raise HashError("bytes_budget")
 
     def update_bytes(self, data: bytes) -> None:
@@ -820,6 +840,41 @@ class RollingHasher:
             b = _encode_u64_le(v)
             self._consume(len(b))
             self._h.update(b)
+
+    def update_signed_ints(self, xs: Iterable[int], *, label: str = "") -> None:
+        """
+        Length-delimited signed-int sequence update.
+
+        Intended for telemetry/vector digests where:
+          - negative scaled values are valid,
+          - multiple arrays are appended to one hasher,
+          - section boundaries must be cryptographically visible.
+        """
+        if label:
+            if not isinstance(label, str):
+                raise HashError("invalid_payload")
+            if _has_surrogate(label):
+                raise HashError("utf8_surrogate")
+            label_b = label.encode("utf-8", errors="strict")
+            if len(label_b) > 128:
+                raise HashError("invalid_payload")
+        else:
+            label_b = b""
+
+        encoded: list[bytes] = []
+        seq = () if xs is None else xs
+        for v in seq:
+            if len(encoded) >= self._cfg.max_items:
+                raise HashError("list_too_large")
+            encoded.append(_encode_i64_le(v))
+
+        self.update_bytes(b"ints.signed.v1\x00")
+        self.update_bytes(_u32be(len(label_b)))
+        if label_b:
+            self.update_bytes(label_b)
+        self.update_bytes(_u32be(len(encoded)))
+        for b in encoded:
+            self.update_bytes(b)
 
     def update_json_legacy(self, obj: Any) -> None:
         """

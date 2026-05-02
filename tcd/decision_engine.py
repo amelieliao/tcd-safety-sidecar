@@ -147,6 +147,22 @@ _JWT_RE = re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$
 _LONG_HEX_RE = re.compile(r"(?i)\b[0-9a-f]{32,}\b")
 
 
+def _scalar_text(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    if isinstance(x, int):
+        return str(x)
+    if isinstance(x, float):
+        return f"{x:.12g}" if math.isfinite(x) else ""
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        return "<bytes>"
+    return f"<{type(x).__name__}>"
+
+
 def _safe_text(x: Any, *, max_len: int) -> str:
     """
     Log/receipt safe text:
@@ -155,8 +171,13 @@ def _safe_text(x: Any, *, max_len: int) -> str:
       - truncates
       - redacts obvious secrets/tokens
     """
-    s = "" if x is None else str(x)
+    s = _scalar_text(x)
     s = _CTRL_RE.sub("", s).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+    if s:
+        s = "".join(
+            ch for ch in s
+            if ch not in ("\u2028", "\u2029") and not (0xD800 <= ord(ch) <= 0xDFFF)
+        )
     if len(s) > max_len:
         s = s[:max_len]
 
@@ -374,6 +395,28 @@ class DecisionAction(str, Enum):
     ESCALATE_TO_HUMAN = "escalate_to_human"
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionContext:
+    """
+    Compatibility context consumed by service_http.TrustRuntimeWrapper.
+
+    score is interpreted as risk in [0,1].
+    verdict=True promotes the context into the soft-block/degrade lane
+    unless the supplied score is already hard-block severity.
+    """
+    score: Any = 0.0
+    verdict: Any = False
+    tenant_id: Any = "unknown"
+    route: Any = "/"
+    method: Any = "OTHER"
+    p95_latency_ms: Any = None
+    error_rate: Any = None
+    in_flight_requests: Any = None
+    is_anomalous: Any = False
+    extra: Mapping[str, Any] = field(default_factory=dict)
+    ts: Any = None
+
+
 # Low-cardinality reason codes
 DecisionReasonCode = Literal[
     "HARD_BLOCK_RISK",
@@ -437,7 +480,10 @@ class DecisionDataQualityPolicy:
     invalid_risk_policy: InvalidRiskPolicy = "escalate"
 
     def normalized(self) -> "DecisionDataQualityPolicy":
-        bump = float(self.missing_slo_risk_bump)
+        try:
+            bump = float(self.missing_slo_risk_bump)
+        except Exception:
+            bump = 0.10
         if not math.isfinite(bump):
             bump = 0.10
         bump = 0.0 if bump < 0.0 else 1.0 if bump > 1.0 else bump
@@ -542,6 +588,23 @@ def _to_int_or_none(x: Any) -> Optional[int]:
     except Exception:
         return None
     return v
+
+
+def _to_bool(x: Any, *, default: bool = False) -> bool:
+    if type(x) is bool:
+        return bool(x)
+    if type(x) is int:
+        if x == 0:
+            return False
+        if x == 1:
+            return True
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(default)
 
 
 def _clamp01_or_none(x: Optional[float]) -> Optional[float]:
@@ -751,6 +814,8 @@ class EnvironmentSnapshot:
         default_factory=lambda: ExtraSanitizeStats(0, 0, 0, 0, 0, False, False)
     )
 
+    extra_allowlist: Optional[Set[str]] = field(default=None, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         tenant_id = _safe_text(self.tenant_id, max_len=128) or "unknown"
         route = _sanitize_route(self.route, max_len=256)
@@ -798,12 +863,31 @@ class EnvironmentSnapshot:
             ts_v = now
 
         # extra allowlist-based sanitization
-        sanitized_extra, stats = _sanitize_extra(self.extra, allowlist=_DEFAULT_EXTRA_ALLOWLIST)
+        extra_allowlist_raw = getattr(self, "extra_allowlist", None)
+        allowlist = set(_DEFAULT_EXTRA_ALLOWLIST)
+        if extra_allowlist_raw is not None:
+            if isinstance(extra_allowlist_raw, str):
+                candidates = [extra_allowlist_raw]
+            else:
+                try:
+                    candidates = list(extra_allowlist_raw)
+                except Exception:
+                    candidates = []
+            allowlist2: Set[str] = set()
+            for item in candidates:
+                key = _safe_text(item, max_len=_MAX_EXTRA_KEY_LEN).strip().lower()
+                if key:
+                    allowlist2.add(key)
+            if allowlist2:
+                allowlist = allowlist2
+
+        sanitized_extra, stats = _sanitize_extra(self.extra, allowlist=allowlist)
         sealed_extra = MappingProxyType(dict(sanitized_extra))
 
         object.__setattr__(self, "tenant_id", tenant_id)
         object.__setattr__(self, "route", route)
         object.__setattr__(self, "method", method)
+        object.__setattr__(self, "is_anomalous", _to_bool(self.is_anomalous, default=False))
 
         object.__setattr__(self, "risk_score", float(risk))
         object.__setattr__(self, "risk_input_valid", bool(risk_valid))
@@ -820,6 +904,7 @@ class EnvironmentSnapshot:
         object.__setattr__(self, "ts", float(ts_v))
         object.__setattr__(self, "extra_stats", stats)
         object.__setattr__(self, "extra", sealed_extra)
+        object.__setattr__(self, "extra_allowlist", frozenset(allowlist))
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,6 +931,17 @@ class DecisionResult:
     created_at: float
 
     factors: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def value(self) -> str:
+        """
+        service_http compatibility: collapse rich actions into allow/degrade/block.
+        """
+        if self.action == DecisionAction.BLOCK:
+            return "block"
+        if self.action == DecisionAction.ALLOW:
+            return "allow"
+        return "degrade"
 
     def to_receipt_dict(self, *, strict: bool = True, pii_hmac_key: Optional[bytes] = None) -> Dict[str, Any]:
         snap = snapshot_view(self.snapshot, strict=strict, pii_hmac_key=pii_hmac_key)
@@ -1356,6 +1452,7 @@ class DecisionEngine:
         is_anomalous: Any = False,
         extra: Any = None,
         ts: Any = None,
+        extra_allowlist: Optional[Set[str]] = None,
     ) -> EnvironmentSnapshot:
         """
         Official constructor: never throws, always returns a valid EnvironmentSnapshot.
@@ -1369,9 +1466,10 @@ class DecisionEngine:
                 p95_latency_ms=p95_latency_ms,
                 error_rate=error_rate,
                 in_flight_requests=in_flight_requests,
-                is_anomalous=bool(is_anomalous),
+                is_anomalous=_to_bool(is_anomalous, default=False),
                 extra=extra if extra is not None else {},
                 ts=ts if ts is not None else time.time(),
+                extra_allowlist=extra_allowlist,
             )
         except Exception:
             # never-throw fallback
@@ -1386,6 +1484,7 @@ class DecisionEngine:
                 is_anomalous=True,
                 extra={},
                 ts=time.time(),
+                extra_allowlist=extra_allowlist,
             )
 
     # ---------------- decision API ----------------
@@ -1658,15 +1757,53 @@ class DecisionEngine:
         Defensive coercion: if snapshot is not an EnvironmentSnapshot, attempt to build one.
         Never throws; always returns a valid snapshot (4.1).
         """
+        engine_allowlist = set(self._extra_allowlist)
+
         if isinstance(snapshot, EnvironmentSnapshot):
-            # ensure extra allowlist policy is applied (snapshot itself uses default allowlist).
-            # If you want per-engine allowlist, build snapshots via engine.make_snapshot.
-            return snapshot
+            if getattr(snapshot, "extra_allowlist", None) == self._extra_allowlist:
+                return snapshot
+            return self.make_snapshot(
+                risk_score=snapshot.risk_score,
+                tenant_id=snapshot.tenant_id,
+                route=snapshot.route,
+                method=snapshot.method,
+                p95_latency_ms=snapshot.p95_latency_ms,
+                error_rate=snapshot.error_rate,
+                in_flight_requests=snapshot.in_flight_requests,
+                is_anomalous=snapshot.is_anomalous,
+                extra=dict(snapshot.extra) if isinstance(snapshot.extra, Mapping) else {},
+                ts=snapshot.ts,
+                extra_allowlist=engine_allowlist,
+            )
+
+        if isinstance(snapshot, DecisionContext):
+            raw_risk = _to_float_or_none(snapshot.score)
+            risk = 1.0 if raw_risk is None else max(0.0, min(1.0, float(raw_risk)))
+
+            if _to_bool(snapshot.verdict, default=False):
+                risk = max(risk, float(self._thresholds.soft_block_risk))
+
+            return self.make_snapshot(
+                risk_score=risk,
+                tenant_id=snapshot.tenant_id,
+                route=snapshot.route,
+                method=snapshot.method,
+                # Compatibility path: DecisionContext has no SLO telemetry in service_http,
+                # so missing SLO must not force a degrade for decision_fail=False.
+                p95_latency_ms=0 if snapshot.p95_latency_ms is None else snapshot.p95_latency_ms,
+                error_rate=0.0 if snapshot.error_rate is None else snapshot.error_rate,
+                in_flight_requests=0 if snapshot.in_flight_requests is None else snapshot.in_flight_requests,
+                is_anomalous=snapshot.is_anomalous,
+                extra=snapshot.extra,
+                ts=snapshot.ts if snapshot.ts is not None else time.time(),
+                extra_allowlist=engine_allowlist,
+            )
 
         if isinstance(snapshot, Mapping):
+            risk_source = snapshot.get("risk_score", snapshot.get("score"))
             return self.make_snapshot(
-                risk_score=snapshot.get("risk_score"),
-                tenant_id=snapshot.get("tenant_id", "unknown"),
+                risk_score=risk_source,
+                tenant_id=snapshot.get("tenant_id", snapshot.get("tenant", "unknown")),
                 route=snapshot.get("route", "/"),
                 method=snapshot.get("method", "OTHER"),
                 p95_latency_ms=snapshot.get("p95_latency_ms"),
@@ -1675,6 +1812,7 @@ class DecisionEngine:
                 is_anomalous=snapshot.get("is_anomalous", False),
                 extra=snapshot.get("extra", {}),
                 ts=snapshot.get("ts", time.time()),
+                extra_allowlist=engine_allowlist,
             )
 
         # fallback
@@ -1686,6 +1824,7 @@ class DecisionEngine:
             is_anomalous=True,
             extra={"dq": "invalid_snapshot_type"},
             ts=time.time(),
+            extra_allowlist=engine_allowlist,
         )
 
 
@@ -1744,9 +1883,11 @@ def build_decision_engine_from_config(
     dq_cfg = cfg.get("data_quality_policy")
     dq = None
     if isinstance(dq_cfg, Mapping):
+        bump_raw = dq_cfg.get("missing_slo_risk_bump", 0.10)
+        bump_val = _to_float_or_none(bump_raw)
         dq = DecisionDataQualityPolicy(
             missing_slo_policy=str(dq_cfg.get("missing_slo_policy", "assume_pressure_soft")),
-            missing_slo_risk_bump=float(dq_cfg.get("missing_slo_risk_bump", 0.10)) if dq_cfg.get("missing_slo_risk_bump") is not None else 0.10,
+            missing_slo_risk_bump=0.10 if bump_val is None else float(bump_val),
             invalid_risk_policy=str(dq_cfg.get("invalid_risk_policy", "escalate")),
         ).normalized()
 

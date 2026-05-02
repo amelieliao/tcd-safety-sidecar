@@ -108,14 +108,20 @@ class _NopMetric:
         pass
 
 
-if _HAS_PROM:
-    _LOG_DROPPED = Counter("tcd_log_dropped_total", "Dropped log lines", ["reason"])
-    _LOG_REDACTED = Counter("tcd_log_redacted_total", "Redactions applied", ["reason"])
-    _LOG_META_DROPPED = Counter("tcd_log_meta_dropped_total", "Meta fields dropped", ["reason"])
-else:  # pragma: no cover
-    _LOG_DROPPED = _NopMetric()
-    _LOG_REDACTED = _NopMetric()
-    _LOG_META_DROPPED = _NopMetric()
+def _counter_or_nop(name: str, documentation: str, labelnames: list[str]) -> Any:
+    if not _HAS_PROM:
+        return _NopMetric()
+    try:
+        return Counter(name, documentation, labelnames)
+    except Exception:
+        # Duplicate collector names can happen in reload/test contexts.
+        # Logging must remain optional and never make service_http import fail.
+        return _NopMetric()
+
+
+_LOG_DROPPED = _counter_or_nop("tcd_log_dropped_total", "Dropped log lines", ["reason"])
+_LOG_REDACTED = _counter_or_nop("tcd_log_redacted_total", "Redactions applied", ["reason"])
+_LOG_META_DROPPED = _counter_or_nop("tcd_log_meta_dropped_total", "Meta fields dropped", ["reason"])
 
 # ---------- Structured metadata sanitization (reuses utils) ----------
 from .utils import (  # noqa: E402
@@ -221,7 +227,7 @@ def _parse_key_material(s: str) -> Optional[bytes]:
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _ALPHA_DIGIT_BOUNDARY_RE = re.compile(r"(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])")
 _TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
-_ASCII_CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_ASCII_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
 
 # Tag-like (identifiers)
 _TAGLIKE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -269,6 +275,29 @@ _DEFAULT_FORBIDDEN_META_KEYS: FrozenSet[str] = frozenset(
         "private_key",
         "password",
         "token",
+    }
+)
+
+_SAFE_CORRELATION_META_KEYS: FrozenSet[str] = frozenset(
+    {
+        "request_id",
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "receipt_ref",
+        "audit_ref",
+        "config_fingerprint",
+        "cfg_fp",
+        "config_hash",
+        "policy_ref",
+        "policyset_ref",
+        "policy_digest",
+        "state_digest",
+        "body_digest",
+        "payload_digest",
+        "event_digest",
+        "chain_id",
+        "chain_head",
     }
 )
 
@@ -335,12 +364,35 @@ _DEFAULT_ALLOWED_META_KEYS: FrozenSet[str] = frozenset(
         "score",
         "http_hdrs",
         "pii_key_id",
+        # service_http decision/evidence correlation fields
+        "request_id",
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "receipt_ref",
+        "audit_ref",
+        "config_fingerprint",
+        "cfg_fp",
+        "config_hash",
+        "bundle_version",
+        "policyset_ref",
+        "policy_digest",
+        "state_digest",
+        "body_digest",
+        "payload_digest",
+        "event_digest",
+        "required_action",
+        "action",
+        "p_final",
+        "route_decoder",
+        "route_temp",
+        "route_top_p",
     }
 )
 
 # Vocab constraints for trust / routing / override / PQ posture
 _ALLOWED_TRUST_ZONES: FrozenSet[str] = frozenset({"internet", "internal", "partner", "admin", "ops"})
-_ALLOWED_ROUTE_PROFILES: FrozenSet[str] = frozenset({"inference", "admin", "control", "metrics", "health"})
+_ALLOWED_ROUTE_PROFILES: FrozenSet[str] = frozenset({"inference", "batch", "admin", "control", "metrics", "health"})
 _ALLOWED_OVERRIDE_LEVELS: FrozenSet[str] = frozenset({"none", "break_glass", "maintenance"})
 _ALLOWED_PQ_SCHEMES: FrozenSet[str] = frozenset({"", "dilithium2", "dilithium3", "falcon", "sphincs+"})
 
@@ -903,6 +955,8 @@ def _is_forbidden_key_name(key: str, cfg: LoggingConfig) -> bool:
     if not k:
         return False
     kl = k.lower()
+    if kl in _SAFE_CORRELATION_META_KEYS:
+        return False
     if kl in cfg.forbidden_keys_exact_lower:
         return True
 
@@ -1902,6 +1956,24 @@ def _safe_extra_merge(dst: Dict[str, Any], extra: Optional[Dict[str, Any]], cfg:
         dst[kl] = v
 
 
+def _filter_log_extra(extra: Mapping[str, Any], cfg: LoggingConfig) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (extra or {}).items():
+        if v is None:
+            continue
+        if not isinstance(k, str):
+            continue
+        kl = _strip_unsafe_text(k, max_len=64).strip()
+        if not kl or kl.startswith("_"):
+            continue
+        if kl in _LOG_RECORD_STD_ATTRS or kl == "message":
+            continue
+        if _is_forbidden_key_name(kl, cfg):
+            continue
+        out[kl] = v
+    return out
+
+
 def log_decision(
     logger: logging.Logger,
     *,
@@ -1950,7 +2022,7 @@ def log_decision(
         except Exception:
             pass
 
-    logger.log(level, message, extra=extra_dict)
+    logger.log(level, message, extra=_filter_log_extra(extra_dict, cfg))
 
 
 def log_security_event(
@@ -2005,7 +2077,7 @@ def log_security_event(
         except Exception:
             pass
 
-    logger.log(level, message, extra=extra_dict)
+    logger.log(level, message, extra=_filter_log_extra(extra_dict, cfg))
 
 
 # ---------------------------------------------------------------------------

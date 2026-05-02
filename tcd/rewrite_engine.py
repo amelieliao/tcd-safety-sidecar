@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import textwrap
 import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # Optional hashing primitive for patch_ref (kept opaque here).
 try:
@@ -24,16 +25,200 @@ except Exception:  # pragma: no cover
 # Hard limits to keep this engine firmly in the "small, local edits" regime.
 _MAX_SEGMENT_LINES = 64
 _MAX_CHANGED_LINES = 32
+_MAX_FILE_BYTES = 1_000_000
+_MAX_REWRITE_TOKEN_CHARS = 256
+_MAX_METADATA_DEPTH = 4
+_MAX_METADATA_ITEMS = 64
+_MAX_METADATA_STRING_CHARS = 512
 
 # Sensitive areas which should not be rewritten automatically.
 # Paths are interpreted relative to the repository root.
 _SENSITIVE_PATH_PREFIXES: Tuple[str, ...] = (
+    # Crypto / verification / receipts.
     "tcd/crypto",
     "tcd/verify",
     "tcd/receipts",
-    "tcd/ratelimit",
+    "tcd/attest",
+
+    # Runtime transport and edge-control surfaces.
+    "tcd/service_http",
+    "tcd/service_grpc",
+    "tcd/api_v1",
+    "tcd/middleware",
+    "tcd/middleware_request",
+    "tcd/middleware_security",
+    "tcd/auth",
+
+    # Policy / routing / security control plane.
+    "tcd/policies",
     "tcd/security_router",
+    "tcd/routing",
+    "tcd/risk_av",
+    "tcd/ratelimit",
+
+    # Evidence / persistence / audit surfaces.
+    "tcd/schemas",
+    "tcd/signals",
+    "tcd/storage",
+    "tcd/ledger",
+    "tcd/audit",
+    "tcd/auditor",
+    "tcd/trust_graph",
+
+    # Detector / decision core and patch governance.
+    "tcd/detector",
+    "tcd/decision_engine",
+    "tcd/multivariate",
+    "tcd/agent",
+    "tcd/patch_runtime",
 )
+
+
+
+_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
+
+_SENSITIVE_METADATA_KEY_TOKENS = frozenset(
+    {
+        "prompt",
+        "completion",
+        "input",
+        "output",
+        "message",
+        "messages",
+        "content",
+        "body",
+        "payload",
+        "headers",
+        "header",
+        "cookie",
+        "authorization",
+        "auth",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "apikey",
+        "api_key",
+        "private",
+        "privatekey",
+        "llm_suggestion",
+    }
+)
+
+
+def _safe_scalar_text(v: Any, *, max_chars: int = _MAX_METADATA_STRING_CHARS) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        s = v
+    elif isinstance(v, bool):
+        return "true" if v else "false"
+    elif isinstance(v, int):
+        s = str(v)
+    elif isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return ""
+        s = f"{v:.12g}"
+    elif isinstance(v, (bytes, bytearray, memoryview)):
+        return "<bytes>"
+    else:
+        return f"[type:{type(v).__name__}]"
+    return _CTRL_RE.sub("", s[:max_chars]).strip()
+
+
+def _metadata_get(meta: Any, key: str, default: Any = "") -> Any:
+    if isinstance(meta, Mapping):
+        return meta.get(key, default)
+    return default
+
+
+def _metadata_key_is_sensitive(key: str) -> bool:
+    key_l = key.lower()
+    parts = [p for p in re.split(r"[^a-z0-9]+", key_l) if p]
+    fused = "".join(parts)
+    toks = tuple(parts) + ((fused,) if fused else tuple())
+    return any(t in _SENSITIVE_METADATA_KEY_TOKENS for t in toks) or any(
+        t in key_l for t in _SENSITIVE_METADATA_KEY_TOKENS
+    )
+
+
+def _sanitize_metadata_value(v: Any, *, depth: int = 0) -> Any:
+    if depth >= _MAX_METADATA_DEPTH:
+        return "[truncated]"
+
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return int(v) if v.bit_length() <= 256 else "[int:oversize]"
+    if isinstance(v, float):
+        return float(v) if (v == v and v not in (float("inf"), float("-inf"))) else None
+    if isinstance(v, str):
+        return _safe_scalar_text(v, max_chars=_MAX_METADATA_STRING_CHARS)
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return f"[bytes:{len(v)}]"
+
+    if isinstance(v, Mapping):
+        out: Dict[str, Any] = {}
+        for idx, (k, val) in enumerate(v.items()):
+            if idx >= _MAX_METADATA_ITEMS:
+                out["_truncated"] = True
+                break
+            if not isinstance(k, str):
+                continue
+            kk = _safe_scalar_text(k, max_chars=128)
+            if not kk:
+                continue
+            if _metadata_key_is_sensitive(kk):
+                out[kk] = "[redacted]"
+                continue
+            out[kk] = _sanitize_metadata_value(val, depth=depth + 1)
+        return out
+
+    if isinstance(v, (list, tuple, set, frozenset)):
+        seq = list(v)[:_MAX_METADATA_ITEMS]
+        out = [_sanitize_metadata_value(x, depth=depth + 1) for x in seq]
+        if len(v) > _MAX_METADATA_ITEMS:
+            out.append("[truncated]")
+        return out
+
+    return f"[type:{type(v).__name__}]"
+
+
+def _sanitize_metadata(meta: Any) -> Dict[str, Any]:
+    if not isinstance(meta, Mapping):
+        return {}
+    out = _sanitize_metadata_value(meta, depth=0)
+    return out if isinstance(out, dict) else {}
+
+
+def _rewrite_token(v: Any, *, max_chars: int = _MAX_REWRITE_TOKEN_CHARS) -> str:
+    if not isinstance(v, str):
+        return ""
+    if "\x00" in v or "\r" in v or "\n" in v:
+        return ""
+    if len(v) > max_chars:
+        return ""
+    return _CTRL_RE.sub("", v).strip()
+
+
+def _normalize_repo_rel_path(file_path: str) -> Optional[str]:
+    if not isinstance(file_path, str):
+        return None
+    raw = file_path.replace("\\", "/").strip()
+    if not raw or raw.startswith("/") or "\x00" in raw:
+        return None
+    p = PurePosixPath(raw)
+    parts: List[str] = []
+    for part in p.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    if not parts:
+        return None
+    return "/".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +418,15 @@ class RewriteEngine:
     supply in BugSignal.metadata.
     """
 
-    def __init__(self, repo_root: Path | str) -> None:
-        self.repo_root = Path(repo_root).resolve()
+    def __init__(self, repo_root: Path | str | None = None) -> None:
+        # Compatibility with service_http.create_http_runtime(), which calls
+        # RewriteEngine() without arguments. Default to the repository root
+        # inferred from this package file: <repo>/tcd/rewrite_engine.py.
+        self.repo_root = (
+            Path(repo_root).resolve()
+            if repo_root is not None
+            else Path(__file__).resolve().parents[1]
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -253,11 +445,14 @@ class RewriteEngine:
           - Only STATIC_RULE + LOW risk patches can be marked as
             auto_apply_allowed in their security metadata.
         """
-        # Guard: do not propose patches in sensitive core areas.
-        if self._is_sensitive_path(signal.file_path):
+        rel_path, abs_path = self._resolve_repo_file(signal.file_path)
+        if rel_path is None or abs_path is None:
             return None
 
-        abs_path = (self.repo_root / signal.file_path).resolve()
+        # Guard: do not propose patches in sensitive core areas.
+        if self._is_sensitive_path(rel_path):
+            return None
+
         if not abs_path.is_file():
             return None
 
@@ -286,27 +481,28 @@ class RewriteEngine:
         risk = self._adjust_risk_for_origin(risk, origin)
 
         hunk = PatchHunk(
-            file_path=signal.file_path,
+            file_path=rel_path,
             old_start=start_idx + 1,
             old_end=end_idx,
             new_start=start_idx + 1,
-            new_end=start_idx + 1 + len(new_segment),
+            new_end=start_idx + len(new_segment),
             old_lines=old_segment,
             new_lines=new_segment,
         )
 
         title = self._title_for_signal(signal)
         description = self._description_for_signal(signal, risk, origin)
+        safe_signal_metadata = _sanitize_metadata(signal.metadata)
 
         # Base metadata from the signal and engine.
         metadata: Dict[str, Any] = {
             "signal": {
                 "kind": signal.kind,
                 "message": signal.message,
-                "file_path": signal.file_path,
+                "file_path": rel_path,
                 "line": signal.line,
                 "context_lines": signal.context_lines,
-                "metadata": signal.metadata,
+                "metadata": safe_signal_metadata,
             },
             "engine": {
                 "name": "tcd.rewrite_engine",
@@ -324,10 +520,10 @@ class RewriteEngine:
                 origin == PatchOrigin.STATIC_RULE and risk == PatchRisk.LOW
             ),
             # Pass-through hints used by control planes for auditing and routing.
-            "policy_ref": signal.metadata.get("policy_ref"),
-            "policyset_ref": signal.metadata.get("policyset_ref"),
-            "subject_hash": signal.metadata.get("subject_hash"),
-            "e_snapshot": signal.metadata.get("e_snapshot"),
+            "policy_ref": safe_signal_metadata.get("policy_ref"),
+            "policyset_ref": safe_signal_metadata.get("policyset_ref"),
+            "subject_hash": safe_signal_metadata.get("subject_hash"),
+            "e_snapshot": safe_signal_metadata.get("e_snapshot"),
         }
         metadata["security"] = security_meta
 
@@ -351,8 +547,24 @@ class RewriteEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+
+    def _resolve_repo_file(self, file_path: str) -> Tuple[Optional[str], Optional[Path]]:
+        rel = _normalize_repo_rel_path(file_path)
+        if rel is None:
+            return None, None
+
+        abs_path = (self.repo_root / rel).resolve()
+        try:
+            abs_path.relative_to(self.repo_root)
+        except ValueError:
+            return None, None
+
+        return rel, abs_path
+
     def _safe_read_lines(self, path: Path) -> List[str]:
         try:
+            if path.stat().st_size > _MAX_FILE_BYTES:
+                return []
             text = path.read_text(encoding="utf-8")
         except Exception:
             return []
@@ -361,9 +573,18 @@ class RewriteEngine:
 
     @staticmethod
     def _context_window(line: int, context: int, n_lines: int) -> Tuple[int, int]:
-        line_idx = max(0, line - 1)
-        start = max(0, line_idx - context)
-        end = min(n_lines, line_idx + context + 1)
+        try:
+            line_i = int(line)
+        except Exception:
+            line_i = 1
+        try:
+            ctx = int(context)
+        except Exception:
+            ctx = 0
+        ctx = max(0, min(ctx, _MAX_SEGMENT_LINES // 2))
+        line_idx = max(0, line_i - 1)
+        start = max(0, line_idx - ctx)
+        end = min(n_lines, line_idx + ctx + 1)
         return start, end
 
     @staticmethod
@@ -376,8 +597,14 @@ class RewriteEngine:
         can still surface signals for these files, but the engine will
         abstain from generating edits.
         """
-        norm = Path(file_path).as_posix()
-        return any(norm.startswith(prefix) for prefix in _SENSITIVE_PATH_PREFIXES)
+        norm = _normalize_repo_rel_path(file_path)
+        if norm is None:
+            return True
+        for prefix in _SENSITIVE_PATH_PREFIXES:
+            pref = prefix.rstrip("/")
+            if norm == pref or norm.startswith(pref + "/") or norm.startswith(pref + "."):
+                return True
+        return False
 
     @staticmethod
     def _estimate_changed_lines(old: List[str], new: List[str]) -> int:
@@ -422,7 +649,7 @@ class RewriteEngine:
           - else if "external_tool" or "tool_name" is present, treat as EXTERNAL_TOOL;
           - otherwise assume STATIC_RULE.
         """
-        meta = signal.metadata or {}
+        meta = signal.metadata if isinstance(signal.metadata, Mapping) else {}
 
         explicit = str(meta.get("origin", "")).strip().lower()
         for o in PatchOrigin:
@@ -459,6 +686,9 @@ class RewriteEngine:
             return
         try:
             payload = proposal.to_dict()
+            # Remove volatile fields so identical semantic patches get the same ref.
+            payload.pop("patch_id", None)
+            payload.pop("created_at", None)
             # Remove any pre-existing patch_ref to avoid self-dependence.
             sec = payload.get("metadata", {}).get("security", {})
             if isinstance(sec, dict):
@@ -514,21 +744,24 @@ class RewriteEngine:
         signal: BugSignal,
         original_lines: List[str],
     ) -> Tuple[Optional[List[str]], PatchRisk]:
-        expected = str(signal.metadata.get("expected_key", "")).strip()
-        actual = str(signal.metadata.get("actual_key", "")).strip()
+        expected = _rewrite_token(_metadata_get(signal.metadata, "expected_key"))
+        actual = _rewrite_token(_metadata_get(signal.metadata, "actual_key"))
 
         if not expected or not actual or expected == actual:
             return None, PatchRisk.HIGH
+
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_.:-]){re.escape(actual)}(?![A-Za-z0-9_.:-])"
+        )
 
         new_lines: List[str] = []
         replaced = False
 
         for line in original_lines:
-            if actual in line:
-                new_lines.append(line.replace(actual, expected))
+            new_line, n = pattern.subn(lambda _m: expected, line)
+            if n:
                 replaced = True
-            else:
-                new_lines.append(line)
+            new_lines.append(new_line)
 
         if not replaced:
             return None, PatchRisk.MEDIUM
@@ -543,22 +776,38 @@ class RewriteEngine:
     ) -> Tuple[Optional[List[str]], PatchRisk]:
         """
         Example: turn logging.debug(...) into logging.info(...) or logging.warning(...).
-        """
-        target_level = str(signal.metadata.get("target_level", "info")).lower()
-        if target_level not in {"debug", "info", "warning", "error"}:
-            target_level = "info"
 
-        old_levels = ["debug", "info", "warning", "error"]
+        Safety rule:
+          - only rewrite one explicit source level;
+          - default source level is debug;
+          - never downgrade severity, for example error -> info.
+        """
+        target_level = _rewrite_token(_metadata_get(signal.metadata, "target_level", "info")).lower()
+        source_level = _rewrite_token(_metadata_get(signal.metadata, "from_level", "debug")).lower()
+
+        severity_order = {"debug": 0, "info": 1, "warning": 2, "error": 3}
+        if target_level not in severity_order:
+            target_level = "info"
+        if source_level not in severity_order:
+            source_level = "debug"
+
+        if source_level == target_level:
+            return None, PatchRisk.MEDIUM
+
+        # "too_verbose" may only move toward less verbosity / higher severity.
+        if severity_order[target_level] < severity_order[source_level]:
+            return None, PatchRisk.HIGH
+
+        pattern = re.compile(rf"(?<![A-Za-z0-9_.])logging\.{re.escape(source_level)}\(")
+        replacement = f"logging.{target_level}("
+
         new_lines: List[str] = []
         replaced = False
 
         for line in original_lines:
-            new_line = line
-            for lvl in old_levels:
-                needle = f"logging.{lvl}("
-                if needle in new_line and lvl != target_level:
-                    new_line = new_line.replace(needle, f"logging.{target_level}(")
-                    replaced = True
+            new_line, n = pattern.subn(replacement, line)
+            if n:
+                replaced = True
             new_lines.append(new_line)
 
         if not replaced:
@@ -575,8 +824,8 @@ class RewriteEngine:
         """
         Simple string replacement based on metadata["from_text"] -> metadata["to_text"].
         """
-        src = str(signal.metadata.get("from_text", "")).strip()
-        dst = str(signal.metadata.get("to_text", "")).strip()
+        src = _rewrite_token(_metadata_get(signal.metadata, "from_text"))
+        dst = _rewrite_token(_metadata_get(signal.metadata, "to_text"))
 
         if not src or not dst or src == dst:
             return None, PatchRisk.HIGH
@@ -612,7 +861,7 @@ class RewriteEngine:
         risk: PatchRisk,
         origin: PatchOrigin,
     ) -> str:
-        meta_preview = json.dumps(signal.metadata, ensure_ascii=False, sort_keys=True)
+        meta_preview = json.dumps(_sanitize_metadata(signal.metadata), ensure_ascii=False, sort_keys=True)
         body = textwrap.dedent(
             f"""
             Automatically generated patch suggestion for bug signal:

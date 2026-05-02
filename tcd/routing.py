@@ -119,6 +119,14 @@ _REASON_CODES = frozenset(
         "ROUTER_FAIL_CLOSED",
         "CFG_ERROR",
         "CFG_ERROR_LKG",
+        "CFG_HASH_BACKEND_UNAVAILABLE",
+        "STRICT_TEMP_CAP_TIGHTENED",
+        "STRICT_TOP_P_CAP_TIGHTENED",
+        "STRICT_MAX_TOKENS_TIGHTENED",
+        "ELEVATED_MAX_TOKENS_TIGHTENED",
+        "ELEVATED_ACTION_TIGHTENED",
+        "STRICT_ACTION_TIGHTENED",
+        "CRITICAL_ACTION_TIGHTENED",
         "INVALID_TRUST_ZONE",
         "UNKNOWN_TRUST_ZONE",
         "INVALID_ROUTE_PROFILE",
@@ -310,6 +318,22 @@ def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
         return int(hi)
     return int(x)
 
+
+
+def _safe_score(v: Any, *, default: float = 0.0) -> float:
+    return _clamp_float(v, default=default, lo=0.0, hi=1.0)
+
+
+def _normalize_signal_tags(values: Any, *, max_items: int = 8) -> Tuple[str, ...]:
+    if values is None:
+        return tuple()
+    if isinstance(values, str):
+        seq: Sequence[Any] = [values]
+    elif isinstance(values, (list, tuple, set, frozenset)):
+        seq = list(values)
+    else:
+        return tuple()
+    return _normalize_label_tuple(seq, max_items=max_items)
 
 def _safe_oneof(v: Any, *, allowed: Sequence[str], default: str, lower: bool = True) -> str:
     s = _strip_unsafe_text(v, max_len=64)
@@ -504,8 +528,8 @@ class StrategySignalEnvelope:
     def normalized(self) -> "StrategySignalEnvelope":
         return StrategySignalEnvelope(
             source=_safe_name(self.source, default="legacy_implicit"),
-            trusted=bool(self.trusted),
-            signed=bool(self.signed),
+            trusted=_coerce_bool(self.trusted, default=True),
+            signed=_coerce_bool(self.signed, default=False),
             signer_kid=_safe_id(self.signer_kid, default=None, max_len=64),
             source_cfg_fp=_safe_id(self.source_cfg_fp, default=None, max_len=128),
             source_policy_ref=_safe_id(self.source_policy_ref, default=None, max_len=128),
@@ -514,7 +538,11 @@ class StrategySignalEnvelope:
                 if self.freshness_ms is not None
                 else None
             ),
-            replay_checked=None if self.replay_checked is None else bool(self.replay_checked),
+            replay_checked=(
+                None
+                if self.replay_checked is None
+                else _coerce_bool(self.replay_checked, default=False)
+            ),
         )
 
 
@@ -555,12 +583,12 @@ class StrategySignals:
         return StrategySignals(
             score=_safe_score(self.score),
             risk_label=_safe_label(self.risk_label, default="normal"),
-            decision_fail=bool(self.decision_fail),
-            e_triggered=bool(self.e_triggered),
-            pq_unhealthy=bool(self.pq_unhealthy),
+            decision_fail=_coerce_bool(self.decision_fail, default=False),
+            e_triggered=_coerce_bool(self.e_triggered, default=False),
+            pq_unhealthy=_coerce_bool(self.pq_unhealthy, default=False),
             av_label=_safe_label(self.av_label, default="") or None if isinstance(self.av_label, str) else None,
-            av_trigger=None if self.av_trigger is None else bool(self.av_trigger),
-            threat_tags=_normalize_label_tuple(self.threat_tags, max_items=8),
+            av_trigger=None if self.av_trigger is None else _coerce_bool(self.av_trigger, default=False),
+            threat_tags=_normalize_signal_tags(self.threat_tags, max_items=8),
             controller_mode=_safe_label(self.controller_mode, default="") or None if isinstance(self.controller_mode, str) else None,
             guarantee_scope=_safe_label(self.guarantee_scope, default="") or None if isinstance(self.guarantee_scope, str) else None,
         )
@@ -1569,6 +1597,15 @@ class StrategyRouter:
                 elevated_top_p_cap=spec.elevated_top_p_cap,
                 high_risk_threshold=spec.high_risk_threshold,
                 critical_risk_threshold=spec.critical_risk_threshold,
+                normal_temperature=spec.normal_preset.temperature,
+                normal_top_p=spec.normal_preset.top_p,
+                elevated_temperature=spec.elevated_preset.temperature,
+                elevated_top_p=spec.elevated_preset.top_p,
+                strict_temperature=spec.strict_preset.temperature,
+                strict_top_p=spec.strict_preset.top_p,
+                normal_max_tokens=spec.normal_preset.max_tokens,
+                elevated_safety_max_tokens=spec.elevated_preset.max_tokens,
+                strict_safety_max_tokens=spec.strict_preset.max_tokens,
                 profile_defaults=dict(spec.profile_defaults),
                 zone_defaults=dict(spec.zone_defaults),
                 risk_label_defaults=dict(spec.risk_label_defaults),
@@ -1771,7 +1808,7 @@ class StrategyRouter:
                 pq_unhealthy=item.get("pq_unhealthy", False),
                 av_label=item.get("av_label"),
                 av_trigger=item.get("av_trigger"),
-                threat_tags=tuple(item.get("threat_kinds") or item.get("threat_tags") or (())),
+                threat_tags=_normalize_signal_tags(item.get("threat_kinds") if item.get("threat_kinds") is not None else item.get("threat_tags"), max_items=8),
                 controller_mode=item.get("controller_mode"),
                 guarantee_scope=item.get("guarantee_scope"),
             )
@@ -1786,8 +1823,8 @@ class StrategyRouter:
             elif isinstance(env_raw, Mapping):
                 env = StrategySignalEnvelope(
                     source=env_raw.get("source", "legacy_implicit"),
-                    trusted=bool(env_raw.get("trusted", True)),
-                    signed=bool(env_raw.get("signed", False)),
+                    trusted=_coerce_bool(env_raw.get("trusted", True), default=True),
+                    signed=_coerce_bool(env_raw.get("signed", False), default=False),
                     signer_kid=env_raw.get("signer_kid"),
                     source_cfg_fp=env_raw.get("source_cfg_fp"),
                     source_policy_ref=env_raw.get("source_policy_ref"),
@@ -1801,10 +1838,10 @@ class StrategyRouter:
                     bundle=bundle,
                     router_mode=router_mode,
                     degraded_codes=degraded_codes,
-                    route_context=ctx,
-                    signals=signals,
-                    base=base,
-                    envelope=env,
+                    route_context=ctx.normalized(),
+                    signals=signals.normalized(),
+                    base=base.normalized(),
+                    envelope=env.normalized(),
                 )
             )
         return out
@@ -1865,7 +1902,7 @@ class StrategyRouter:
             pq_unhealthy=pq_unhealthy,
             av_label=av_label,
             av_trigger=av_trigger,
-            threat_tags=tuple(threat_kinds) if threat_kinds is not None else ((threat_kind,) if threat_kind else ()),
+            threat_tags=_normalize_signal_tags(threat_kinds if threat_kinds is not None else ([threat_kind] if threat_kind else ()), max_items=8),
             controller_mode=controller_mode,
             guarantee_scope=guarantee_scope,
         ).normalized()
@@ -2455,15 +2492,6 @@ class StrategyRouter:
 
         required_action = preset.required_action
         enforcement_mode = preset.enforcement_mode
-
-        if critical_basis and bundle.spec.critical_basis_force_block:
-            if bundle.spec.require_signed_signal_for_block and not envelope.signed:
-                degraded_reason_codes.append("UNSIGNED_BLOCK_SIGNAL_DOWNGRADED")
-            else:
-                required_action = _action_max(required_action, "block")
-                enforcement_mode = (
-                    "fail_closed" if bundle.spec.profile in {"FINREG", "LOCKDOWN"} else preset.enforcement_mode
-                )
 
         return {
             "safety_tier": safety_tier,

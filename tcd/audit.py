@@ -897,7 +897,7 @@ class AuditLedger:
     # ------------------------------------------------------------------ #
 
     def _hash_self_test(self) -> None:
-        expected = "a71079d42853dea26e453004338670a53814b78137ffbed07603a41d76a483aa"
+        expected = "f308fc02ce9172ad02a7d75800ecfc027109bc67987ea32aba9b8dcc7b10150e"
         got = blake2s(b"test").hexdigest()
         if got != expected:
             raise AuditConfigError("AuditLedger hash self-test failed")
@@ -1210,125 +1210,133 @@ class AuditLedger:
 
     def _recover_jsonl_and_repair(self, *, fd_rw: int, file_size: int) -> Tuple[bool, int]:
         """
-        Returns (ok, truncate_to_offset).
-        If ok=False, no valid record was found.
+        Sequentially recover JSONL records, restore in-memory chain state, and
+        return the last-good byte offset for tail repair.
+
+        This fixes the critical JSONL resume bug: recovery must restore _prev/_seq,
+        not merely find a truncation boundary.
         """
         cfg = self._cfg
-        tail_bytes = min(max(1, int(cfg.recover_tail_bytes)), int(file_size))
-        base = int(file_size) - int(tail_bytes)
-
-        try:
-            os.lseek(fd_rw, base, os.SEEK_SET)
-            tail = os.read(fd_rw, tail_bytes)
-        except Exception as e:
-            raise AuditIOError(f"tail read failed: {_safe_text(e, max_len=200)}") from e
-
-        # find lines with offsets
-        lines: List[Tuple[int, int]] = []  # (start, end_exclusive) within tail
-        start = 0
-        for i, b in enumerate(tail):
-            if b == 0x0A:  # \n
-                lines.append((start, i))
-                start = i + 1
-        # last fragment (may be empty)
-        if start < len(tail):
-            lines.append((start, len(tail)))
-        elif start == len(tail) and len(tail) > 0 and tail[-1] == 0x0A:
-            pass
-
-        candidates: List[Tuple[str, int, int, Optional[int], Optional[int], Optional[str], Optional[str]]] = []
-        # tuple: (head, offset_end_abs, has_newline, seq, ts_ns, prev, head_mac)
-        for (s, e) in reversed(lines):
-            if e <= s:
-                continue
-            line_bytes = tail[s:e]
-            outer = self._parse_outer_json_bytes(line_bytes)
-            if not outer:
-                continue
-            body = str(outer.get("body"))
-            head = str(outer.get("head"))
-            head_mac = outer.get("head_mac") if isinstance(outer.get("head_mac"), str) else None
-
-            if cfg.verify_tail:
-                try:
-                    if head != self._hash_public(body):
-                        continue
-                    if self._mac_key is not None and head_mac is not None:
-                        mac2 = self._hash_mac(body)
-                        if mac2 is not None and mac2 != head_mac:
-                            continue
-                except Exception:
-                    continue
-
-            seq, ts_ns, prev = self._parse_inner_meta(body)
-            # determine absolute end offset:
-            # if this line ended at a newline in tail, then end_abs = base + e + 1
-            # else it's end of file fragment; we will either truncate or add newline later.
-            has_nl = 0
-            if e < len(tail) and e >= 0:
-                # line ended at newline delimiter in scan; only true if original tail had \n at position e
-                # (we split at \n but removed it, so if next char exists and was \n, then line ended with \n)
-                pass
-            # we know delimiter at index e is \n if e < len(tail) and tail[e] == \n, but e is exclusive (points to \n)
-            if e < len(tail) and tail[e:e+1] == b"\n":  # defensive
-                has_nl = 1
-            # better: in our construction, a line (s,e) where e is i at which tail[i] == '\n'
-            # so has_nl is true when e < len(tail) and tail[e] == '\n' (not included)
-            if e < len(tail) and e < len(tail) and (e < len(tail) and e >= 0) and (e < len(tail) and tail[e:e+1] == b"\n"):
-                has_nl = 1
-
-            # But because we stored e as index of '\n', the correct condition is: e < len(tail) and tail[e] == '\n'.
-            if e < len(tail) and tail[e] == 0x0A:
-                has_nl = 1
-
-            end_abs = base + e + (1 if has_nl else 0)
-            candidates.append((head, end_abs, has_nl, seq, ts_ns, prev, head_mac))
-            if len(candidates) >= 256:
-                break
-
-        if not candidates:
+        if file_size <= 0:
             return (False, 0)
 
-        # Optional tail-chain verification on recovered window
-        chain = list(reversed(candidates))  # oldest->newest in this window
-        if cfg.verify_tail_chain:
-            best: List[Tuple[str, int, int, Optional[int], Optional[int], Optional[str], Optional[str]]] = []
-            cur: List[Tuple[str, int, int, Optional[int], Optional[int], Optional[str], Optional[str]]] = []
-            for rec in chain:
-                if not cur:
-                    cur = [rec]
-                    continue
-                prev_expect = cur[-1][0]
-                prev_field = rec[5]
-                if prev_field == prev_expect:
-                    cur.append(rec)
-                else:
-                    if len(cur) > len(best):
-                        best = cur
-                    cur = [rec]
-            if len(cur) > len(best):
-                best = cur
-            if best:
-                chain = best
+        last_good_off = 0
+        ok_any = False
 
-        last = chain[-1]
-        head_hex, end_abs, has_nl, seq, ts_ns, prev, head_mac = last
+        seg_digest = self._segment_digest_seed()
+        first_seq: Optional[int] = None
+        first_ts_ns: Optional[int] = None
+        first_head: Optional[str] = None
+        first_prev: Optional[str] = None
 
-        # repair tail: truncate after last valid line bytes
-        truncate_to = int(end_abs)
-        # If last valid line did not end with newline and is at end of file, we can add a newline instead of truncation.
-        # But if there is trailing garbage after end_abs, truncation will remove it anyway.
-        return (True, truncate_to)
+        last_head: Optional[str] = None
+        last_seq: Optional[int] = None
+        last_ts_ns: Optional[int] = None
+        last_head_mac: Optional[str] = None
+
+        # JSONL active segment may begin after a previous rotated segment, so
+        # the first prev is allowed to be non-zero. Internal records must chain.
+        prev_in_segment: Optional[str] = None
+
+        try:
+            dup_fd = os.dup(fd_rw)
+            with os.fdopen(dup_fd, "rb") as rf:
+                rf.seek(0)
+                while True:
+                    off_before = rf.tell()
+                    raw = rf.readline(int(cfg.max_line_bytes) + 2)
+                    if not raw:
+                        break
+
+                    off_after = rf.tell()
+
+                    # Oversized or unterminated huge line: stop and truncate to last good.
+                    if len(raw) > int(cfg.max_line_bytes) + 1:
+                        break
+
+                    line = raw.rstrip(b"\r\n")
+                    if not line:
+                        # A blank line in the middle is not a ledger record.
+                        break
+
+                    outer = self._parse_outer_json_bytes(line)
+                    if not outer:
+                        break
+
+                    body = str(outer.get("body"))
+                    head = str(outer.get("head"))
+                    head_mac = outer.get("head_mac") if isinstance(outer.get("head_mac"), str) else None
+
+                    if cfg.verify_tail:
+                        try:
+                            if head != self._hash_public(body):
+                                break
+                            if self._mac_key is not None and head_mac is not None:
+                                mac2 = self._hash_mac(body)
+                                if mac2 is not None and mac2 != head_mac:
+                                    break
+                        except Exception:
+                            break
+
+                    seq, ts_ns, prev = self._parse_inner_meta(body)
+
+                    if cfg.verify_tail_chain and prev_in_segment is not None:
+                        if prev != prev_in_segment:
+                            break
+
+                    if first_seq is None:
+                        first_seq = seq if isinstance(seq, int) else None
+                        first_ts_ns = ts_ns if isinstance(ts_ns, int) else None
+                        first_head = head
+                        first_prev = prev if isinstance(prev, str) else None
+
+                    ok_any = True
+                    last_good_off = int(off_after)
+                    last_head = head
+                    last_seq = seq if isinstance(seq, int) else last_seq
+                    last_ts_ns = ts_ns if isinstance(ts_ns, int) else last_ts_ns
+                    last_head_mac = head_mac if head_mac else last_head_mac
+                    prev_in_segment = head
+                    seg_digest = self._segment_digest_step(seg_digest, head)
+
+        except Exception as e:
+            raise AuditIOError(f"jsonl recovery failed: {_safe_text(e, max_len=200)}") from e
+
+        if not ok_any or last_head is None:
+            return (False, 0)
+
+        self._prev = str(last_head)
+        if isinstance(last_seq, int):
+            self._seq = int(last_seq)
+
+        self._segment_start_seq = first_seq
+        self._segment_start_ts_ns = first_ts_ns
+        self._segment_start_head = first_head
+        self._segment_start_prev = first_prev
+
+        self._segment_last_seq = last_seq
+        self._segment_last_ts_ns = last_ts_ns
+        self._segment_last_head_mac = last_head_mac
+        self._segment_digest = str(seg_digest)
+
+        return (True, int(last_good_off))
 
     def _recover_framed_and_repair(self, *, fd_rw: int, file_size: int) -> Tuple[bool, int]:
         cfg = self._cfg
         magic = cfg.framed_magic
         crc_on = bool(cfg.framed_enable_crc32)
 
-        # sequential scan; stop at first incomplete/bad frame; truncate to last_good_off
         off = 0
         last_good_off = 0
         ok_any = False
+
+        seg_digest = self._segment_digest_seed()
+        first_seq: Optional[int] = None
+        first_ts_ns: Optional[int] = None
+        first_head: Optional[str] = None
+        first_prev: Optional[str] = None
+
+        prev_in_segment: Optional[str] = None
 
         while off < file_size:
             try:
@@ -1337,19 +1345,19 @@ class AuditLedger:
                 raise AuditIOError(f"seek failed: {_safe_text(e, max_len=200)}") from e
 
             hdr = _read_exact(fd_rw, 8)
-            if hdr is None:
-                break
-            if len(hdr) < 8:
+            if hdr is None or len(hdr) < 8:
                 break
             if hdr[:4] != magic:
-                # cannot resync safely; stop
                 break
+
             ln = struct.unpack(">I", hdr[4:8])[0]
             if ln <= 0 or ln > int(cfg.max_line_bytes):
                 break
+
             payload = _read_exact(fd_rw, ln)
             if payload is None or len(payload) < ln:
                 break
+
             if crc_on:
                 crc_bytes = _read_exact(fd_rw, 4)
                 if crc_bytes is None or len(crc_bytes) < 4:
@@ -1366,6 +1374,7 @@ class AuditLedger:
             body = str(outer.get("body"))
             head = str(outer.get("head"))
             head_mac = outer.get("head_mac") if isinstance(outer.get("head_mac"), str) else None
+
             if cfg.verify_tail:
                 try:
                     if head != self._hash_public(body):
@@ -1378,19 +1387,41 @@ class AuditLedger:
                     break
 
             seq, ts_ns, prev = self._parse_inner_meta(body)
+
+            if cfg.verify_tail_chain and prev_in_segment is not None:
+                if prev != prev_in_segment:
+                    break
+
+            if first_head is None:
+                first_seq = seq if isinstance(seq, int) else None
+                first_ts_ns = ts_ns if isinstance(ts_ns, int) else None
+                first_head = head
+                first_prev = prev if isinstance(prev, str) else None
+
             if isinstance(seq, int):
                 self._seq = seq
                 self._segment_last_seq = seq
             if isinstance(ts_ns, int):
                 self._segment_last_ts_ns = ts_ns
+
             self._prev = head
             self._segment_last_head_mac = head_mac if head_mac else self._segment_last_head_mac
-            ok_any = True
+            self._segment_digest = self._segment_digest_step(seg_digest, head)
+            seg_digest = self._segment_digest
 
-            # advance
+            ok_any = True
+            prev_in_segment = head
+
             frame_len = 8 + ln + (4 if crc_on else 0)
             off += frame_len
             last_good_off = off
+
+        if ok_any:
+            self._segment_start_seq = first_seq
+            self._segment_start_ts_ns = first_ts_ns
+            self._segment_start_head = first_head
+            self._segment_start_prev = first_prev
+            self._segment_digest = str(seg_digest)
 
         return (ok_any, int(last_good_off))
 
@@ -1793,9 +1824,51 @@ class AuditLedger:
                     if cur_size > 0 and (cur_size + len(outer_json) + (1 if self._record_format == "jsonl" else 0)) > self.rotate_bytes:
                         rotated = self._rotate_before_write()
 
-                # Optional segment marker (only after rotation, before writing user record)
+                # Optional segment marker (only after rotation, before writing user record).
+                # The marker advances _seq/_prev, so the already-built user record
+                # must be rebuilt to chain after the marker.
                 if rotated and cfg.include_segment_markers:
                     self._write_segment_marker(prev_segment_last_head=prev_head)
+
+                    prev_head = self._prev
+                    seq_val = self._seq + 1
+                    inner["seq"] = int(seq_val)
+                    inner["prev"] = str(prev_head)
+
+                    body = _canonical_json(inner)
+                    body_bytes = body.encode("utf-8")
+                    if cfg.max_record_bytes > 0 and len(body_bytes) > int(cfg.max_record_bytes):
+                        raise AuditConfigError("record too large (max_record_bytes)")
+
+                    head = self._hash_public(body)
+                    head_mac = self._hash_mac(body)
+
+                    outer = {"head": head, "body": body}
+                    if head_mac is not None:
+                        outer["head_mac"] = head_mac
+
+                    if cfg.sign_func is not None and cfg.sig_alg:
+                        sign_over = (cfg.sign_over or "body").lower().strip()
+                        if sign_over not in ("body", "head"):
+                            raise AuditConfigError("sign_over must be 'body' or 'head'")
+                        signed_bytes = body_bytes if sign_over == "body" else head.encode("ascii")
+                        try:
+                            sig_bytes = cfg.sign_func(signed_bytes)
+                        except Exception as e:
+                            raise AuditIOError(f"sign_func failed: {_safe_text(e, max_len=200)}") from e
+                        if not isinstance(sig_bytes, (bytes, bytearray)):
+                            raise AuditConfigError("sign_func must return bytes")
+                        if cfg.max_signature_bytes > 0 and len(sig_bytes) > int(cfg.max_signature_bytes):
+                            raise AuditConfigError("signature too large")
+                        sig_val = b64encode(bytes(sig_bytes)).decode("ascii")
+                        sig_block = {"alg": _safe_text(cfg.sig_alg, max_len=64), "val": sig_val, "signed_over": sign_over}
+                        if cfg.sig_key_id:
+                            sig_block["key_id"] = _safe_text(cfg.sig_key_id, max_len=128)
+                        outer["sig"] = sig_block
+
+                    outer_json = _canonical_json(outer).encode("utf-8")
+                    if cfg.max_line_bytes > 0 and len(outer_json) > int(cfg.max_line_bytes):
+                        raise AuditConfigError("outer record too large (max_line_bytes)")
 
                 # Write record (transactional I/O)
                 fsync_ok = True

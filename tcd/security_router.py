@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import math
 import os
 import threading
@@ -79,6 +81,16 @@ except ImportError:  # pragma: no cover
     StrategyRouteContext = Any  # type: ignore[misc]
     StrategySignalEnvelope = Any  # type: ignore[misc]
 
+try:
+    from .verify import verify_receipt_ex
+except Exception:  # pragma: no cover
+    verify_receipt_ex = None  # type: ignore[assignment]
+
+try:
+    from .schemas import ReceiptView
+except Exception:  # pragma: no cover
+    ReceiptView = None  # type: ignore[assignment]
+
 __all__ = [
     "SecuritySignalEnvelope",
     "SecurityAuthContext",
@@ -108,21 +120,23 @@ RouterMode = Literal["normal", "last_known_good", "fail_closed", "disabled", "de
 RouteIdKind = Literal["plan"]
 SignalTrustMode = Literal["trusted", "advisory", "untrusted"]
 
-_SCHEMA = "tcd.security_router.v3"
+_SCHEMA = "tcd.security_router.v4"
 _ROUTER_NAME = "tcd.security_router"
-_ROUTER_VERSION = "3.0.0"
+_ROUTER_VERSION = "4.0.0"
 
-_CFG_FP_VERSION = "scfg1"
-_ACTIVATION_ID_VERSION = "sact1"
-_EVENT_ID_VERSION = "sev1"
-_POLICY_DIGEST_VERSION = "sp1"
-_SUBJECT_DIGEST_VERSION = "ss1"
-_ROUTE_PLAN_ID_VERSION = "srp1"
-_DECISION_ID_VERSION = "sd1"
-_CONTEXT_DIGEST_VERSION = "scx1"
-_SIGNAL_DIGEST_VERSION = "ssg1"
-_ID_HASH_VERSION = "idh1"
+_CFG_FP_VERSION = "scfg2"
+_ACTIVATION_ID_VERSION = "sact2"
+_EVENT_ID_VERSION = "sev2"
+_POLICY_DIGEST_VERSION = "sp2"
+_SUBJECT_DIGEST_VERSION = "ss2"
+_ROUTE_PLAN_ID_VERSION = "srp2"
+_DECISION_ID_VERSION = "sd2"
+_CONTEXT_DIGEST_VERSION = "scx2"
+_SIGNAL_DIGEST_VERSION = "ssg2"
+_ID_HASH_VERSION = "idh2"
 _SAFE_DIGEST_ALG = "sha256"
+
+_LOG = logging.getLogger(__name__)
 
 _ALLOWED_PROFILES = frozenset({"DEV", "PROD", "FINREG", "LOCKDOWN"})
 _ALLOWED_REQUIRED_ACTIONS = frozenset({"allow", "degrade", "block"})
@@ -131,6 +145,7 @@ _ALLOWED_KINDS = frozenset({"inference", "admin", "control", "batch", "metrics",
 _ALLOWED_ROUTE_PROFILES = frozenset({"inference", "batch", "admin", "control", "metrics", "health", "restricted"})
 _ALLOWED_TRUST_ZONES = frozenset({"internet", "partner", "internal", "admin", "ops"})
 _ALLOWED_SIGNAL_TRUST = frozenset({"trusted", "advisory", "untrusted"})
+_ALLOWED_ROUTER_MODES = frozenset({"normal", "last_known_good", "fail_closed", "disabled", "degraded"})
 
 _CTX_KEYS: Tuple[str, ...] = (
     "tenant",
@@ -182,6 +197,8 @@ _DEFAULT_META_KEYS = frozenset(
         "model_family",
         "region",
         "cluster",
+        "build_id",
+        "image_digest",
     }
 )
 
@@ -192,7 +209,8 @@ _DEFAULT_ALLOWED_SENSITIVE_SCOPES = frozenset({"tcd:admin", "tcd:control", "writ
 _ASCII_CTRL_RE = __import__("re").compile(r"[\x00-\x1F\x7F]")
 _SAFE_LABEL_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
 _SAFE_NAME_RE = __import__("re").compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
-_SAFE_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#]{0,255}$")
+_SAFE_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#/+=]{0,255}$")
+_HEX_RE = __import__("re").compile(r"^[0-9a-fA-F]+$")
 
 _ALLOWED_REASON_CODES = frozenset(
     {
@@ -227,9 +245,16 @@ _ALLOWED_REASON_CODES = frozenset(
         "ATTESTATION_FAILED",
         "RECEIPT_ISSUED",
         "RECEIPT_SKIPPED",
+        "RECEIPT_LOCAL_ONLY",
+        "RECEIPT_DURABILITY_PENDING",
+        "RECEIPT_DURABLE_OUTBOX",
+        "RECEIPT_DURABLE_COMMITTED",
         "AUDIT_EMIT_FAIL",
+        "AUDIT_OUTBOX_QUEUED",
         "LEDGER_PREPARE_FAILED",
         "LEDGER_COMMIT_FAILED",
+        "LEDGER_PREPARED",
+        "LEDGER_COMMITTED",
         "OUTBOX_QUEUED",
         "OUTBOX_QUEUE_FAILED",
         "INTEGRITY_ERROR",
@@ -269,9 +294,16 @@ _REASON_CODE_TO_ACTION: Mapping[str, RequiredAction] = MappingProxyType(
         "ATTESTATION_FAILED": "block",
         "RECEIPT_ISSUED": "allow",
         "RECEIPT_SKIPPED": "allow",
+        "RECEIPT_LOCAL_ONLY": "allow",
+        "RECEIPT_DURABILITY_PENDING": "allow",
+        "RECEIPT_DURABLE_OUTBOX": "allow",
+        "RECEIPT_DURABLE_COMMITTED": "allow",
         "AUDIT_EMIT_FAIL": "allow",
+        "AUDIT_OUTBOX_QUEUED": "allow",
         "LEDGER_PREPARE_FAILED": "block",
         "LEDGER_COMMIT_FAILED": "block",
+        "LEDGER_PREPARED": "allow",
+        "LEDGER_COMMITTED": "allow",
         "OUTBOX_QUEUED": "allow",
         "OUTBOX_QUEUE_FAILED": "allow",
         "INTEGRITY_ERROR": "block",
@@ -341,7 +373,22 @@ def _safe_name(v: Any, *, default: str) -> str:
 
 def _safe_id(v: Any, *, default: Optional[str], max_len: int = 256) -> Optional[str]:
     s = _strip_unsafe_text(v, max_len=max_len)
-    if not s or not _SAFE_ID_RE.fullmatch(s):
+    if not s:
+        return default
+
+    # Preserve the original strict regex path for normal IDs.
+    if max_len <= 256:
+        if not _SAFE_ID_RE.fullmatch(s):
+            return default
+        return s
+
+    # For governed long tokens such as signatures / verify keys, honor max_len
+    # while keeping the same allowed character grammar.
+    first_allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    rest_allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-@#/+="
+    if s[0] not in first_allowed:
+        return default
+    if any(ch not in rest_allowed for ch in s[1:]):
         return default
     return s
 
@@ -476,6 +523,48 @@ def _canon_json_bytes(obj: Any) -> bytes:
         allow_nan=False,
     ).encode("utf-8", errors="strict")
 
+
+
+def _call_with_timeout_compat(fn: Any, *, timeout_ms: float, name: str) -> Tuple[bool, Any, Optional[str]]:
+    """
+    Best-effort timeout wrapper for sync calls.
+
+    Uses a daemon thread so a stuck attestor / verifier cannot hold the request
+    path forever. The stuck thread may finish later, but the caller returns on
+    timeout.
+    """
+    timeout = _clamp_float(timeout_ms, default=1000.0, lo=1.0, hi=60000.0) / 1000.0
+
+    import queue as _queue
+
+    q: Any = _queue.Queue(maxsize=1)
+
+    def _runner() -> None:
+        try:
+            q.put((True, fn(), None), block=False)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                q.put(
+                    (
+                        False,
+                        None,
+                        f"{_safe_label(name, default='call')}_exception:{type(e).__name__}",
+                    ),
+                    block=False,
+                )
+
+    t = threading.Thread(
+        target=_runner,
+        name=f"tcd-{_safe_label(name, default='timeout_call')}",
+        daemon=True,
+    )
+    t.start()
+
+    try:
+        ok, value, err = q.get(timeout=timeout)
+        return bool(ok), value, err
+    except _queue.Empty:
+        return False, None, f"{_safe_label(name, default='call')}_timeout"
 
 def _safe_digest_hex(*, ctx: str, payload: Mapping[str, Any], out_hex: int = 32) -> str:
     raw = ctx.encode("utf-8", errors="strict") + b"\x00" + _canon_json_bytes(payload)
@@ -656,6 +745,14 @@ def _context_digest(ctx: "SecurityContext", hasher: _IdentityHasher) -> str:
     return f"{_CONTEXT_DIGEST_VERSION}:{_SAFE_DIGEST_ALG}:{_safe_digest_hex(ctx='tcd:security:context', payload=payload, out_hex=32)}"
 
 
+def _signal_trust_mode(env: "SecuritySignalEnvelope") -> SignalTrustMode:
+    if bool(env.trusted) and bool(env.signed):
+        return "trusted"
+    if bool(env.trusted) or bool(env.signed):
+        return "advisory"
+    return "untrusted"
+
+
 def _signal_digest(
     env: "SecuritySignalEnvelope",
     det: "_DetectorResult",
@@ -764,6 +861,149 @@ def _normalize_meta_map(
     return public, internal, dropped, tuple(sorted(set(warnings)))
 
 
+def _hash_handle_public(handle: Optional[str]) -> Optional[str]:
+    if not handle:
+        return None
+    return f"vk1:{_safe_digest_hex(ctx='tcd:security:verify_key', payload={'handle': handle}, out_hex=24)}"
+
+
+def _receipt_view_model(payload: Mapping[str, Any]) -> Any:
+    if ReceiptView is None:
+        return None
+    try:
+        if hasattr(ReceiptView, "model_validate"):
+            return ReceiptView.model_validate(dict(payload))
+        return ReceiptView(**dict(payload))
+    except Exception:
+        return None
+
+
+def _fallback_receipt_public(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema": payload.get("schema"),
+        "head": payload.get("receipt") or payload.get("head"),
+        "receipt_ref": payload.get("receipt_ref") or payload.get("receipt") or payload.get("head"),
+        "audit_ref": payload.get("audit_ref"),
+        "event_id": payload.get("event_id"),
+        "decision_id": payload.get("decision_id"),
+        "route_plan_id": payload.get("route_plan_id"),
+        "policy_ref": payload.get("policy_ref"),
+        "policyset_ref": payload.get("policyset_ref"),
+        "cfg_fp": payload.get("cfg_fp"),
+        "verify_key_id": payload.get("verify_key_id"),
+        "verify_key_fp": payload.get("verify_key_fp"),
+        "receipt_integrity": payload.get("receipt_integrity"),
+        "pq_signature_required": payload.get("pq_signature_required"),
+        "pq_signature_ok": payload.get("pq_signature_ok"),
+        "integrity_ok": payload.get("integrity_ok"),
+        "integrity_errors": payload.get("integrity_errors") or [],
+        "receipt_surface_kind": payload.get("receipt_surface_kind"),
+        "receipt_delivery_state": payload.get("receipt_delivery_state"),
+        "evidence_durable": payload.get("evidence_durable"),
+        "evidence_storage_ready": payload.get("evidence_storage_ready"),
+        "ledger_stage": payload.get("ledger_stage"),
+        "outbox_status": payload.get("outbox_status"),
+        "ledger_ref": payload.get("ledger_ref"),
+        "prepare_ref": payload.get("prepare_ref") or payload.get("ledger_prepare_ref"),
+        "commit_ref": payload.get("commit_ref") or payload.get("ledger_commit_ref"),
+        "ledger_prepare_ref": payload.get("ledger_prepare_ref"),
+        "ledger_commit_ref": payload.get("ledger_commit_ref"),
+    }
+
+
+def _fallback_receipt_verification(payload: Mapping[str, Any], *, include_verify_key: bool) -> Dict[str, Any]:
+    return {
+        "schema": payload.get("schema"),
+        "head": payload.get("receipt") or payload.get("head"),
+        "body": payload.get("receipt_body") or payload.get("body"),
+        "sig": payload.get("receipt_sig") or payload.get("sig"),
+        "verify_key": payload.get("verify_key") if include_verify_key else None,
+        "verify_key_id": payload.get("verify_key_id"),
+        "verify_key_fp": payload.get("verify_key_fp"),
+        "receipt_integrity": payload.get("receipt_integrity"),
+        "body_kind": payload.get("body_kind"),
+        "body_digest": payload.get("body_digest"),
+        "head_verified": payload.get("head_verified"),
+        "body_canonical_verified": payload.get("body_canonical_verified"),
+        "integrity_hash_verified": payload.get("integrity_hash_verified"),
+        "signature_verified": payload.get("signature_verified"),
+        "verify_key_allowed": payload.get("verify_key_allowed"),
+        "policy_binding_verified": payload.get("policy_binding_verified"),
+        "cfg_binding_verified": payload.get("cfg_binding_verified"),
+        "integrity_ok": payload.get("integrity_ok"),
+        "integrity_errors": payload.get("integrity_errors") or [],
+        "receipt_surface_kind": payload.get("receipt_surface_kind"),
+        "receipt_delivery_state": payload.get("receipt_delivery_state"),
+        "evidence_durable": payload.get("evidence_durable"),
+        "evidence_storage_ready": payload.get("evidence_storage_ready"),
+        "ledger_stage": payload.get("ledger_stage"),
+        "outbox_status": payload.get("outbox_status"),
+        "ledger_ref": payload.get("ledger_ref"),
+        "prepare_ref": payload.get("prepare_ref") or payload.get("ledger_prepare_ref"),
+        "commit_ref": payload.get("commit_ref") or payload.get("ledger_commit_ref"),
+        "ledger_prepare_ref": payload.get("ledger_prepare_ref"),
+        "ledger_commit_ref": payload.get("ledger_commit_ref"),
+    }
+
+
+def _build_receipt_surfaces(
+    payload: Mapping[str, Any],
+    *,
+    include_verify_key: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    rv = _receipt_view_model(payload)
+    if rv is not None:
+        with contextlib.suppress(Exception):
+            pub = rv.to_public_dict(strict=False)
+            ver = rv.to_verification_dict(strict=False, include_verify_key=bool(include_verify_key))
+            return dict(pub or {}), dict(ver or {})
+    return (
+        _fallback_receipt_public(payload),
+        _fallback_receipt_verification(payload, include_verify_key=bool(include_verify_key)),
+    )
+
+
+def _annotate_receipt_surfaces(
+    *,
+    raw: Dict[str, Any],
+    public: Dict[str, Any],
+    verification: Dict[str, Any],
+    artifacts: Mapping[str, Any],
+    audit_ref: Optional[str],
+    receipt_ref: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    delivery_state = artifacts.get("evidence_delivery_state")
+    surface_kind = artifacts.get("receipt_surface_kind")
+    evidence_durable = bool(artifacts.get("evidence_durable", False))
+    evidence_storage_ready = bool(artifacts.get("evidence_storage_ready", False))
+    ledger_stage = artifacts.get("ledger_stage")
+    outbox_status = artifacts.get("outbox_status")
+    outbox_ref = artifacts.get("outbox_ref")
+    prepare_ref = artifacts.get("prepare_ref") or artifacts.get("ledger_prepare_ref")
+    commit_ref = artifacts.get("commit_ref") or artifacts.get("ledger_commit_ref")
+    ledger_ref = artifacts.get("ledger_ref") or commit_ref or prepare_ref
+
+    for obj in (raw, public, verification):
+        obj["receipt_ref"] = obj.get("receipt_ref") or receipt_ref
+        obj["audit_ref"] = obj.get("audit_ref") or audit_ref
+        obj["receipt_surface_kind"] = surface_kind
+        obj["receipt_delivery_state"] = delivery_state
+        obj["evidence_durable"] = evidence_durable
+        obj["evidence_storage_ready"] = evidence_storage_ready
+        obj["ledger_stage"] = ledger_stage
+        obj["outbox_status"] = outbox_status
+        obj["ledger_ref"] = obj.get("ledger_ref") or ledger_ref
+        obj["prepare_ref"] = obj.get("prepare_ref") or prepare_ref
+        obj["commit_ref"] = obj.get("commit_ref") or commit_ref
+        if outbox_ref is not None:
+            obj["outbox_ref"] = outbox_ref
+        if prepare_ref is not None:
+            obj["ledger_prepare_ref"] = prepare_ref
+        if commit_ref is not None:
+            obj["ledger_commit_ref"] = commit_ref
+
+    return raw, public, verification
+
 # =============================================================================
 # Protocols
 # =============================================================================
@@ -793,6 +1033,393 @@ class SecurityLedgerSink(Protocol):
 class SecurityOutboxSink(Protocol):
     def enqueue(self, *, kind: str, dedupe_key: str, payload: Mapping[str, Any], payload_digest: str) -> Optional[str]:
         ...
+
+# =============================================================================
+# Local durable sink adapters
+# =============================================================================
+
+def _sr_env_bool(name: str, default: bool = False) -> bool:
+    return _coerce_bool(os.getenv(name), default=default)
+
+
+def _sr_env_text(name: str, default: str = "") -> str:
+    return _strip_unsafe_text(os.getenv(name, default), max_len=4096) or default
+
+
+def _security_router_auto_ledger_requested() -> bool:
+    if _sr_env_bool("TCD_SECURITY_ROUTER_LOCAL_LEDGER_DISABLE", default=False):
+        return False
+    truthy_names = (
+        "TCD_SECURITY_ROUTER_DURABLE_RECEIPTS",
+        "TCD_SECURITY_ROUTER_LOCAL_LEDGER_ENABLE",
+        "TCD_SECURITY_ROUTER_LEDGER_ENABLE",
+        "TCD_SECURITY_ROUTER_REQUIRE_LEDGER_WHEN_REQUIRED",
+        "TCD_SECURITY_ROUTER_LEDGER_REQUIRED_ON_DENY",
+        "TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT",
+        "TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT",
+    )
+    if any(_sr_env_bool(n, default=False) for n in truthy_names):
+        return True
+    if os.getenv("TCD_SECURITY_ROUTER_LEDGER_DB") or os.getenv("TCD_LEDGER_DB"):
+        return True
+    return False
+
+
+def _security_router_auto_outbox_requested() -> bool:
+    if _sr_env_bool("TCD_SECURITY_ROUTER_LOCAL_OUTBOX_DISABLE", default=False):
+        return False
+
+    # Explicit outbox enablement.
+    truthy_names = (
+        "TCD_SECURITY_ROUTER_LOCAL_OUTBOX_ENABLE",
+        "TCD_SECURITY_ROUTER_OUTBOX_ENABLE",
+        "TCD_SECURITY_ROUTER_OUTBOX_ENABLED",
+    )
+    if any(_sr_env_bool(n, default=False) for n in truthy_names):
+        return True
+
+    # Durable governance implies an outbox fallback should be available when
+    # ledger prepare/commit fails. This does not make outbox the primary path;
+    # it only makes failure compensation possible.
+    durable_truthy_names = (
+        "TCD_SECURITY_ROUTER_DURABLE_RECEIPTS",
+        "TCD_SECURITY_ROUTER_REQUIRE_LEDGER_WHEN_REQUIRED",
+        "TCD_SECURITY_ROUTER_LEDGER_REQUIRED_ON_DENY",
+        "TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT",
+        "TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT",
+    )
+    if any(_sr_env_bool(n, default=False) for n in durable_truthy_names):
+        return True
+
+    if os.getenv("TCD_SECURITY_ROUTER_OUTBOX_AUDIT_PATH") or os.getenv("TCD_AUDIT_LOG"):
+        return True
+    return False
+
+
+def _security_router_auto_attestor_requested() -> bool:
+    if _sr_env_bool("TCD_SECURITY_ROUTER_ATTESTOR_DISABLE", default=False):
+        return False
+    return bool(
+        _sr_env_bool("TCD_SECURITY_ROUTER_ATTESTOR_ENABLE", default=False)
+        or _security_router_auto_ledger_requested()
+        or _sr_env_bool("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT", default=False)
+    )
+
+
+def _durable_compact_json(obj: Any, *, max_bytes: int = 1024 * 1024) -> str:
+    try:
+        s = json.dumps(
+            _stable_jsonable(obj),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except Exception:
+        s = json.dumps(
+            {"serialization_error": True, "type": _safe_name(type(obj).__name__, default="object")},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    try:
+        raw = s.encode("utf-8", errors="strict")
+    except Exception:
+        raw = s.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return s
+
+    digest = hashlib.sha256(raw).hexdigest()
+    return json.dumps(
+        {
+            "truncated": True,
+            "original_sha256": digest,
+            "original_bytes": len(raw),
+            "schema": "tcd.durable_payload_truncated.v1",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _build_local_attestor_from_env() -> Optional[Any]:
+    if Attestor is None:
+        return None
+    hash_alg = _safe_label(os.getenv("TCD_HASH_ALG", "blake3"), default="sha256")
+    for kwargs in ({"hash_alg": hash_alg}, {}):
+        try:
+            return Attestor(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+    return None
+
+
+class _LocalSQLiteReceiptLedgerSink:
+    """
+    Local durable receipt sink backed by tcd.ledger.SQLiteLedger.
+
+    It stores:
+      - prepare events as ledger-chain governance records;
+      - commit events as the actual attestor receipt when receipt material exists;
+      - commit governance records as a fallback when no receipt material is present.
+
+    Important compatibility choice:
+      The ledger chain head and attestor receipt head are treated as separate
+      concepts. We preserve the attestor receipt head as receipt_ref/head and use
+      the SQLite ledger append as durability evidence.
+    """
+
+    def __init__(
+        self,
+        *,
+        db_path: Optional[str] = None,
+        chain_id: Optional[str] = None,
+        strict_append: bool = True,
+        max_retries: int = 16,
+    ) -> None:
+        # Make attestor-head receipts appendable by default. Explicit env values
+        # still win because setdefault does not overwrite user-provided config.
+        chain_id0 = (
+            chain_id
+            or _sr_env_text("TCD_SECURITY_ROUTER_LEDGER_CHAIN_ID", "")
+            or _sr_env_text("TCD_LEDGER_DEFAULT_CHAIN_ID", "")
+            or "security-router-receipts"
+        )
+        os.environ.setdefault("TCD_LEDGER_DEFAULT_CHAIN_ID", chain_id0)
+        os.environ.setdefault("TCD_LEDGER_REQUIRE_STRICT_RECEIPT_APPEND", "1")
+        os.environ.setdefault("TCD_LEDGER_VERIFY_RECEIPT_HEAD", "0")
+        os.environ.setdefault("TCD_LEDGER_VALIDATE_RECEIPT_JSON", "0")
+        os.environ.setdefault("TCD_LEDGER_MAX_RECEIPT_BODY_BYTES", "1000000")
+        os.environ.setdefault("TCD_LEDGER_SQLITE_TIMEOUT_S", "1")
+
+        from .ledger import SQLiteLedger, ReceiptRecord  # imported lazily
+
+        db_path0 = (
+            db_path
+            or _sr_env_text("TCD_SECURITY_ROUTER_LEDGER_DB", "")
+            or _sr_env_text("TCD_LEDGER_DB", "")
+            or os.path.join(".tcd_runtime", "security_receipts.sqlite3")
+        )
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(db_path0)) or ".", exist_ok=True)
+        except Exception:
+            pass
+
+        self._ledger = SQLiteLedger(path=db_path0)
+        self._ReceiptRecord = ReceiptRecord
+        self._chain_id = chain_id0
+        self._strict_append = bool(strict_append)
+        self._max_retries = max(1, min(128, int(max_retries)))
+        self._lock = threading.RLock()
+
+    @property
+    def chain_id(self) -> str:
+        return self._chain_id
+
+    def _ref(self, *, phase: str, head: str) -> str:
+        chain_digest = hashlib.sha256(self._chain_id.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"ledger:{phase}:{chain_digest}:{head}"
+
+    def _safe_head(self, raw: Any, *, phase: str, event_id: str, body: str, sig: Optional[str]) -> str:
+        if isinstance(raw, str):
+            h = raw.strip()
+            if h and len(h) <= 1024 and _SAFE_ID_RE.fullmatch(h):
+                return h
+        payload = {
+            "phase": phase,
+            "event_id": event_id,
+            "body_sha256": hashlib.sha256(body.encode("utf-8", errors="strict")).hexdigest(),
+            "sig_sha256": hashlib.sha256((sig or "").encode("utf-8", errors="strict")).hexdigest(),
+            "chain_id": self._chain_id,
+        }
+        return hashlib.sha256(_canon_json_bytes(payload)).hexdigest()
+
+    def _append(self, *, phase: str, event_id: str, head: str, body: str, sig: Optional[str]) -> str:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self._max_retries):
+            try:
+                prev = self._ledger.chain_head()
+                rec = self._ReceiptRecord(
+                    head=head,
+                    body=body,
+                    sig=sig,
+                    prev=prev,
+                    ts=time.time(),
+                    chain_id=self._chain_id,
+                )
+                with self._lock:
+                    if self._strict_append and hasattr(self._ledger, "append_receipt_strict"):
+                        self._ledger.append_receipt_strict(rec)
+                    else:
+                        self._ledger.append_receipt(rec)
+                return self._ref(phase=phase, head=head)
+            except Exception as e:
+                last_exc = e
+                code = _safe_label(getattr(e, "code", ""), default="")
+                msg = str(e).lower()
+                if code in {"receipt_duplicate"} or "duplicate receipt head" in msg:
+                    return self._ref(phase=phase, head=head)
+                if (
+                    code in {"receipt_prev_mismatch", "receipt_integrity", "receipt_chain_fork"}
+                    or "prev mismatch" in msg
+                    or "race/fork" in msg
+                    or "integrity" in msg
+                ):
+                    time.sleep(min(0.001 * (attempt + 1), 0.050))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("ledger_append_failed")
+
+    def prepare(self, event_id: str, payload: Mapping[str, Any]) -> Optional[str]:
+        event_id0 = _safe_id(event_id, default=None, max_len=256) or hashlib.sha256(
+            str(event_id).encode("utf-8", errors="ignore")
+        ).hexdigest()
+        body = _durable_compact_json(
+            {
+                "schema": "tcd.security_router.ledger_prepare.v1",
+                "event_id": event_id0,
+                "phase": "prepare",
+                "payload": dict(payload),
+            },
+            max_bytes=512_000,
+        )
+        head = self._safe_head(None, phase="prepare", event_id=event_id0, body=body, sig=None)
+        return self._append(phase="prepare", event_id=event_id0, head=head, body=body, sig=None)
+
+    def commit(self, event_id: str, payload: Mapping[str, Any]) -> Optional[str]:
+        event_id0 = _safe_id(event_id, default=None, max_len=256) or hashlib.sha256(
+            str(event_id).encode("utf-8", errors="ignore")
+        ).hexdigest()
+
+        receipt_private = payload.get("receipt_private")
+        if not isinstance(receipt_private, Mapping):
+            receipt_private = {}
+
+        receipt_bundle = payload.get("receipt_bundle")
+        if not isinstance(receipt_bundle, Mapping):
+            receipt_bundle = {}
+
+        raw_head = (
+            receipt_private.get("receipt")
+            or receipt_private.get("head")
+            or receipt_bundle.get("head")
+            or payload.get("receipt_ref")
+        )
+        raw_body = (
+            receipt_private.get("receipt_body")
+            or receipt_private.get("body")
+        )
+        raw_sig = (
+            receipt_private.get("receipt_sig")
+            or receipt_private.get("sig")
+        )
+
+        if isinstance(raw_body, str) and raw_body:
+            body = raw_body
+        else:
+            body = _durable_compact_json(
+                {
+                    "schema": "tcd.security_router.ledger_commit.v1",
+                    "event_id": event_id0,
+                    "phase": "commit",
+                    "payload": dict(payload),
+                },
+                max_bytes=512_000,
+            )
+
+        sig = raw_sig if isinstance(raw_sig, str) and raw_sig else None
+        head = self._safe_head(raw_head, phase="commit", event_id=event_id0, body=body, sig=sig)
+        return self._append(phase="commit", event_id=event_id0, head=head, body=body, sig=sig)
+
+
+class _LocalAuditOutboxSink:
+    """
+    Local audit/outbox sink backed by tcd.audit.AuditLedger.
+    """
+
+    def __init__(self, *, path: Optional[str] = None, rotate_mb: Optional[int] = None) -> None:
+        from .audit import AuditLedger, AuditLedgerConfig  # imported lazily
+
+        out_path = (
+            path
+            or _sr_env_text("TCD_SECURITY_ROUTER_OUTBOX_AUDIT_PATH", "")
+            or _sr_env_text("TCD_AUDIT_LOG", "")
+            or os.path.join(".tcd_runtime", "security_outbox.audit.log")
+        )
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+        except Exception:
+            pass
+
+        rot = rotate_mb
+        if rot is None:
+            rot = _clamp_int(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_ROTATE_MB"), default=50, lo=1, hi=4096)
+
+        cfg = AuditLedgerConfig(
+            path=out_path,
+            rotate_mb=int(rot),
+            record_format=_sr_env_text("TCD_SECURITY_ROUTER_OUTBOX_RECORD_FORMAT", "jsonl") or "jsonl",
+            sync_on_write=_sr_env_bool("TCD_SECURITY_ROUTER_OUTBOX_SYNC_ON_WRITE", default=True),
+            fsync_every_n=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_FSYNC_EVERY_N"), default=1, lo=1, hi=10000),
+            fsync_interval_ms=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_FSYNC_INTERVAL_MS"), default=0, lo=0, hi=60000),
+            include_policy_block=True,
+            include_index_root_in_markers=True,
+            sanitize_payload=True,
+            redact_secrets=True,
+            max_payload_depth=12,
+            max_payload_items=256,
+            max_record_bytes=512 * 1024,
+            max_line_bytes=1024 * 1024,
+        )
+        self._audit = AuditLedger(path=out_path, rotate_mb=int(rot), cfg=cfg)
+
+    def enqueue(self, *, kind: str, dedupe_key: str, payload: Mapping[str, Any], payload_digest: str) -> Optional[str]:
+        record = {
+            "schema": "tcd.security_router.outbox.v1",
+            "kind": _safe_label(kind, default="security_router"),
+            "dedupe_key": _strip_unsafe_text(dedupe_key, max_len=256),
+            "payload_digest": _strip_unsafe_text(payload_digest, max_len=256),
+            "payload": _stable_jsonable(dict(payload)),
+            "ts_ns": time.time_ns(),
+        }
+        res = self._audit.append_ex(record)
+        head = _safe_id(getattr(res, "head", None), default=None, max_len=256)
+        return f"outbox:audit:{head}" if head else None
+
+
+def _build_local_sqlite_ledger_sink_from_env() -> Optional[SecurityLedgerSink]:
+    try:
+        return _LocalSQLiteReceiptLedgerSink(
+            db_path=_sr_env_text("TCD_SECURITY_ROUTER_LEDGER_DB", "") or _sr_env_text("TCD_LEDGER_DB", "") or None,
+            chain_id=_sr_env_text("TCD_SECURITY_ROUTER_LEDGER_CHAIN_ID", "") or _sr_env_text("TCD_LEDGER_DEFAULT_CHAIN_ID", "") or None,
+            strict_append=_sr_env_bool("TCD_SECURITY_ROUTER_LEDGER_STRICT_APPEND", default=True),
+            max_retries=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_LEDGER_APPEND_RETRIES"), default=16, lo=1, hi=128),
+        )
+    except Exception as e:
+        _LOG.exception("failed to build local SQLite receipt ledger sink: %s", type(e).__name__)
+        if _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_LOCAL_LEDGER", default=False):
+            raise
+        return None
+
+
+def _build_local_audit_outbox_sink_from_env() -> Optional[SecurityOutboxSink]:
+    try:
+        return _LocalAuditOutboxSink(
+            path=_sr_env_text("TCD_SECURITY_ROUTER_OUTBOX_AUDIT_PATH", "") or _sr_env_text("TCD_AUDIT_LOG", "") or None,
+            rotate_mb=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_ROTATE_MB"), default=50, lo=1, hi=4096),
+        )
+    except Exception as e:
+        _LOG.exception("failed to build local audit outbox sink: %s", type(e).__name__)
+        if _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_LOCAL_OUTBOX", default=False):
+            raise
+        return None
 
 
 # =============================================================================
@@ -1002,7 +1629,7 @@ class SecurityContext:
 
 @dataclass
 class SecurityRouterConfig:
-    schema_version: int = 1
+    schema_version: int = 2
     enabled: bool = True
     profile: Profile = "PROD"
     on_config_error: OnConfigError = "use_last_known_good"
@@ -1059,9 +1686,23 @@ class SecurityRouterConfig:
 
     strict_preview_requires_preview_method: bool = True
 
+    # v4 alignment knobs
+    include_receipt_verification_surface: bool = True
+    include_verify_key_in_verification_surface: bool = False
+    annotate_receipt_governance_state: bool = True
+    treat_outbox_enqueue_as_durable: bool = True
+    require_terminal_governance_for_receipt_required: bool = False
+    require_storage_ready_for_receipt_required: bool = False
+    queue_audit_on_failure: bool = True
+    prepare_before_attestation: bool = True
+
+    receipt_issue_timeout_ms: float = 1000.0
+    receipt_self_check_enabled: bool = False
+    receipt_self_check_timeout_ms: float = 500.0
+
     def normalized_copy(self) -> "SecurityRouterConfig":
         c = SecurityRouterConfig()
-        c.schema_version = _clamp_int(self.schema_version, default=1, lo=1, hi=1_000_000)
+        c.schema_version = _clamp_int(self.schema_version, default=2, lo=1, hi=1_000_000)
 
         prof = _safe_label(self.profile, default="prod").upper()
         if prof not in _ALLOWED_PROFILES:
@@ -1155,6 +1796,29 @@ class SecurityRouterConfig:
         c.require_signed_signal_for_block = bool(self.require_signed_signal_for_block)
         c.strict_preview_requires_preview_method = bool(self.strict_preview_requires_preview_method)
 
+        c.include_receipt_verification_surface = bool(self.include_receipt_verification_surface)
+        c.include_verify_key_in_verification_surface = bool(self.include_verify_key_in_verification_surface)
+        c.annotate_receipt_governance_state = bool(self.annotate_receipt_governance_state)
+        c.treat_outbox_enqueue_as_durable = bool(self.treat_outbox_enqueue_as_durable)
+        c.require_terminal_governance_for_receipt_required = bool(self.require_terminal_governance_for_receipt_required)
+        c.require_storage_ready_for_receipt_required = bool(self.require_storage_ready_for_receipt_required)
+        c.queue_audit_on_failure = bool(self.queue_audit_on_failure)
+        c.prepare_before_attestation = bool(self.prepare_before_attestation)
+
+        c.receipt_issue_timeout_ms = _clamp_float(
+            self.receipt_issue_timeout_ms,
+            default=1000.0,
+            lo=1.0,
+            hi=60000.0,
+        )
+        c.receipt_self_check_enabled = bool(self.receipt_self_check_enabled)
+        c.receipt_self_check_timeout_ms = _clamp_float(
+            self.receipt_self_check_timeout_ms,
+            default=500.0,
+            lo=1.0,
+            hi=60000.0,
+        )
+
         if c.profile in {"FINREG", "LOCKDOWN"}:
             c.bind_error_action = "block"
             c.rate_error_action = "block"
@@ -1171,6 +1835,9 @@ class SecurityRouterConfig:
             c.require_signed_signal_for_block = True
             c.max_meta_items = min(c.max_meta_items, 16)
             c.max_context_items = min(c.max_context_items, 16)
+            c.include_receipt_verification_surface = True
+            c.annotate_receipt_governance_state = True
+            c.require_terminal_governance_for_receipt_required = True
 
         return c
 
@@ -1221,11 +1888,117 @@ class SecurityRouterConfig:
             "require_trusted_signal_for_block": c.require_trusted_signal_for_block,
             "require_signed_signal_for_block": c.require_signed_signal_for_block,
             "strict_preview_requires_preview_method": c.strict_preview_requires_preview_method,
+            "include_receipt_verification_surface": c.include_receipt_verification_surface,
+            "include_verify_key_in_verification_surface": c.include_verify_key_in_verification_surface,
+            "annotate_receipt_governance_state": c.annotate_receipt_governance_state,
+            "treat_outbox_enqueue_as_durable": c.treat_outbox_enqueue_as_durable,
+            "require_terminal_governance_for_receipt_required": c.require_terminal_governance_for_receipt_required,
+            "require_storage_ready_for_receipt_required": c.require_storage_ready_for_receipt_required,
+            "queue_audit_on_failure": c.queue_audit_on_failure,
+            "prepare_before_attestation": c.prepare_before_attestation,
+            "receipt_issue_timeout_ms": _stable_float(c.receipt_issue_timeout_ms),
+            "receipt_self_check_enabled": c.receipt_self_check_enabled,
+            "receipt_self_check_timeout_ms": _stable_float(c.receipt_self_check_timeout_ms),
         }
 
     def fingerprint(self) -> str:
         d = _safe_digest_hex(ctx="tcd:security_router:cfg", payload=self.to_public_dict(), out_hex=64)
         return f"{_CFG_FP_VERSION}:{_SAFE_DIGEST_ALG}:{d}"
+
+
+def _security_router_config_from_env() -> "SecurityRouterConfig":
+    """
+    Default SecurityRouterConfig with env overrides.
+
+    This matters for the normal service_http factory path, where create_http_runtime()
+    builds SecurityRouter without passing an explicit config.
+    """
+    cfg = SecurityRouterConfig()
+
+    x = _coerce_float(os.getenv("TCD_SECURITY_ROUTER_RECEIPT_ISSUE_TIMEOUT_MS"))
+    if x is not None:
+        cfg.receipt_issue_timeout_ms = x
+
+    cfg.receipt_self_check_enabled = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_RECEIPT_SELF_CHECK"),
+        default=cfg.receipt_self_check_enabled,
+    )
+
+    x = _coerce_float(os.getenv("TCD_SECURITY_ROUTER_RECEIPT_SELF_CHECK_TIMEOUT_MS"))
+    if x is not None:
+        cfg.receipt_self_check_timeout_ms = x
+
+    cfg.require_attestor_when_required = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_REQUIRE_ATTESTOR_WHEN_REQUIRED"),
+        default=cfg.require_attestor_when_required,
+    )
+
+    cfg.include_receipt_verification_surface = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_INCLUDE_RECEIPT_VERIFICATION_SURFACE"),
+        default=cfg.include_receipt_verification_surface,
+    )
+
+    cfg.include_verify_key_in_verification_surface = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_INCLUDE_VERIFY_KEY"),
+        default=cfg.include_verify_key_in_verification_surface,
+    )
+
+    cfg.require_terminal_governance_for_receipt_required = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT"),
+        default=cfg.require_terminal_governance_for_receipt_required,
+    )
+
+    cfg.require_storage_ready_for_receipt_required = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT"),
+        default=cfg.require_storage_ready_for_receipt_required,
+    )
+
+    durable_requested = _security_router_auto_ledger_requested()
+
+    cfg.receipt_required_on_deny = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_RECEIPT_REQUIRED_ON_DENY"),
+        default=cfg.receipt_required_on_deny,
+    )
+    cfg.ledger_required_on_deny = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_LEDGER_REQUIRED_ON_DENY"),
+        default=(True if durable_requested else cfg.ledger_required_on_deny),
+    )
+    cfg.attestation_required_on_deny = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_ATTESTATION_REQUIRED_ON_DENY"),
+        default=cfg.attestation_required_on_deny,
+    )
+    cfg.require_ledger_when_required = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_REQUIRE_LEDGER_WHEN_REQUIRED"),
+        default=(True if durable_requested else cfg.require_ledger_when_required),
+    )
+    cfg.outbox_enabled = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_OUTBOX_ENABLED"),
+        default=cfg.outbox_enabled,
+    )
+    cfg.outbox_on_required_sink_failure = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_OUTBOX_ON_REQUIRED_SINK_FAILURE"),
+        default=cfg.outbox_on_required_sink_failure,
+    )
+    cfg.treat_outbox_enqueue_as_durable = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_TREAT_OUTBOX_ENQUEUE_AS_DURABLE"),
+        default=cfg.treat_outbox_enqueue_as_durable,
+    )
+    cfg.prepare_before_attestation = _coerce_bool(
+        os.getenv("TCD_SECURITY_ROUTER_PREPARE_BEFORE_ATTESTATION"),
+        default=cfg.prepare_before_attestation,
+    )
+
+    if durable_requested:
+        cfg.require_terminal_governance_for_receipt_required = _coerce_bool(
+            os.getenv("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT"),
+            default=True,
+        )
+        cfg.require_attestor_when_required = _coerce_bool(
+            os.getenv("TCD_SECURITY_ROUTER_REQUIRE_ATTESTOR_WHEN_REQUIRED"),
+            default=True,
+        )
+
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -1545,7 +2318,12 @@ class SecurityDecision:
 
     audit_ref: Optional[str] = None
     receipt_ref: Optional[str] = None
+
+    # raw/private bundle retained for transport adapters and internal verification
     receipt: Optional[Dict[str, Any]] = None
+    receipt_public: Dict[str, Any] = field(default_factory=dict)
+    receipt_verification: Optional[Dict[str, Any]] = None
+    receipt_private: Optional[Dict[str, Any]] = None
 
     integrity_ok: bool = True
     integrity_errors: Tuple[str, ...] = ()
@@ -1614,6 +2392,9 @@ class SecurityDecision:
             "audit_ref": self.audit_ref,
             "receipt_ref": self.receipt_ref,
             "receipt": dict(self.receipt or {}),
+            "receipt_public": dict(self.receipt_public or {}),
+            "receipt_verification": (dict(self.receipt_verification) if isinstance(self.receipt_verification, Mapping) else None),
+            "receipt_private": (dict(self.receipt_private) if isinstance(self.receipt_private, Mapping) else None),
             "integrity_ok": self.integrity_ok,
             "integrity_errors": list(self.integrity_errors),
             "normalization_warnings": list(self.normalization_warnings),
@@ -1656,7 +2437,8 @@ class SecurityDecision:
             "evidence_identity": dict(self.evidence_identity),
             "artifacts": dict(self.artifacts),
             "security": dict(self.security),
-            "receipt": dict(self.receipt or {}),
+            "receipt_public": dict(self.receipt_public or {}),
+            "receipt_verification": dict(self.receipt_verification or {}) if self.receipt_verification is not None else None,
             "integrity_ok": self.integrity_ok,
             "integrity_errors": list(self.integrity_errors),
         }
@@ -1700,6 +2482,8 @@ class SecurityDecision:
             "security": dict(self.security),
             "evidence_identity": dict(self.evidence_identity),
             "artifacts": dict(self.artifacts),
+            "receipt_ref": self.receipt_ref,
+            "audit_ref": self.audit_ref,
             "integrity_ok": self.integrity_ok,
             "integrity_errors": list(self.integrity_errors),
         }
@@ -1721,17 +2505,29 @@ class SecurityDecision:
             "risk_label": self.risk_label,
             "controller_mode": self.controller_mode,
             "statistical_guarantee_scope": self.guarantee_scope,
+            "receipt_ref": self.receipt_ref,
+            "audit_ref": self.audit_ref,
+            "receipt_public": dict(self.receipt_public or {}),
             "evidence_identity": dict(self.evidence_identity),
             "artifacts": dict(self.artifacts),
             "integrity_ok": self.integrity_ok,
         }
 
     def to_diagnose_out(self) -> Dict[str, Any]:
+        decision_label = "block" if self.required_action == "block" else ("degrade" if self.required_action == "degrade" else "allow")
+        action_label = "block" if self.action_taken == "block" else ("degrade" if self.action_taken == "degrade" else "none")
+        route_dict = self.route.to_dict() if self.route is not None and hasattr(self.route, "to_dict") else None
+        legacy_receipt = self.receipt_public.get("head") if self.receipt_public else None
+        legacy_body = self.receipt_verification.get("body") if self.receipt_verification else None
+        legacy_sig = self.receipt_verification.get("sig") if self.receipt_verification else None
         return {
-            "verdict": bool(self.allowed),
-            "decision": self.action,
+            "verdict": bool(self.required_action != "allow"),
+            "allowed": bool(self.allowed),
+            "decision": decision_label,
+            "required_action": self.required_action,
+            "enforcement_mode": self.enforcement_mode,
             "cause": self.reason,
-            "action": self.action,
+            "action": action_label,
             "score": float(self.risk_score if self.risk_score is not None else 0.0),
             "threshold": 0.0,
             "budget_remaining": 0.0,
@@ -1739,13 +2535,21 @@ class SecurityDecision:
             "e_value": 1.0,
             "alpha_alloc": 0.0,
             "alpha_spent": 0.0,
-            "components": {},
-            "route": self.route.to_dict() if self.route is not None and hasattr(self.route, "to_dict") else None,
+            "components": {
+                "route": route_dict,
+                "e_state": self.e_state,
+                "security": dict(self.security),
+                "receipt_public": dict(self.receipt_public or {}),
+                "receipt_verification": dict(self.receipt_verification or {}) if self.receipt_verification is not None else None,
+                "evidence_identity": dict(self.evidence_identity),
+                "artifacts": dict(self.artifacts),
+            },
+            "route": route_dict,
             "e_state": self.e_state,
             "trust_zone": self.security.get("trust_zone"),
             "route_profile": self.security.get("route_profile"),
-            "threat_kind": None,
-            "threat_confidence": None,
+            "threat_kind": self.security.get("threat_kind"),
+            "threat_confidence": self.security.get("threat_confidence"),
             "pq_required": bool(self.security.get("pq_required", False)),
             "pq_ok": self.security.get("pq_ok"),
             "policy_ref": self.policy_ref,
@@ -1760,7 +2564,11 @@ class SecurityDecision:
             "controller_mode": self.controller_mode,
             "statistical_guarantee_scope": self.guarantee_scope,
             "security": dict(self.security),
-            "receipt": dict(self.receipt or {}),
+            "receipt": legacy_receipt,
+            "receipt_body": legacy_body,
+            "receipt_sig": legacy_sig,
+            "receipt_public": dict(self.receipt_public or {}),
+            "receipt_verification": dict(self.receipt_verification or {}) if self.receipt_verification is not None else None,
             "evidence_identity": dict(self.evidence_identity),
             "artifacts": dict(self.artifacts),
             "integrity_ok": self.integrity_ok,
@@ -1768,7 +2576,6 @@ class SecurityDecision:
             "normalization_warnings": list(self.normalization_warnings),
             "compat_warnings": list(self.compat_warnings),
         }
-
 
 # =============================================================================
 # Internal models
@@ -1925,7 +2732,6 @@ class _SyntheticBoundPolicy:
     decision: str = "deny"
     enforcement: Optional[str] = "block"
 
-
 # =============================================================================
 # Security Router
 # =============================================================================
@@ -1935,22 +2741,15 @@ class SecurityRouter:
     """
     Platform-grade security router and evidence orchestrator.
 
-    This module is intentionally content-agnostic. It accepts only:
-      - normalized identity/auth context,
-      - coarse policy binding context,
-      - token/cost estimates,
-      - detector/risk outputs,
-      - route contracts,
-      - receipt/audit/ledger sinks.
+    This build keeps the old skeleton, but aligns final outward semantics with the
+    newer HTTP / gRPC contracts:
 
-    Design properties:
-      - immutable compiled config bundle + atomic swap
-      - deterministic event identity
-      - no detector state mutation on explain/preview paths
-      - no silent fail-open on rate-limit dependency failures
-      - synthetic route contract when route layer is unavailable
-      - evidence identity block + artifact refs + integrity report
-      - optional ledger prepare/commit + outbox fallback
+      - final outward decision remains explicit and deterministic
+      - receipt_public / receipt_verification / receipt_private are separated
+      - evidence_identity / artifacts describe governance state precisely
+      - local attestation is never over-claimed as storage-ready evidence
+      - durable governance path is explicit: prepare -> attestation -> commit,
+        with outbox fallback where available
     """
 
     def __init__(
@@ -1981,12 +2780,21 @@ class SecurityRouter:
         self._outbox_sink = outbox_sink
         self._authorizer = authorizer
 
+        if self._attestor is None and _security_router_auto_attestor_requested():
+            self._attestor = _build_local_attestor_from_env()
+
+        if self._ledger_sink is None and _security_router_auto_ledger_requested():
+            self._ledger_sink = _build_local_sqlite_ledger_sink_from_env()
+
+        if self._outbox_sink is None and _security_router_auto_outbox_requested():
+            self._outbox_sink = _build_local_audit_outbox_sink_from_env()
+
         self._instance_id = os.urandom(8).hex()
         self._seq_lock = threading.Lock()
         self._decision_seq = 0
         self._bundle_lock = threading.RLock()
 
-        init_cfg = (config or SecurityRouterConfig()).normalized_copy()
+        init_cfg = (config or _security_router_config_from_env()).normalized_copy()
         bundle = self._compile_bundle(init_cfg, previous=None)
         if bundle.errors and init_cfg.on_config_error == "raise":
             raise ValueError("invalid SecurityRouterConfig: " + "; ".join(bundle.errors[:3]))
@@ -2075,6 +2883,9 @@ class SecurityRouter:
             "last_rejected_cfg_fp": d.last_rejected_cfg_fp,
             "error_count": len(d.errors),
             "warning_count": len(d.warnings),
+            "has_attestor": self._attestor is not None,
+            "has_ledger_sink": self._ledger_sink is not None,
+            "has_outbox_sink": self._outbox_sink is not None,
             "errors": list(d.errors[:50]),
             "warnings": list(d.warnings[:50]),
         }
@@ -2354,10 +3165,8 @@ class SecurityRouter:
         )
 
         decision = self._compose_decision(snap, router_mode=router_mode, degraded_reason_codes=degraded_reason_codes)
-
         decision = self._finalize_with_artifacts(decision, snap)
         decision = self._finalize_integrity(decision, snap)
-
         return decision
 
     def _evaluate(
@@ -2665,7 +3474,14 @@ class SecurityRouter:
         )
 
     def _consume_rate(self, *, zone: str, key: Any, cost: float) -> Any:
-        return self._limiter.consume_decision(key=key, cost=cost, zone=zone)
+        fn = getattr(self._limiter, "consume_decision", None)
+        if callable(fn):
+            return fn(key=key, cost=cost, zone=zone)
+        fn2 = getattr(self._limiter, "consume", None)
+        if callable(fn2):
+            ok = bool(fn2(key, cost=cost))
+            return _SyntheticRateDecision(zone=zone, allowed=ok, reason="ok" if ok else "deny")
+        raise RuntimeError("rate_limiter_unavailable")
 
     def _rate_key_ip(self, ctx: SecurityContext) -> Any:
         if ctx.ip is None:
@@ -2728,8 +3544,6 @@ class SecurityRouter:
             method_names = ("evaluate", "execute", "update_security", "update", "step")
         else:
             method_names = ("preview", "evaluate_preview", "preview_security", "explain_preview")
-            if bundle.config.strict_preview_requires_preview_method and bundle.config.profile in {"FINREG", "LOCKDOWN"}:
-                pass
 
         fn = None
         for name in method_names:
@@ -3123,7 +3937,6 @@ class SecurityRouter:
 
         env = ctx.signal_envelope or SecuritySignalEnvelope()
 
-        # Try newest routing signature first.
         try:
             return self._strategy_router.decide(
                 decision_fail=(prior_action == "block"),
@@ -3162,7 +3975,6 @@ class SecurityRouter:
                 max_tokens=ctx.base_max_tokens,
             )
         except TypeError:
-            # Compatibility with older routing versions; routing is deterministic and side-effect free.
             return self._strategy_router.decide(
                 decision_fail=(prior_action == "block"),
                 score=float(detector.risk_score if detector.risk_score is not None else 0.0),
@@ -3247,9 +4059,8 @@ class SecurityRouter:
             action_taken = "block"
             allowed = False
 
-        enforcement_mode: EnforcementMode
         if required_action == "block":
-            enforcement_mode = "must_enforce"
+            enforcement_mode: EnforcementMode = "must_enforce"
         elif required_action == "degrade":
             enforcement_mode = "must_enforce"
         else:
@@ -3288,7 +4099,18 @@ class SecurityRouter:
             "ledger_stage": "skipped",
             "ledger_prepare_ref": None,
             "ledger_commit_ref": None,
+            "ledger_ref": None,
+            "prepare_ref": None,
+            "commit_ref": None,
             "outbox_status": "none",
+            "outbox_ref": None,
+            "receipt_surface_kind": "none",
+            "evidence_delivery_state": "none",
+            "evidence_durable": False,
+            "evidence_storage_ready": False,
+            "governance_terminal": False,
+            "governance_path": "none",
+            "receipt_governance_ready": False,
         }
 
         reason_codes = _normalize_reason_codes(reason_accum, max_items=32)
@@ -3338,6 +4160,9 @@ class SecurityRouter:
             audit_ref=detector.audit_ref,
             receipt_ref=detector.receipt_ref,
             receipt=None,
+            receipt_public={},
+            receipt_verification=None,
+            receipt_private=None,
             integrity_ok=True,
             integrity_errors=tuple(),
             normalization_warnings=ctx.normalization_warnings,
@@ -3346,22 +4171,119 @@ class SecurityRouter:
         return decision
 
     def _finalize_with_artifacts(self, decision: SecurityDecision, snap: _EvaluationSnapshot) -> SecurityDecision:
+        """
+        Governance-aligned finalization.
+
+        Old behavior:
+            local receipt could be issued and then treated as if it were the final,
+            durable evidence artifact even before any prepare/commit/outbox path
+            had succeeded.
+
+        New behavior:
+            - prepare / attestation / commit are modeled explicitly
+            - local receipt remains a private attestation blob until governance state
+              is known
+            - outward receipt_public / receipt_verification are annotated with
+              durability state
+            - evidence_identity / artifacts encode whether evidence is:
+                * ephemeral only
+                * durable via outbox
+                * storage-ready via commit
+        """
         bundle = snap.bundle
+        ctx = snap.ctx
         artifacts = dict(decision.artifacts)
+        evidence_identity = dict(decision.evidence_identity)
+        security_block = dict(decision.security)
+
         audit_ref = decision.audit_ref
         receipt_ref = decision.receipt_ref
-        receipt = decision.receipt
+        receipt_raw: Optional[Dict[str, Any]] = dict(decision.receipt or {}) if isinstance(decision.receipt, Mapping) else None
+        receipt_private: Optional[Dict[str, Any]] = dict(decision.receipt_private or {}) if isinstance(decision.receipt_private, Mapping) else None
+        receipt_public: Dict[str, Any] = dict(decision.receipt_public or {})
+        receipt_verification: Optional[Dict[str, Any]] = dict(decision.receipt_verification or {}) if isinstance(decision.receipt_verification, Mapping) else None
+
         reason_codes = list(decision.reason_codes)
-        primary_reason = decision.primary_reason_code
         required_action = decision.required_action
         action_taken = decision.action_taken
         allowed = decision.allowed
         enforcement_mode = decision.enforcement_mode
 
-        # Receipt / attestation first, because it can change final decision.
         receipt_required = bool(artifacts.get("receipt_required"))
+        ledger_required = bool(artifacts.get("ledger_required"))
         attestation_required = bool(artifacts.get("attestation_required"))
+        governance_required = bool(receipt_required or ledger_required or attestation_required or bundle.config.audit_emit_all_decisions)
 
+        governance_payload_base = self._make_governance_payload(
+            decision=decision,
+            snap=snap,
+            artifacts=artifacts,
+            receipt_ref=receipt_ref,
+            audit_ref=audit_ref,
+            phase="prepare",
+        )
+
+        # ------------------------------------------------------------------
+        # 1) PREPARE FIRST (align with service_grpc durable governance closure)
+        # ------------------------------------------------------------------
+        if governance_required and bundle.config.prepare_before_attestation:
+            if self._ledger_sink is not None:
+                try:
+                    prepare_ref = self._ledger_sink.prepare(decision.event_id, governance_payload_base)
+                    artifacts["ledger_prepare_ref"] = prepare_ref
+                    artifacts["prepare_ref"] = prepare_ref
+                    artifacts["ledger_ref"] = prepare_ref or artifacts.get("ledger_ref")
+                    artifacts["ledger_stage"] = "prepared"
+                    artifacts["governance_path"] = "ledger_prepare_commit"
+                    reason_codes.append("LEDGER_PREPARED")
+                    audit_ref = prepare_ref or audit_ref
+                except Exception:
+                    artifacts["ledger_stage"] = "prepare_failed"
+                    reason_codes.append("LEDGER_PREPARE_FAILED")
+                    if self._outbox_sink is not None and bundle.config.outbox_enabled and bundle.config.outbox_on_required_sink_failure:
+                        outbox_ref = self._enqueue_outbox(
+                            kind="security_router.ledger.prepare",
+                            dedupe_key=f"{decision.event_id}:governance",
+                            payload=governance_payload_base,
+                        )
+                        if outbox_ref is not None:
+                            artifacts["outbox_status"] = "queued"
+                            artifacts["outbox_ref"] = outbox_ref
+                            artifacts["ledger_stage"] = "outboxed"
+                            artifacts["governance_path"] = "ledger_prepare_outbox"
+                            reason_codes.append("OUTBOX_QUEUED")
+                        else:
+                            artifacts["outbox_status"] = "dropped"
+                            reason_codes.append("OUTBOX_QUEUE_FAILED")
+                            if ledger_required and bundle.config.require_ledger_when_required:
+                                required_action = _action_max(required_action, "block")
+                                action_taken = required_action
+                                allowed = required_action != "block"
+                                enforcement_mode = "fail_closed"
+                    elif ledger_required and bundle.config.require_ledger_when_required:
+                        required_action = _action_max(required_action, "block")
+                        action_taken = required_action
+                        allowed = required_action != "block"
+                        enforcement_mode = "fail_closed"
+            elif self._outbox_sink is not None and bundle.config.outbox_enabled:
+                outbox_ref = self._enqueue_outbox(
+                    kind="security_router.governance.prepare",
+                    dedupe_key=f"{decision.event_id}:governance",
+                    payload=governance_payload_base,
+                )
+                if outbox_ref is not None:
+                    artifacts["outbox_status"] = "queued"
+                    artifacts["outbox_ref"] = outbox_ref
+                    artifacts["ledger_stage"] = "outboxed"
+                    artifacts["governance_path"] = "outbox_only"
+                    reason_codes.append("OUTBOX_QUEUED")
+                else:
+                    artifacts["outbox_status"] = "dropped"
+                    reason_codes.append("OUTBOX_QUEUE_FAILED")
+
+        # ------------------------------------------------------------------
+        # 2) ISSUE ATTESTATION / RECEIPT (private first; never over-claim)
+        # ------------------------------------------------------------------
         if receipt_required:
             if self._attestor is None:
                 reason_codes.append("ATTESTOR_REQUIRED_UNAVAILABLE")
@@ -3372,13 +4294,14 @@ class SecurityRouter:
                     enforcement_mode = "fail_closed" if required_action == "block" else "must_enforce"
             else:
                 try:
-                    receipt = self._issue_security_receipt(
+                    receipt_private = self._issue_security_receipt(
                         decision=decision,
                         snap=snap,
                         audit_ref=audit_ref,
                     )
-                    if receipt:
-                        receipt_ref = _safe_id(receipt.get("receipt"), default=None, max_len=256) or receipt_ref
+                    if receipt_private:
+                        receipt_raw = dict(receipt_private)
+                        receipt_ref = _safe_id(receipt_private.get("receipt_ref") or receipt_private.get("receipt"), default=None, max_len=256) or receipt_ref
                         reason_codes.append("RECEIPT_ISSUED")
                     else:
                         reason_codes.append("RECEIPT_SKIPPED")
@@ -3390,79 +4313,241 @@ class SecurityRouter:
                         allowed = required_action != "block"
                         enforcement_mode = "fail_closed" if required_action == "block" else "must_enforce"
 
-        # Ledger after receipt so the final payload is final.
-        if self._ledger_sink is not None and (bool(artifacts.get("ledger_required")) or bundle.config.audit_emit_all_decisions):
-            payload = decision.to_audit_event()
-            payload["artifacts"] = dict(artifacts)
-            payload["receipt_ref"] = receipt_ref
-            payload["receipt_present"] = bool(receipt)
-            payload_digest = _safe_digest_hex(ctx="tcd:security:ledger_payload", payload=payload, out_hex=32)
+        # ------------------------------------------------------------------
+        # 3) COMMIT / DURABLE GOVERNANCE
+        # ------------------------------------------------------------------
+        governance_payload_final = self._make_governance_payload(
+            decision=SecurityDecision(
+                schema=decision.schema,
+                router=decision.router,
+                version=decision.version,
+                instance_id=decision.instance_id,
+                activation_id=decision.activation_id,
+                config_fingerprint=decision.config_fingerprint,
+                bundle_version=decision.bundle_version,
+                bundle_updated_at_unix_ns=decision.bundle_updated_at_unix_ns,
+                event_id=decision.event_id,
+                decision_seq=decision.decision_seq,
+                decision_ts_unix_ns=decision.decision_ts_unix_ns,
+                decision_ts_mono_ns=decision.decision_ts_mono_ns,
+                batch_id=decision.batch_id,
+                allowed=allowed,
+                action=action_taken,
+                action_taken=action_taken,
+                required_action=required_action,
+                enforcement_mode=enforcement_mode,
+                primary_reason_code=decision.primary_reason_code,
+                reason_codes=tuple(reason_codes),
+                degraded_reason_codes=decision.degraded_reason_codes,
+                reason=decision.reason,
+                bound_policy=decision.bound_policy,
+                policy_ref=decision.policy_ref,
+                policyset_ref=decision.policyset_ref,
+                policy_digest=decision.policy_digest,
+                route=decision.route,
+                route_plan_id=decision.route_plan_id,
+                decision_id=decision.decision_id,
+                rate_decisions=decision.rate_decisions,
+                risk_score=decision.risk_score,
+                risk_label=decision.risk_label,
+                e_triggered=decision.e_triggered,
+                controller_mode=decision.controller_mode,
+                guarantee_scope=decision.guarantee_scope,
+                e_state=decision.e_state,
+                security=decision.security,
+                evidence_identity=decision.evidence_identity,
+                artifacts=artifacts,
+                audit_ref=audit_ref,
+                receipt_ref=receipt_ref,
+                receipt=receipt_raw,
+                receipt_public=receipt_public,
+                receipt_verification=receipt_verification,
+                receipt_private=receipt_private,
+                integrity_ok=decision.integrity_ok,
+                integrity_errors=decision.integrity_errors,
+                normalization_warnings=decision.normalization_warnings,
+                compat_warnings=decision.compat_warnings,
+            ),
+            snap=snap,
+            artifacts=artifacts,
+            receipt_ref=receipt_ref,
+            audit_ref=audit_ref,
+            phase="commit",
+        )
+        if receipt_private is not None:
+            governance_payload_final["receipt_present"] = True
+            governance_payload_final["receipt_ref"] = receipt_ref
+            governance_payload_final["receipt_bundle"] = {
+                "head": receipt_private.get("receipt"),
+                "verify_key_id": receipt_private.get("verify_key_id"),
+                "verify_key_fp": receipt_private.get("verify_key_fp"),
+                "body_digest": receipt_private.get("body_digest"),
+                "receipt_integrity": receipt_private.get("receipt_integrity"),
+            }
+            governance_payload_final["receipt_private"] = {
+                "schema": receipt_private.get("schema"),
+                "receipt": receipt_private.get("receipt"),
+                "head": receipt_private.get("head") or receipt_private.get("receipt"),
+                "receipt_body": receipt_private.get("receipt_body"),
+                "body": receipt_private.get("body") or receipt_private.get("receipt_body"),
+                "receipt_sig": receipt_private.get("receipt_sig"),
+                "sig": receipt_private.get("sig") or receipt_private.get("receipt_sig"),
+                "verify_key_id": receipt_private.get("verify_key_id"),
+                "verify_key_fp": receipt_private.get("verify_key_fp"),
+                "receipt_integrity": receipt_private.get("receipt_integrity"),
+                "body_digest": receipt_private.get("body_digest"),
+                "policy_ref": receipt_private.get("policy_ref"),
+                "policyset_ref": receipt_private.get("policyset_ref"),
+                "policy_digest": receipt_private.get("policy_digest"),
+                "cfg_fp": receipt_private.get("cfg_fp"),
+                "event_id": receipt_private.get("event_id"),
+                "decision_id": receipt_private.get("decision_id"),
+                "route_plan_id": receipt_private.get("route_plan_id"),
+            }
+            governance_payload_final["receipt_private"] = {
+                "schema": receipt_private.get("schema"),
+                "receipt": receipt_private.get("receipt"),
+                "head": receipt_private.get("head") or receipt_private.get("receipt"),
+                "receipt_body": receipt_private.get("receipt_body"),
+                "body": receipt_private.get("body") or receipt_private.get("receipt_body"),
+                "receipt_sig": receipt_private.get("receipt_sig"),
+                "sig": receipt_private.get("sig") or receipt_private.get("receipt_sig"),
+                "verify_key_id": receipt_private.get("verify_key_id"),
+                "verify_key_fp": receipt_private.get("verify_key_fp"),
+                "receipt_integrity": receipt_private.get("receipt_integrity"),
+                "body_digest": receipt_private.get("body_digest"),
+                "policy_ref": receipt_private.get("policy_ref"),
+                "policyset_ref": receipt_private.get("policyset_ref"),
+                "policy_digest": receipt_private.get("policy_digest"),
+                "cfg_fp": receipt_private.get("cfg_fp"),
+                "event_id": receipt_private.get("event_id"),
+                "decision_id": receipt_private.get("decision_id"),
+                "route_plan_id": receipt_private.get("route_plan_id"),
+            }
 
-            try:
-                prepare_ref = self._ledger_sink.prepare(decision.event_id, payload)
-                artifacts["ledger_prepare_ref"] = prepare_ref
-                artifacts["ledger_stage"] = "prepared"
-            except Exception:
-                artifacts["ledger_stage"] = "failed"
-                reason_codes.append("LEDGER_PREPARE_FAILED")
-                if self._outbox_sink is not None and bundle.config.outbox_enabled and bundle.config.outbox_on_required_sink_failure:
-                    try:
-                        outbox_ref = self._outbox_sink.enqueue(
-                            kind="security_router.ledger",
-                            dedupe_key=decision.event_id,
-                            payload=payload,
-                            payload_digest=payload_digest,
-                        )
-                        artifacts["outbox_status"] = "queued"
-                        artifacts["outbox_ref"] = outbox_ref
-                        reason_codes.append("OUTBOX_QUEUED")
-                    except Exception:
-                        artifacts["outbox_status"] = "dropped"
-                        reason_codes.append("OUTBOX_QUEUE_FAILED")
-                        if bool(artifacts.get("ledger_required")) and bundle.config.require_ledger_when_required:
-                            required_action = _action_max(required_action, "block")
-                            action_taken = required_action
-                            allowed = required_action != "block"
-                            enforcement_mode = "fail_closed"
-                elif bool(artifacts.get("ledger_required")) and bundle.config.require_ledger_when_required:
-                    required_action = _action_max(required_action, "block")
-                    action_taken = required_action
-                    allowed = required_action != "block"
-                    enforcement_mode = "fail_closed"
-            else:
+        if governance_required:
+            if self._ledger_sink is not None:
                 try:
-                    commit_ref = self._ledger_sink.commit(decision.event_id, payload)
+                    commit_ref = self._ledger_sink.commit(decision.event_id, governance_payload_final)
                     artifacts["ledger_commit_ref"] = commit_ref
+                    artifacts["commit_ref"] = commit_ref
+                    artifacts["ledger_ref"] = commit_ref or artifacts.get("ledger_ref")
                     artifacts["ledger_stage"] = "committed"
+                    artifacts["governance_terminal"] = True
+                    artifacts["governance_path"] = artifacts.get("governance_path") or "ledger_prepare_commit"
+                    artifacts["evidence_durable"] = True
+                    artifacts["evidence_storage_ready"] = True
+                    artifacts["evidence_delivery_state"] = "committed"
+                    reason_codes.append("LEDGER_COMMITTED")
+                    if receipt_private is not None:
+                        reason_codes.append("RECEIPT_DURABLE_COMMITTED")
+                    audit_ref = commit_ref or audit_ref
                 except Exception:
-                    artifacts["ledger_stage"] = "failed"
+                    artifacts["ledger_stage"] = "commit_failed"
                     reason_codes.append("LEDGER_COMMIT_FAILED")
                     if self._outbox_sink is not None and bundle.config.outbox_enabled and bundle.config.outbox_on_required_sink_failure:
-                        try:
-                            outbox_ref = self._outbox_sink.enqueue(
-                                kind="security_router.ledger",
-                                dedupe_key=decision.event_id,
-                                payload=payload,
-                                payload_digest=payload_digest,
-                            )
+                        outbox_ref = self._enqueue_outbox(
+                            kind="security_router.ledger.commit",
+                            dedupe_key=f"{decision.event_id}:governance",
+                            payload=governance_payload_final,
+                        )
+                        if outbox_ref is not None:
                             artifacts["outbox_status"] = "queued"
                             artifacts["outbox_ref"] = outbox_ref
+                            artifacts["ledger_stage"] = "outboxed"
+                            artifacts["governance_path"] = "ledger_commit_outbox"
+                            artifacts["evidence_durable"] = bool(bundle.config.treat_outbox_enqueue_as_durable)
+                            artifacts["evidence_storage_ready"] = False
+                            artifacts["evidence_delivery_state"] = "queued_for_commit"
                             reason_codes.append("OUTBOX_QUEUED")
-                        except Exception:
+                            if receipt_private is not None:
+                                reason_codes.append("RECEIPT_DURABLE_OUTBOX")
+                        else:
                             artifacts["outbox_status"] = "dropped"
                             reason_codes.append("OUTBOX_QUEUE_FAILED")
-                            if bool(artifacts.get("ledger_required")) and bundle.config.require_ledger_when_required:
+                            if (ledger_required and bundle.config.require_ledger_when_required) or (
+                                receipt_required and bundle.config.require_terminal_governance_for_receipt_required
+                            ):
                                 required_action = _action_max(required_action, "block")
                                 action_taken = required_action
                                 allowed = required_action != "block"
                                 enforcement_mode = "fail_closed"
-                    elif bool(artifacts.get("ledger_required")) and bundle.config.require_ledger_when_required:
+                    elif (ledger_required and bundle.config.require_ledger_when_required) or (
+                        receipt_required and bundle.config.require_terminal_governance_for_receipt_required
+                    ):
                         required_action = _action_max(required_action, "block")
                         action_taken = required_action
                         allowed = required_action != "block"
                         enforcement_mode = "fail_closed"
+            elif self._outbox_sink is not None and bundle.config.outbox_enabled:
+                outbox_ref = self._enqueue_outbox(
+                    kind="security_router.governance.finalize",
+                    dedupe_key=f"{decision.event_id}:governance",
+                    payload=governance_payload_final,
+                )
+                if outbox_ref is not None:
+                    artifacts["outbox_status"] = "queued"
+                    artifacts["outbox_ref"] = outbox_ref
+                    artifacts["ledger_stage"] = "outboxed"
+                    artifacts["governance_path"] = artifacts.get("governance_path") or "outbox_only"
+                    artifacts["evidence_durable"] = bool(bundle.config.treat_outbox_enqueue_as_durable)
+                    artifacts["evidence_storage_ready"] = False
+                    artifacts["evidence_delivery_state"] = "queued_for_commit"
+                    reason_codes.append("OUTBOX_QUEUED")
+                    if receipt_private is not None:
+                        reason_codes.append("RECEIPT_DURABLE_OUTBOX")
+                else:
+                    artifacts["outbox_status"] = "dropped"
+                    reason_codes.append("OUTBOX_QUEUE_FAILED")
 
-        # Audit last, after final action and artifacts are settled.
+        # ------------------------------------------------------------------
+        # 4) Derive receipt public / verification / private surfaces
+        # ------------------------------------------------------------------
+        if receipt_private is not None:
+            if not artifacts.get("evidence_delivery_state"):
+                if artifacts.get("evidence_storage_ready"):
+                    artifacts["evidence_delivery_state"] = "committed"
+                elif artifacts.get("evidence_durable"):
+                    artifacts["evidence_delivery_state"] = "queued_for_commit"
+                else:
+                    artifacts["evidence_delivery_state"] = "issued_only"
+
+            if artifacts.get("evidence_storage_ready"):
+                artifacts["receipt_surface_kind"] = "durable_committed"
+            elif artifacts.get("evidence_durable"):
+                artifacts["receipt_surface_kind"] = "durable_outbox_pending_commit"
+            else:
+                artifacts["receipt_surface_kind"] = "ephemeral_attestation"
+
+            artifacts["receipt_governance_ready"] = bool(artifacts.get("evidence_durable") or artifacts.get("evidence_storage_ready"))
+
+            pub, ver = _build_receipt_surfaces(
+                receipt_private,
+                include_verify_key=bundle.config.include_verify_key_in_verification_surface,
+            )
+            if not bundle.config.include_receipt_verification_surface:
+                ver = {}
+
+            receipt_private, pub, ver = _annotate_receipt_surfaces(
+                raw=receipt_private,
+                public=pub,
+                verification=ver,
+                artifacts=artifacts,
+                audit_ref=audit_ref,
+                receipt_ref=receipt_ref,
+            )
+            receipt_raw = dict(receipt_private)
+            receipt_public = dict(pub)
+            receipt_verification = dict(ver) if ver else None
+
+            if not artifacts.get("evidence_durable") and not artifacts.get("evidence_storage_ready"):
+                reason_codes.append("RECEIPT_LOCAL_ONLY")
+            elif artifacts.get("evidence_durable") and not artifacts.get("evidence_storage_ready"):
+                reason_codes.append("RECEIPT_DURABILITY_PENDING")
+
+        # ------------------------------------------------------------------
+        # 5) Audit last, after final action / refs / governance state settle
+        # ------------------------------------------------------------------
         if self._audit_sink is not None and (bundle.config.audit_emit_all_decisions or action_taken != "allow"):
             try:
                 audit_payload = decision.to_audit_event()
@@ -3471,27 +4556,90 @@ class SecurityRouter:
                 audit_payload["required_action"] = required_action
                 audit_payload["allowed"] = allowed
                 audit_payload["enforcement_mode"] = enforcement_mode
+                audit_payload["audit_ref"] = audit_ref
+                audit_payload["receipt_ref"] = receipt_ref
+                audit_payload["receipt_public"] = dict(receipt_public or {})
                 audit_ref = self._audit_sink.emit("security_router.decision", audit_payload) or audit_ref
             except Exception:
                 reason_codes.append("AUDIT_EMIT_FAIL")
+                if self._outbox_sink is not None and bundle.config.outbox_enabled and bundle.config.queue_audit_on_failure:
+                    audit_outbox_ref = self._enqueue_outbox(
+                        kind="security_router.audit",
+                        dedupe_key=f"{decision.event_id}:audit",
+                        payload={
+                            "type": "security_router.audit",
+                            "event_id": decision.event_id,
+                            "action": action_taken,
+                            "required_action": required_action,
+                            "allowed": allowed,
+                            "enforcement_mode": enforcement_mode,
+                            "receipt_ref": receipt_ref,
+                            "artifacts": dict(artifacts),
+                            "evidence_identity": dict(evidence_identity),
+                        },
+                    )
+                    if audit_outbox_ref is not None:
+                        artifacts["audit_outbox_ref"] = audit_outbox_ref
+                        reason_codes.append("AUDIT_OUTBOX_QUEUED")
 
+        # ------------------------------------------------------------------
+        # 6) Final outward blocks
+        # ------------------------------------------------------------------
+        if receipt_required and bundle.config.require_storage_ready_for_receipt_required and not bool(artifacts.get("evidence_storage_ready")):
+            required_action = _action_max(required_action, "block")
+            action_taken = required_action
+            allowed = required_action != "block"
+            enforcement_mode = "fail_closed"
+
+        if receipt_required and bundle.config.require_terminal_governance_for_receipt_required and not bool(artifacts.get("evidence_durable") or artifacts.get("evidence_storage_ready")):
+            required_action = _action_max(required_action, "block")
+            action_taken = required_action
+            allowed = required_action != "block"
+            enforcement_mode = "fail_closed"
+
+        evidence_identity.update(
+            {
+                "receipt_ref": receipt_ref,
+                "audit_ref": audit_ref,
+                "ledger_prepare_ref": artifacts.get("ledger_prepare_ref"),
+                "ledger_commit_ref": artifacts.get("ledger_commit_ref"),
+                "outbox_ref": artifacts.get("outbox_ref"),
+                "ledger_stage": artifacts.get("ledger_stage"),
+                "outbox_status": artifacts.get("outbox_status"),
+                "receipt_surface_kind": artifacts.get("receipt_surface_kind"),
+                "evidence_delivery_state": artifacts.get("evidence_delivery_state"),
+                "evidence_durable": bool(artifacts.get("evidence_durable", False)),
+                "evidence_storage_ready": bool(artifacts.get("evidence_storage_ready", False)),
+                "governance_terminal": bool(artifacts.get("governance_terminal", False)),
+                "produced_by": "tcd.security_router",
+            }
+        )
+
+        security_block.update(
+            {
+                "receipt_required": bool(artifacts.get("receipt_required")),
+                "ledger_required": bool(artifacts.get("ledger_required")),
+                "attestation_required": bool(artifacts.get("attestation_required")),
+                "audit_ref": audit_ref,
+                "receipt_ref": receipt_ref,
+                "ledger_prepare_ref": artifacts.get("ledger_prepare_ref"),
+                "ledger_commit_ref": artifacts.get("ledger_commit_ref"),
+                "outbox_ref": artifacts.get("outbox_ref"),
+                "ledger_stage": artifacts.get("ledger_stage"),
+                "outbox_status": artifacts.get("outbox_status"),
+                "receipt_surface_kind": artifacts.get("receipt_surface_kind"),
+                "evidence_delivery_state": artifacts.get("evidence_delivery_state"),
+                "evidence_durable": bool(artifacts.get("evidence_durable", False)),
+                "evidence_storage_ready": bool(artifacts.get("evidence_storage_ready", False)),
+            }
+        )
+
+        primary_reason = decision.primary_reason_code
         if primary_reason not in reason_codes and reason_codes:
             primary_reason = reason_codes[0]
         reason_codes_final = _normalize_reason_codes(reason_codes, max_items=32)
         if reason_codes_final:
             primary_reason = reason_codes_final[0]
-
-        evidence_identity = dict(decision.evidence_identity)
-        evidence_identity["receipt_ref"] = receipt_ref
-        evidence_identity["audit_ref"] = audit_ref
-
-        security_block = dict(decision.security)
-        security_block["receipt_required"] = bool(artifacts.get("receipt_required"))
-        security_block["ledger_required"] = bool(artifacts.get("ledger_required"))
-        security_block["attestation_required"] = bool(artifacts.get("attestation_required"))
-        security_block["audit_ref"] = audit_ref
-        security_block["receipt_ref"] = receipt_ref
-
         reason_text = ";".join(list(reason_codes_final) + list(decision.degraded_reason_codes)) or "DEFAULT_ALLOW"
 
         return SecurityDecision(
@@ -3536,7 +4684,10 @@ class SecurityRouter:
             artifacts=artifacts,
             audit_ref=audit_ref,
             receipt_ref=receipt_ref,
-            receipt=receipt,
+            receipt=receipt_raw,
+            receipt_public=receipt_public,
+            receipt_verification=receipt_verification,
+            receipt_private=receipt_private,
             integrity_ok=decision.integrity_ok,
             integrity_errors=decision.integrity_errors,
             normalization_warnings=decision.normalization_warnings,
@@ -3560,6 +4711,16 @@ class SecurityRouter:
             errors.append("attestation_required_but_receipt_missing")
         if decision.artifacts.get("ledger_required") and decision.artifacts.get("ledger_stage") == "failed":
             errors.append("ledger_required_but_commit_failed")
+        if decision.artifacts.get("receipt_required") and snap.bundle.config.require_terminal_governance_for_receipt_required:
+            if not bool(decision.artifacts.get("evidence_durable") or decision.artifacts.get("evidence_storage_ready")):
+                errors.append("receipt_required_but_no_durable_governance_path")
+        if decision.artifacts.get("receipt_required") and snap.bundle.config.require_storage_ready_for_receipt_required:
+            if not bool(decision.artifacts.get("evidence_storage_ready")):
+                errors.append("receipt_required_but_not_storage_ready")
+        if decision.receipt_private and not decision.receipt_public:
+            errors.append("receipt_private_present_without_public_surface")
+        if decision.receipt_public and decision.receipt_ref != decision.receipt_public.get("receipt_ref", decision.receipt_ref):
+            errors.append("receipt_ref_mismatch")
 
         e_ctrl = None
         if isinstance(decision.e_state, Mapping):
@@ -3631,6 +4792,9 @@ class SecurityRouter:
             audit_ref=decision.audit_ref,
             receipt_ref=decision.receipt_ref,
             receipt=decision.receipt,
+            receipt_public=decision.receipt_public,
+            receipt_verification=decision.receipt_verification,
+            receipt_private=decision.receipt_private,
             integrity_ok=integrity_ok,
             integrity_errors=integrity_errors,
             normalization_warnings=decision.normalization_warnings,
@@ -3640,6 +4804,11 @@ class SecurityRouter:
     # ------------------------------------------------------------------
     # Detector action policy / auth / rate / route helpers
     # ------------------------------------------------------------------
+
+    def _next_decision_seq(self) -> int:
+        with self._seq_lock:
+            self._decision_seq += 1
+            return self._decision_seq
 
     def _detector_required_action(self, bundle: _CompiledSecurityBundle, det: _DetectorResult) -> RequiredAction:
         if det.error:
@@ -4013,6 +5182,14 @@ class SecurityRouter:
         if isinstance(route_dict.get("tags"), (list, tuple)):
             tags = _normalize_tags((str(x) for x in route_dict["tags"]), max_items=32)
 
+        router_mode = _safe_label(route_dict.get("router_mode"), default="normal")
+        if router_mode not in _ALLOWED_ROUTER_MODES:
+            router_mode = "normal"
+
+        signal_trust_mode = _safe_label(route_dict.get("signal_trust_mode"), default=env.trust_mode())
+        if signal_trust_mode not in _ALLOWED_SIGNAL_TRUST:
+            signal_trust_mode = env.trust_mode()
+
         return SecurityRouteContract(
             schema=_strip_unsafe_text(route_dict.get("schema"), max_len=64) or "tcd.route.v4",
             router=_strip_unsafe_text(route_dict.get("router"), max_len=128) or _ROUTER_NAME,
@@ -4027,7 +5204,7 @@ class SecurityRouter:
             patch_id=_safe_id(route_dict.get("patch_id"), default=bundle.config.patch_id, max_len=128),
             change_ticket_id=_safe_id(route_dict.get("change_ticket_id"), default=bundle.config.change_ticket_id, max_len=128),
             activated_by=_safe_id(route_dict.get("activated_by"), default=bundle.config.activated_by, max_len=128),
-            router_mode=_safe_label(route_dict.get("router_mode"), default="normal") if _safe_label(route_dict.get("router_mode"), default="normal") in _ALLOWED_ROUTER_MODES else "normal",
+            router_mode=router_mode,  # type: ignore[arg-type]
             route_id_kind="plan",
             route_plan_id=route_plan_id,
             route_id=route_id,
@@ -4069,7 +5246,7 @@ class SecurityRouter:
             controller_mode=_safe_label(route_dict.get("controller_mode"), default="") or detector.controller_mode,
             guarantee_scope=_safe_label(route_dict.get("guarantee_scope"), default="") or detector.guarantee_scope,
             signal_source=_safe_name(route_dict.get("signal_source"), default=env.source),
-            signal_trust_mode=_safe_label(route_dict.get("signal_trust_mode"), default=env.trust_mode()) if _safe_label(route_dict.get("signal_trust_mode"), default=env.trust_mode()) in _ALLOWED_SIGNAL_TRUST else env.trust_mode(),  # type: ignore[arg-type]
+            signal_trust_mode=signal_trust_mode,  # type: ignore[arg-type]
             signal_signed=_coerce_bool(route_dict.get("signal_signed"), default=env.signed),
             signal_signer_kid=_safe_id(route_dict.get("signal_signer_kid"), default=env.signer_kid, max_len=64),
             signal_cfg_fp=_safe_id(route_dict.get("signal_cfg_fp"), default=env.source_cfg_fp, max_len=128),
@@ -4182,6 +5359,56 @@ class SecurityRouter:
             },
         }
 
+    def _make_governance_payload(
+        self,
+        *,
+        decision: SecurityDecision,
+        snap: _EvaluationSnapshot,
+        artifacts: Mapping[str, Any],
+        receipt_ref: Optional[str],
+        audit_ref: Optional[str],
+        phase: str,
+    ) -> Dict[str, Any]:
+        payload = decision.to_audit_event()
+        payload["phase"] = _safe_label(phase, default="commit")
+        payload["artifacts"] = dict(artifacts)
+        payload["receipt_ref"] = receipt_ref
+        payload["audit_ref"] = audit_ref
+        payload["evidence_identity"] = dict(decision.evidence_identity)
+        payload["security"] = dict(decision.security)
+        payload["config_fingerprint"] = snap.bundle.cfg_fp
+        payload["activation_id"] = snap.bundle.activation.activation_id
+        payload["policy_digest"] = decision.policy_digest
+        payload["subject_hash"] = _subject_digest(snap.ctx.subject_id(), snap.bundle.identity_hasher)
+        payload["context_digest"] = getattr(decision.route, "context_digest", None) if decision.route is not None else _context_digest(snap.ctx, snap.bundle.identity_hasher)
+        payload["signal_digest"] = getattr(decision.route, "signal_digest", None) if decision.route is not None else _signal_digest(
+            snap.ctx.signal_envelope or SecuritySignalEnvelope(),
+            snap.detector,
+            ctx=snap.ctx,
+            hasher=snap.bundle.identity_hasher,
+        )
+        return payload
+
+    def _enqueue_outbox(
+        self,
+        *,
+        kind: str,
+        dedupe_key: str,
+        payload: Mapping[str, Any],
+    ) -> Optional[str]:
+        if self._outbox_sink is None:
+            return None
+        payload_digest = _safe_digest_hex(ctx=f"tcd:security:outbox:{kind}", payload=dict(payload), out_hex=32)
+        try:
+            return self._outbox_sink.enqueue(
+                kind=kind,
+                dedupe_key=dedupe_key,
+                payload=dict(payload),
+                payload_digest=payload_digest,
+            )
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Artifact emission
     # ------------------------------------------------------------------
@@ -4198,6 +5425,7 @@ class SecurityRouter:
 
         ctx = snap.ctx
         bp = snap.policy.bound_policy
+        route_receipt = decision.route.to_receipt_dict() if decision.route is not None and hasattr(decision.route, "to_receipt_dict") else None
 
         req_obj = {
             "ts_ns": decision.decision_ts_unix_ns,
@@ -4207,11 +5435,11 @@ class SecurityRouter:
             "subject": {
                 "subject_hash": _subject_digest(ctx.subject_id(), snap.bundle.identity_hasher),
                 "tenant_id": ctx.tenant_id,
-                "principal_hash": (_subject_digest(ctx.principal_id, snap.bundle.identity_hasher) if ctx.principal_id else None),
+                "principal_hash": (snap.bundle.identity_hasher.digest(ctx.principal_id, ctx="tcd:security:principal", out_hex=24) if ctx.principal_id else None),
                 "kind": ctx.kind,
                 "trust_zone": ctx.trust_zone,
                 "route_profile": ctx.route_profile,
-                "ip_hash": (_subject_digest(ctx.ip, snap.bundle.identity_hasher) if ctx.ip else None),
+                "ip_hash": (snap.bundle.identity_hasher.digest(ctx.ip, ctx="tcd:security:ip", out_hex=24) if ctx.ip else None),
                 "ctx": ({k: v for k, v in ctx.binding_context().items() if k in _CTX_KEYS} if bool(getattr(bp, "attach_match_context", False)) else None),
             },
         }
@@ -4226,10 +5454,13 @@ class SecurityRouter:
             "policyset_ref": decision.policyset_ref,
             "policy_digest": decision.policy_digest,
             "reason_codes": list(decision.reason_codes),
-            "route": decision.route.to_receipt_dict() if decision.route is not None and hasattr(decision.route, "to_receipt_dict") else None,
+            "route": route_receipt,
             "audit_ref": audit_ref,
             "decision_id": decision.decision_id,
             "route_plan_id": decision.route_plan_id,
+            "evidence_identity": dict(decision.evidence_identity),
+            "artifacts": dict(decision.artifacts),
+            "security": dict(decision.security),
         }
 
         if decision.e_state is not None:
@@ -4247,7 +5478,7 @@ class SecurityRouter:
 
         witness_segments: List[Dict[str, Any]] = [
             {
-                "kind": "security_policy",
+                "kind": "external",
                 "id": _ROUTER_NAME,
                 "digest": decision.policy_digest,
                 "meta": {
@@ -4259,8 +5490,8 @@ class SecurityRouter:
         if decision.route_plan_id:
             witness_segments.append(
                 {
-                    "kind": "route_plan",
-                    "id": _ROUTER_NAME,
+                    "kind": "external",
+                    "id": "route_plan",
                     "digest": decision.route_plan_id,
                     "meta": {
                         "decision_id": decision.decision_id,
@@ -4291,41 +5522,203 @@ class SecurityRouter:
             "activation_id": snap.bundle.activation.activation_id,
         }
 
-        receipt = self._attestor.issue(
-            req_obj=req_obj,
-            comp_obj=comp_obj,
-            e_obj=e_obj,
-            witness_segments=witness_segments,
-            witness_tags=witness_tags,
-            meta=meta,
+        issue_kwargs = {
+            "req_obj": req_obj,
+            "comp_obj": comp_obj,
+            "e_obj": e_obj,
+            "witness_segments": witness_segments,
+            "witness_tags": witness_tags,
+            "meta": meta,
+        }
+
+        _LOG.error(
+            "SECURITY RECEIPT STAGE 1 before attestor.issue event_id=%s timeout_ms=%s",
+            decision.event_id,
+            snap.bundle.config.receipt_issue_timeout_ms,
         )
-        if not isinstance(receipt, Mapping):
+        issue_ok, issued, issue_err = _call_with_timeout_compat(
+            lambda: self._attestor.issue(**issue_kwargs),
+            timeout_ms=snap.bundle.config.receipt_issue_timeout_ms,
+            name="security_receipt_issue",
+        )
+        if not issue_ok:
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 2 attestor.issue failed event_id=%s error=%s",
+                decision.event_id,
+                issue_err,
+            )
+            raise RuntimeError(issue_err or "security_receipt_issue_failed")
+
+        _LOG.error(
+            "SECURITY RECEIPT STAGE 2 after attestor.issue event_id=%s issued_type=%s",
+            decision.event_id,
+            type(issued).__name__,
+        )
+
+        if not isinstance(issued, Mapping):
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 2 attestor.issue returned non-mapping event_id=%s issued_type=%s",
+                decision.event_id,
+                type(issued).__name__,
+            )
             return {}
-        out = dict(receipt)
-        return {
-            "receipt": out.get("receipt"),
-            "receipt_body": out.get("receipt_body"),
-            "receipt_sig": out.get("receipt_sig"),
-            "verify_key": out.get("verify_key"),
-            "receipt_integrity": out.get("receipt_integrity"),
+
+        out = dict(issued)
+        head = _safe_id(out.get("receipt"), default=None, max_len=1024)
+        body = out.get("receipt_body") if isinstance(out.get("receipt_body"), str) else None
+        sig = _safe_id(out.get("receipt_sig"), default=None, max_len=8192)
+        verify_key = _safe_id(out.get("verify_key"), default=None, max_len=4096)
+        receipt_ref = _safe_id(out.get("receipt_ref"), default=None, max_len=512) or head
+
+        enriched: Dict[str, Any] = {
+            "schema": "tcd.receipt.security_router.v2",
+            "receipt_kind": "security_router.decision",
+            "event_type": "security_router.decision",
+            "receipt": head,
+            "head": head,
+            "receipt_body": body,
+            "body": body,
+            "receipt_sig": sig,
+            "sig": sig,
+            "verify_key": verify_key,
+            "verify_key_id": verify_key if (_safe_id(verify_key, default=None, max_len=256) is not None) else None,
+            "verify_key_fp": _hash_handle_public(verify_key),
+            "receipt_integrity": _safe_id(out.get("receipt_integrity"), default=None, max_len=256),
             "receipt_secondary": out.get("receipt_secondary"),
             "receipt_sig_secondary": out.get("receipt_sig_secondary"),
+            "receipt_ref": receipt_ref,
+            "audit_ref": audit_ref,
+            "event_id": decision.event_id,
+            "decision_id": decision.decision_id,
+            "route_plan_id": decision.route_plan_id,
+            "policy_ref": decision.policy_ref,
+            "policyset_ref": decision.policyset_ref,
+            "policy_digest": decision.policy_digest,
+            "cfg_fp": snap.bundle.cfg_fp,
+            "state_domain_id": decision.evidence_identity.get("state_domain_id"),
+            "adapter_registry_fp": decision.evidence_identity.get("adapter_registry_fp"),
+            "build_id": ctx.meta_public.get("build_id"),
+            "image_digest": ctx.meta_public.get("image_digest"),
+            "pq_required": bool(decision.security.get("pq_required", False)),
+            "pq_ok": decision.security.get("pq_ok"),
+            "body_kind": "canonical_json" if body else None,
+            "body_digest": ("sha256:" + hashlib.sha256(body.encode("utf-8", errors="strict")).hexdigest()) if body else None,
+            "integrity_ok": True,
+            "integrity_errors": [],
         }
 
+        self_check_ok: Optional[bool] = None
+        self_check_errors: List[str] = []
+        enriched["self_check_enabled"] = bool(snap.bundle.config.receipt_self_check_enabled)
+        enriched["self_check_ok"] = None
 
-    # ------------------------------------------------------------------
-    # Integrity / dependency status
-    # ------------------------------------------------------------------
+        if not snap.bundle.config.receipt_self_check_enabled:
+            enriched["integrity_ok"] = None
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 3 self-check skipped event_id=%s enabled=%s",
+                decision.event_id,
+                snap.bundle.config.receipt_self_check_enabled,
+            )
+        elif verify_receipt_ex is None:
+            self_check_ok = False
+            self_check_errors = ["verify_receipt_ex_unavailable"]
+            enriched["integrity_ok"] = False
+            enriched["integrity_errors"] = list(self_check_errors)
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 3 self-check unavailable event_id=%s",
+                decision.event_id,
+            )
+        elif not (head and body):
+            self_check_ok = False
+            self_check_errors = ["receipt_head_or_body_missing"]
+            enriched["integrity_ok"] = False
+            enriched["integrity_errors"] = list(self_check_errors)
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 3 self-check missing material event_id=%s head=%s body=%s",
+                decision.event_id,
+                bool(head),
+                bool(body),
+            )
+        else:
+            def _self_check_call() -> Any:
+                return verify_receipt_ex(
+                    receipt_head_hex=head,
+                    receipt_body_json=body,
+                    verify_key_hex=verify_key,
+                    receipt_sig_hex=sig,
+                    req_obj=req_obj,
+                    comp_obj=comp_obj,
+                    e_obj=e_obj,
+                    witness_segments=witness_segments,
+                    strict=True,
+                    expected_policy_ref=decision.policy_ref,
+                    expected_policyset_ref=decision.policyset_ref,
+                    expected_policy_digest=decision.policy_digest,
+                    expected_cfg_fp=snap.bundle.cfg_fp,
+                    expected_build_id=ctx.meta_public.get("build_id"),
+                    expected_image_digest=ctx.meta_public.get("image_digest"),
+                )
 
-    def _dependency_status(self) -> Dict[str, Any]:
-        return {
-            "policy_store": self._policies is not None,
-            "rate_limiter": self._limiter is not None,
-            "attestor": self._attestor is not None,
-            "detector": self._detector is not None,
-            "strategy_router": self._strategy_router is not None,
-            "audit_sink": self._audit_sink is not None,
-            "telemetry_sink": self._telemetry_sink is not None,
-            "ledger_sink": self._ledger_sink is not None,
-            "outbox_sink": self._outbox_sink is not None,
-        }
+            _LOG.error(
+                "SECURITY RECEIPT STAGE 3 before self-check event_id=%s timeout_ms=%s",
+                decision.event_id,
+                snap.bundle.config.receipt_self_check_timeout_ms,
+            )
+            verify_ok, report, verify_err = _call_with_timeout_compat(
+                _self_check_call,
+                timeout_ms=snap.bundle.config.receipt_self_check_timeout_ms,
+                name="security_receipt_self_check",
+            )
+            if verify_ok:
+                enriched["head_verified"] = getattr(report, "head_verified", None)
+                enriched["body_canonical_verified"] = getattr(report, "body_canonical_verified", None)
+                enriched["integrity_hash_verified"] = getattr(report, "integrity_hash_verified", None)
+                enriched["signature_verified"] = getattr(report, "signature_verified", None)
+                enriched["verify_key_allowed"] = getattr(report, "verify_key_allowed", None)
+                enriched["policy_binding_verified"] = getattr(report, "policy_binding_verified", None)
+                enriched["cfg_binding_verified"] = getattr(report, "cfg_binding_verified", None)
+                self_check_ok = bool(getattr(report, "ok", False))
+                self_check_errors = list(getattr(report, "errors", []) or [])
+                enriched["integrity_ok"] = self_check_ok
+                enriched["integrity_errors"] = list(self_check_errors)
+                _LOG.error(
+                    "SECURITY RECEIPT STAGE 4 after self-check event_id=%s ok=%s",
+                    decision.event_id,
+                    self_check_ok,
+                )
+            else:
+                self_check_ok = False
+                self_check_errors = [verify_err or "security_receipt_self_check_failed"]
+                enriched["integrity_ok"] = False
+                enriched["integrity_errors"] = list(self_check_errors)
+                _LOG.error(
+                    "SECURITY RECEIPT STAGE 4 self-check failed event_id=%s error=%s",
+                    decision.event_id,
+                    verify_err,
+                )
+
+        enriched["self_check_ok"] = self_check_ok
+        if self_check_errors:
+            enriched["integrity_errors"] = list(self_check_errors)
+
+        return enriched
+
+# ---------------------------------------------------------------------------
+# Public / telemetry helpers
+# ---------------------------------------------------------------------------
+
+    def _record_metric(self, name: str, value: float, labels: Mapping[str, str]) -> None:
+        if self._telemetry_sink is None:
+            return
+        try:
+            self._telemetry_sink.record_metric(name, float(value), dict(labels))
+        except Exception:
+            return
+
+    def _record_event(self, name: str, payload: Mapping[str, Any]) -> None:
+        if self._telemetry_sink is None:
+            return
+        try:
+            self._telemetry_sink.record_event(name, dict(payload))
+        except Exception:
+            return

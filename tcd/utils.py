@@ -608,15 +608,33 @@ class CanonicalJsonPolicy:
     def normalized(self) -> "CanonicalJsonPolicy":
         nf = self.nonfinite_mode if self.nonfinite_mode in {"reject", "null", "default", "tag"} else "null"
         oi = self.oversize_int_mode if self.oversize_int_mode in {"reject", "tag", "clamp"} else "tag"
+
+        try:
+            schema_version = int(self.schema_version)
+        except Exception:
+            schema_version = 1
+
+        try:
+            nfd = float(self.nonfinite_default)
+            if not math.isfinite(nfd):
+                nfd = 0.0
+        except Exception:
+            nfd = 0.0
+
+        try:
+            max_int_bits = int(self.max_int_bits)
+        except Exception:
+            max_int_bits = _MAX_INT_BITS
+
         return CanonicalJsonPolicy(
-            schema_version=max(1, min(1_000_000, int(self.schema_version))),
+            schema_version=max(1, min(1_000_000, schema_version)),
             canonicalization_version=_safe_text(self.canonicalization_version, max_len=64) or _CANONICALIZATION_VERSION,
             ensure_ascii=bool(self.ensure_ascii),
             forbid_float=bool(self.forbid_float),
             nonfinite_mode=nf,
-            nonfinite_default=float(self.nonfinite_default) if math.isfinite(float(self.nonfinite_default)) else 0.0,
+            nonfinite_default=nfd,
             oversize_int_mode=oi,
-            max_int_bits=max(32, min(8192, int(self.max_int_bits))),
+            max_int_bits=max(32, min(8192, max_int_bits)),
             sort_keys=bool(self.sort_keys),
             compact=bool(self.compact),
         )
@@ -684,9 +702,18 @@ class KeyPolicyEngine:
         tokens = _key_tokens(key)
         if not tokens:
             return False
+
+        # These single-token words are too broad as substring blockers for
+        # structured control-plane metadata. Exact matches are still blocked
+        # above, and genuinely dangerous composites still match stronger keys
+        # such as body/content/prompt/secret/token/privatekey.
+        broad_singletons = {"api", "input", "output", "private", "request", "response"}
+
         for raw in self.forbid_keys:
             seq = _key_tokens(str(raw))
             if not seq:
+                continue
+            if len(seq) == 1 and seq[0] in broad_singletons and len(tokens) > 1:
                 continue
             if _token_seq_in(tokens, seq):
                 return True
@@ -1985,6 +2012,7 @@ def canonical_json_dumps(
         forbid_keys=tuple(forbid_keys or tuple(_FORBIDDEN_META_KEYS)),
         numeric_only_keys=tuple(numeric_only_keys or ()),
         ensure_ascii=ensure_ascii,
+        nonfinite_mode="default" if sanitize_nan else "reject",
         reject_on_forbidden_keys=bool(forbid_keys),
     )
     sanitized, _ = sanitize_with_report(obj, policy=cfg)
@@ -2027,10 +2055,13 @@ def canonical_json_bytes_strict(
     *,
     policy: SanitizePolicyBundle | SanitizeConfig | None = None,
 ) -> bytes:
-    sanitized, _ = sanitize_with_report(obj, policy=policy)
+    bundle = policy if isinstance(policy, SanitizePolicyBundle) else (
+        policy.to_bundle() if isinstance(policy, SanitizeConfig) else SanitizeConfig().to_bundle()
+    )
+    sanitized, _ = sanitize_with_report(obj, policy=bundle)
     return json.dumps(
         _stable_jsonable(sanitized),
-        ensure_ascii=False,
+        ensure_ascii=bundle.canonical_json.ensure_ascii,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -2056,6 +2087,7 @@ def bounded_json_dumps(
         strip_pii=strip_pii,
         redact_secrets=redact_secrets,
         ensure_ascii=ensure_ascii,
+        nonfinite_mode="default" if sanitize_nan else "reject",
     )
     sanitized, report = sanitize_with_report(obj, policy=cfg)
     txt = json.dumps(
@@ -2086,37 +2118,52 @@ def normalize_digest_token(v: Any, *, kind: str = "any", default: Optional[str] 
     s = _safe_text(v, max_len=1024, redact_mode="token")
     if not s or s == "[redacted]":
         return default
+
     kind_l = (kind or "any").lower()
+    sl = s.lower()
+
+    def _plain_hex(x: str) -> Optional[str]:
+        if 16 <= len(x) <= 256 and _HEX_RE.fullmatch(x):
+            return x.lower()
+        return None
+
+    def _zero_x_hex(x: str) -> Optional[str]:
+        if x.lower().startswith("0x"):
+            body = x[2:]
+            if 16 <= len(body) <= 256 and _HEX_RE.fullmatch(body):
+                return "0x" + body.lower()
+        return None
+
+    def _alg_hex(x: str) -> Optional[str]:
+        algo, sep, rest = x.partition(":")
+        if not sep:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}", algo):
+            return None
+        if 16 <= len(rest) <= 256 and _HEX_RE.fullmatch(rest):
+            return f"{algo}:{rest.lower()}"
+        return None
+
     if kind_l == "cfg_fp":
-        return s if _CFG_FP_RE.fullmatch(s) else default
+        return sl if _CFG_FP_RE.fullmatch(sl) else default
+
     if kind_l == "integrity":
         return s if _RECEIPT_INTEGRITY_RE.fullmatch(s) else default
+
     if kind_l == "hex":
-        if _DIGEST_HEX_RE.fullmatch(s):
-            return s.lower()
-        return default
+        return _plain_hex(s) or default
+
     if kind_l == "0xhex":
-        if _DIGEST_HEX_0X_RE.fullmatch(s):
-            return s.lower()
-        if _DIGEST_HEX_RE.fullmatch(s):
-            return "0x" + s.lower()
-        return default
+        plain = _plain_hex(s)
+        return _zero_x_hex(s) or (("0x" + plain) if plain else default)
+
     if kind_l == "alg:hex":
-        return s if _DIGEST_ALG_HEX_RE.fullmatch(s) else default
+        return _alg_hex(s) or default
+
     if kind_l == "receipt_head":
-        if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s):
-            return s.lower()
-        if _DIGEST_ALG_HEX_RE.fullmatch(s):
-            return s
-        return default
-    if _DIGEST_HEX_RE.fullmatch(s):
-        return s.lower()
-    if _DIGEST_HEX_0X_RE.fullmatch(s):
-        return s.lower()
-    if _DIGEST_ALG_HEX_RE.fullmatch(s):
-        algo, _, rest = s.partition(":")
-        return f"{algo}:{rest.lower()}"
-    return default
+        return _plain_hex(s) or _zero_x_hex(s) or _alg_hex(s) or default
+
+    return _plain_hex(s) or _zero_x_hex(s) or _alg_hex(s) or default
 
 
 def blake2s_hex(
@@ -2285,7 +2332,7 @@ def secure_compare_hex(a: str, b: str) -> bool:
         if not ss or not _HEX_RE.fullmatch(ss):
             return None
         if len(ss) % 2 == 1:
-            ss = "0" + ss
+            return None
         try:
             return bytes.fromhex(ss.lower())
         except Exception:
@@ -2294,6 +2341,8 @@ def secure_compare_hex(a: str, b: str) -> bool:
     ba = _norm(a)
     bb = _norm(b)
     if ba is None or bb is None:
+        return False
+    if len(ba) != len(bb):
         return False
 
     return hmac.compare_digest(ba, bb)

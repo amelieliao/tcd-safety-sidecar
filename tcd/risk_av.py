@@ -1298,6 +1298,31 @@ class StateRecord:
     state: EProcessState
 
 
+class ScoreToPAdapter(Protocol):
+    def p_value(self, *, score: float, meta: Mapping[str, Any], ctx: Mapping[str, Any]) -> float:
+        ...
+
+    def provenance(self) -> Dict[str, Any]:
+        ...
+
+
+class AlwaysValidAuditSink(Protocol):
+    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Optional[str]:
+        ...
+
+
+class AlwaysValidTelemetrySink(Protocol):
+    def record_metric(self, name: str, value: float, labels: Mapping[str, str]) -> None:
+        ...
+
+    def record_event(self, name: str, payload: Mapping[str, Any]) -> None:
+        ...
+
+
+class AlwaysValidReceiptSink(Protocol):
+    def issue(self, payload: Mapping[str, Any]) -> Optional[str]:
+        ...
+
 class EProcessStateBackend(Protocol):
     def load(self, *, state_domain_id: str, stream_hash: str, history_window: int) -> Optional[StateRecord]:
         ...
@@ -3314,6 +3339,62 @@ class AlwaysValidRiskController:
             return float(st.strict_log_e), "dual_strict", "strict_direct_p"
         return float(st.controller_log_e), "dual_controller", st.last_guarantee_scope
 
+
+    def _make_initial_state(
+        self,
+        bundle: _CompiledBundle,
+        now_mono_ns: int,
+        now_unix_ns: int,
+    ) -> EProcessState:
+        history_window = int(bundle.runtime_cfg.history_window)
+        retain_history = bool(bundle.runtime_cfg.retain_history)
+        maxlen = history_window if (retain_history and history_window > 0) else None
+
+        alpha_wealth = float(bundle.policy_spec.alpha_wealth_init)
+        if not math.isfinite(alpha_wealth):
+            alpha_wealth = 0.0
+        alpha_wealth = max(0.0, min(alpha_wealth, float(bundle.policy_spec.alpha_wealth_cap)))
+
+        exhausted_at_boot = bool(bundle.policy_spec.freeze_on_exhaust and alpha_wealth <= 0.0)
+
+        return EProcessState(
+            strict_log_e=0.0,
+            controller_log_e=0.0,
+            alpha_wealth=alpha_wealth,
+            decisions=0,
+            triggers=0,
+            active=False,
+            frozen=exhausted_at_boot,
+            last_trigger_step=None,
+            exhausted_step=0 if exhausted_at_boot else None,
+            last_update_mono_ns=int(now_mono_ns),
+            last_update_unix_ns=int(now_unix_ns),
+            last_p_value=1.0,
+            last_p_source="neutral",
+            last_score=None,
+            last_calibration_ref=None,
+            last_calibration_cfg_digest=None,
+            last_calibration_state_digest=None,
+            last_guarantee_scope="none",
+            ewma_score=None,
+            ewma_neglogp=0.0,
+            min_p_value=1.0,
+            min_p_value_step=None,
+            max_score=None,
+            max_score_step=None,
+            direct_p_steps=0,
+            calibrated_p_steps=0,
+            heuristic_p_steps=0,
+            neutral_steps=0,
+            small_p_count_05=0,
+            small_p_count_01=0,
+            small_p_count_001=0,
+            fisher_stat=0.0,
+            fisher_df=0,
+            history_p=deque(maxlen=maxlen),
+            history_score=deque(maxlen=maxlen),
+            history_log_e=deque(maxlen=maxlen),
+        )
     def _update_state(
         self,
         *,

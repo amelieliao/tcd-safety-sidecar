@@ -812,19 +812,37 @@ class _Metrics:
             self.auth_sig_fail_reason = self.req_sec = self.inflight = self.audit_drop = None
             return
 
+        class _NopMetric:
+            def labels(self, *_, **__):
+                return self
+            def inc(self, *_, **__):
+                pass
+            def observe(self, *_, **__):
+                pass
+            def set(self, *_, **__):
+                pass
+            def dec(self, *_, **__):
+                pass
+
+        def _metric(factory: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return factory(*args, **kwargs)
+            except Exception:
+                return _NopMetric()
+
         reg = REGISTRY
-        self.req_ctr = Counter("tcd_http_requests_total", "HTTP requests", ["method", "path", "code"], registry=reg)
-        self.req_reject = Counter("tcd_http_reject_total", "Rejected requests", ["reason", "path"], registry=reg)
-        self.req_bytes = Counter("tcd_http_request_bytes_total", "Request bytes", ["method", "path"], registry=reg)
-        self.resp_bytes = Counter("tcd_http_response_bytes_total", "Response bytes", ["method", "path", "code"], registry=reg)
-        self.latency = Histogram("tcd_http_latency_seconds", "End-to-end request latency", buckets=cfg.latency_buckets, registry=reg)
-        self.idem_ctr = Counter("tcd_http_idempotency_total", "Idempotency outcomes", ["status", "path"], registry=reg)
-        self.rate_block = Counter("tcd_http_rate_limit_total", "Rate-limit blocks", ["path"], registry=reg)
-        self.auth_sig = Counter("tcd_http_signature_total", "Signature verification", ["status", "path"], registry=reg)
-        self.auth_sig_fail_reason = Counter("tcd_http_signature_fail_total", "Signature failures", ["reason", "path"], registry=reg)
-        self.req_sec = Counter("tcd_http_requests_security_total", "HTTP requests by coarse security level", ["sec_level", "path"], registry=reg)
-        self.inflight = Gauge("tcd_http_request_inflight", "Current in-flight HTTP requests", ["path"], registry=reg)
-        self.audit_drop = Counter("tcd_http_audit_drop_total", "Dropped audit events", ["reason"], registry=reg)
+        self.req_ctr = _metric(Counter, "tcd_request_middleware_requests_total", "HTTP requests", ["method", "path", "code"], registry=reg)
+        self.req_reject = _metric(Counter, "tcd_request_middleware_reject_total", "Rejected requests", ["reason", "path"], registry=reg)
+        self.req_bytes = _metric(Counter, "tcd_request_middleware_request_bytes_total", "Request bytes", ["method", "path"], registry=reg)
+        self.resp_bytes = _metric(Counter, "tcd_request_middleware_response_bytes_total", "Response bytes", ["method", "path", "code"], registry=reg)
+        self.latency = _metric(Histogram, "tcd_request_middleware_latency_seconds", "End-to-end request latency", buckets=cfg.latency_buckets, registry=reg)
+        self.idem_ctr = _metric(Counter, "tcd_request_middleware_idempotency_total", "Idempotency outcomes", ["status", "path"], registry=reg)
+        self.rate_block = _metric(Counter, "tcd_request_middleware_rate_limit_total", "Rate-limit blocks", ["path"], registry=reg)
+        self.auth_sig = _metric(Counter, "tcd_request_middleware_signature_total", "Signature verification", ["status", "path"], registry=reg)
+        self.auth_sig_fail_reason = _metric(Counter, "tcd_request_middleware_signature_fail_total", "Signature failures", ["reason", "path"], registry=reg)
+        self.req_sec = _metric(Counter, "tcd_request_middleware_requests_security_total", "HTTP requests by coarse security level", ["sec_level", "path"], registry=reg)
+        self.inflight = _metric(Gauge, "tcd_request_middleware_inflight", "Current in-flight HTTP requests", ["path"], registry=reg)
+        self.audit_drop = _metric(Counter, "tcd_request_middleware_audit_drop_total", "Dropped audit events", ["reason"], registry=reg)
 
 
 # ---------------------------------------------------------------------------
@@ -2183,8 +2201,16 @@ class TCDRequestASGIMiddleware:
 
         t0 = time.perf_counter()
 
+        query_raw = scope.get("query_string", b"")
+        if isinstance(query_raw, (bytes, bytearray)):
+            query_len = len(query_raw)
+        elif isinstance(query_raw, str):
+            query_len = len(query_raw.encode("utf-8", errors="ignore"))
+        else:
+            query_len = 0
+
         async def _asgi_response(resp: Response) -> None:
-            await resp(scope, receive, send)
+            await resp(scope, _make_body_receive(b""), send)
 
         try:
             hdr_count, hdr_bytes = _headers_budget(scope)
@@ -2192,6 +2218,8 @@ class TCDRequestASGIMiddleware:
                 raise _Reject(431, "headers_too_many")
             if hdr_bytes > self._engine._cfg.limits.max_header_bytes:
                 raise _Reject(431, "headers_too_large")
+            if query_len > self._engine._cfg.limits.max_query_bytes:
+                raise _Reject(414, "query_too_large")
 
             req_for_state = Request(scope, receive=_make_body_receive(b""))
             self._engine._ensure_request_context(req_for_state, req_id)

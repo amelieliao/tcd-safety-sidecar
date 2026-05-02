@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "policyset_meta": {
+    "name": "local_dev_policyset",
+    "version": "v1",
+    "owner": "local",
+    "purpose": "dev_smoke_test"
+  },
+  "rules": [
+    {
+      "name": "block_internet_admin",
+      "version": "v1",
+      "priority": 1000,
+      "match": {
+        "tenant": "*",
+        "user": "*",
+        "session": "*",
+        "model_id": "*",
+        "gpu_id": "*",
+        "task": "*",
+        "lang": "*",
+        "env": "*",
+        "trust_zone": "internet",
+        "route": "admin",
+        "data_class": "*",
+        "workload": "*",
+        "jurisdiction": "*",
+        "regulation": "*",
+        "client_app": "*",
+        "access_channel": "*"
+      },
+      "decision": "deny",
+      "enforcement": "block",
+      "routing": {
+        "route_profile": "restricted",
+        "action_hint": "block",
+        "fallback_decoder": "safe",
+        "t_low": 0.2,
+        "t_high": 0.5,
+        "top_p_low": 0.4,
+        "top_p_high": 0.6
+      },
+      "receipt": {
+        "enable_issue": false,
+        "enable_verify_metrics": true,
+        "attach_policy_refs": true,
+        "attach_match_context": true,
+        "profile": "local_dev",
+        "crypto_profile": null,
+        "match_context_level": "coarse"
+      },
+      "sre": {
+        "token_cost_divisor": 10.0,
+        "probe_sample_rate": 1.0
+      },
+      "audit": {
+        "audit_label": "admin_block",
+        "sample_rate": 1.0,
+        "log_level": "error",
+        "incident_class": "security",
+        "force_audit_on_violation": true,
+        "require_full_trace": false
+      },
+      "compliance_profile": "strict",
+      "risk_label": "critical",
+      "origin": "local_dev_policy"
+    },
+    {
+      "name": "degrade_partner_batch",
+      "version": "v1",
+      "priority": 500,
+      "match": {
+        "tenant": "*",
+        "user": "*",
+        "session": "*",
+        "model_id": "*",
+        "gpu_id": "*",
+        "task": "*",
+        "lang": "*",
+        "env": "*",
+        "trust_zone": "partner",
+        "route": "batch",
+        "data_class": "*",
+        "workload": "*",
+        "jurisdiction": "*",
+        "regulation": "*",
+        "client_app": "*",
+        "access_channel": "*"
+      },
+      "decision": "degrade",
+      "enforcement": "degrade",
+      "routing": {
+        "route_profile": "batch",
+        "action_hint": "degrade",
+        "fallback_decoder": "cautious",
+        "t_low": 0.4,
+        "t_high": 0.7,
+        "top_p_low": 0.6,
+        "top_p_high": 0.8
+      },
+      "receipt": {
+        "enable_issue": false,
+        "enable_verify_metrics": true,
+        "attach_policy_refs": true,
+        "attach_match_context": false,
+        "profile": null,
+        "crypto_profile": null,
+        "match_context_level": "coarse"
+      },
+      "sre": {
+        "token_cost_divisor": 25.0,
+        "probe_sample_rate": 0.2
+      },
+      "audit": {
+        "audit_label": "partner_batch_degrade",
+        "sample_rate": 0.2,
+        "log_level": "warning",
+        "incident_class": "policy",
+        "force_audit_on_violation": false,
+        "require_full_trace": false
+      },
+      "compliance_profile": null,
+      "risk_label": "elevated",
+      "origin": "local_dev_policy"
+    },
+    {
+      "name": "default_inference_allow",
+      "version": "v1",
+      "priority": 100,
+      "match": {
+        "tenant": "*",
+        "user": "*",
+        "session": "*",
+        "model_id": "*",
+        "gpu_id": "*",
+        "task": "*",
+        "lang": "*",
+        "env": "*",
+        "trust_zone": "*",
+        "route": "inference",
+        "data_class": "*",
+        "workload": "*",
+        "jurisdiction": "*",
+        "regulation": "*",
+        "client_app": "*",
+        "access_channel": "*"
+      },
+      "decision": "allow",
+      "enforcement": "allow",
+      "routing": {
+        "route_profile": "inference",
+        "action_hint": "allow",
+        "fallback_decoder": "default",
+        "t_low": 0.7,
+        "t_high": 1.0,
+        "top_p_low": 0.8,
+        "top_p_high": 0.9
+      },
+      "receipt": {
+        "enable_issue": false,
+        "enable_verify_metrics": true,
+        "attach_policy_refs": true,
+        "attach_match_context": false,
+        "profile": null,
+        "crypto_profile": null,
+        "match_context_level": "coarse"
+      },
+      "sre": {
+        "token_cost_divisor": 50.0,
+        "probe_sample_rate": 0.0
+      },
+      "audit": {
+        "audit_label": "normal_inference",
+        "sample_rate": 0.0,
+        "log_level": "info",
+        "incident_class": "none",
+        "force_audit_on_violation": false,
+        "require_full_trace": false
+      },
+      "compliance_profile": null,
+      "risk_label": "normal",
+      "origin": "local_dev_policy"
+    },
+    {
+      "name": "default_catchall_allow",
+      "version": "v1",
+      "priority": 1,
+      "match": {
+        "tenant": "*",
+        "user": "*",
+        "session": "*",
+        "model_id": "*",
+        "gpu_id": "*",
+        "task": "*",
+        "lang": "*",
+        "env": "*",
+        "trust_zone": "*",
+        "route": "*",
+        "data_class": "*",
+        "workload": "*",
+        "jurisdiction": "*",
+        "regulation": "*",
+        "client_app": "*",
+        "access_channel": "*"
+      },
+      "decision": "allow",
+      "enforcement": "allow",
+      "routing": {
+        "route_profile": "inference",
+        "action_hint": "allow",
+        "fallback_decoder": "default",
+        "t_low": 0.7,
+        "t_high": 1.0,
+        "top_p_low": 0.8,
+        "top_p_high": 0.9
+      },
+      "receipt": {
+        "enable_issue": false,
+        "enable_verify_metrics": true,
+        "attach_policy_refs": true,
+        "attach_match_context": false,
+        "profile": null,
+        "crypto_profile": null,
+        "match_context_level": "coarse"
+      },
+      "sre": {
+        "token_cost_divisor": 50.0,
+        "probe_sample_rate": 0.0
+      },
+      "audit": {
+        "audit_label": "catchall_allow",
+        "sample_rate": 0.0,
+        "log_level": "info",
+        "incident_class": "none",
+        "force_audit_on_violation": false,
+        "require_full_trace": false
+      },
+      "compliance_profile": null,
+      "risk_label": "normal",
+      "origin": "local_dev_policy"
+    }
+  ]
+}

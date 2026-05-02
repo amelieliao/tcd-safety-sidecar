@@ -3,25 +3,35 @@ from __future__ import annotations
 """
 tcd/service_grpc.py
 
-Platform-grade gRPC service shim for TCD.
+Platform-grade gRPC transport/control-plane adapter aligned to the current
+service_http.py outward contract while preserving the older gRPC durability /
+governance skeleton.
 
-This module is intentionally a transport/control-plane adapter, not a policy
-engine. It aligns the gRPC surface with the stronger contracts already present
-in auth.py, routing.py, risk_av.py, security_router.py, attest.py, audit.py,
-schemas.py, and api_v1.py.
+Alignment goals
+---------------
+1) Preserve the old platform skeleton:
+   - bounded executors + queue rejection
+   - circuit breakers + retries
+   - inflight gates
+   - deterministic request/event identity
+   - prepare / commit ledger flow with outbox fallback
+   - control registry / replay registry
+   - rich config surface and runtime public view
 
-Core properties:
-- bounded metadata / payload / vector / verify-chain budgets
-- deterministic request_id / event_id / body_digest semantics
-- protocol compatibility policy (api_version / compatibility_epoch / capabilities)
-- strong subject identity parsing with explicit degraded / rejected states
-- method-scoped authz with peer/mTLS awareness
-- bounded executors + queue rejection + dependency breakers
-- detector + multivariate + AlwaysValidRiskController pipeline
-- optional SecurityRouter v3 integration for policy, routing, receipts, audit, ledger
-- prepare/commit evidence flow with outbox fallback
-- process-isolated verify option
-- safe no-op registration when grpcio or generated stubs are unavailable
+2) Switch to the newer HTTP-facing semantics:
+   - formal detector first: DetectRequest + build_default_detector()
+   - verify path uses verify_receipt_ex(...)
+   - outward response surface exposes:
+       * receipt_public
+       * receipt_verification (optional)
+       * evidence_identity
+       * artifacts
+     via components JSON and opportunistic proto-field population
+
+3) Keep backward compatibility:
+   - existing RiskResponse / VerifyResponse core fields stay usable
+   - richer fields are projected into components JSON
+   - newer proto fields are filled via safe setattr when available
 """
 
 import asyncio
@@ -80,14 +90,14 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 from .config import make_reloadable_settings
-from .detector import TCDConfig, TraceCollapseDetector
+from .detector import DetectRequest, build_default_detector
 from .exporter import TCDPrometheusExporter
 from .multivariate import MultiVarConfig, MultiVarDetector
 from .otel_exporter import TCDOtelExporter
 from .risk_av import AlwaysValidConfig, AlwaysValidRiskController
 from .routing import StrategyRouter
 from .utils import sanitize_floats
-from .verify import verify_chain, verify_receipt
+from .verify import verify_chain, verify_receipt_ex
 
 try:
     from .ratelimit import RateLimiter, RateLimitConfig, RateLimitZoneConfig, RateKey
@@ -98,9 +108,8 @@ except Exception:  # pragma: no cover
     RateKey = Any  # type: ignore
 
 try:
-    from .auth import Authenticator, build_authenticator_from_env  # type: ignore
+    from .auth import build_authenticator_from_env  # type: ignore
 except Exception:  # pragma: no cover
-    Authenticator = None  # type: ignore[assignment]
     build_authenticator_from_env = None  # type: ignore[assignment]
 
 try:
@@ -154,34 +163,52 @@ except Exception:  # pragma: no cover
     PolicyStore = Any  # type: ignore[misc]
 
 try:
-    from .schemas import DiagnoseOut, ReceiptPublicView  # type: ignore
+    from .schemas import ReceiptView  # type: ignore
 except Exception:  # pragma: no cover
-    DiagnoseOut = None  # type: ignore[assignment]
-    ReceiptPublicView = None  # type: ignore[assignment]
+    ReceiptView = None  # type: ignore[assignment]
+
+# Reuse HTTP contract helpers so semantics stay aligned.
+from .service_http import (
+    ServiceHttpConfig,
+    VerifyLimits,
+    _build_http_cfg_from_env,
+    _safe_text,
+    _safe_label,
+    _coerce_float,
+    _coerce_int,
+    _coerce_bool,
+    _clamp_float,
+    _clamp_int,
+    _sanitize_json_mapping,
+    _sanitize_numeric_array,
+    _safe_context_subset,
+    _filtered_kwargs_for,
+    _body_digest,
+    _build_attestor_compat,
+    _build_security_router_compat,
+    _security_context_compat,
+    _extract_receipt_like,
+    _extract_route_dict,
+    _extract_security_public,
+    _route_decide_compat,
+    _route_required_action,
+    _route_enforcement_mode,
+    _av_step_compat,
+    _build_receipt_surfaces,
+    RiskBudgetEnvelope,
+    ReceiptManager,
+)
 
 logger = logging.getLogger(__name__)
 _settings = make_reloadable_settings()
 
-# ---------------------------------------------------------------------------
-# Constants / regex
-# ---------------------------------------------------------------------------
-
-ERR_BAD_REQUEST = "BAD_REQUEST"
-ERR_PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
-ERR_OVERLOADED = "OVERLOADED"
-ERR_AUTH = "AUTH"
-ERR_FORBIDDEN = "FORBIDDEN"
-ERR_TIMEOUT = "TIMEOUT"
-ERR_DEPENDENCY = "DEPENDENCY"
-ERR_INTERNAL = "INTERNAL"
-ERR_EVIDENCE = "EVIDENCE"
-ERR_VERIFY = "VERIFY"
-ERR_HEADERS_TOO_LARGE = "HEADERS_TOO_LARGE"
-ERR_UNAVAILABLE = "UNAVAILABLE"
-
-_MAX_TRACE = 8192
-_MAX_SPECT = 8192
-_MAX_FEATS = 4096
+_SCHEMA = "tcd.grpc.service.v3"
+_DEFAULT_MAX_PROTO_BYTES = 2 * 1024 * 1024
+_DEFAULT_MAX_METADATA_BYTES = 16 * 1024
+_DEFAULT_MAX_METADATA_ITEMS = 96
+_MAX_TRACE = 4096
+_MAX_SPECT = 4096
+_MAX_FEATS = 2048
 _JSON_COMPONENT_LIMIT = 256_000
 
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -307,6 +334,16 @@ _GRPC_METADATA_BYTES = Histogram(
     buckets=(0, 128, 512, 1024, 4096, 8192, 16384, 32768),
     labelnames=("method",),
 )
+_GRPC_EXEC_RESERVED = Gauge(
+    "tcd_service_grpc_executor_reserved",
+    "Reserved slots in bounded executors",
+    labelnames=("pool",),
+)
+_GRPC_EXEC_REJECT = Counter(
+    "tcd_service_grpc_executor_reject_total",
+    "Rejected submissions to bounded executors",
+    labelnames=("pool",),
+)
 _GRPC_DEP_LATENCY = Histogram(
     "tcd_service_grpc_dependency_latency_ms",
     "Dependency latency in gRPC shim (ms)",
@@ -327,16 +364,6 @@ _GRPC_BREAKER_PROBE_TOTAL = Counter(
     "tcd_service_grpc_breaker_probe_total",
     "Breaker probes",
     labelnames=("dep", "ok"),
-)
-_GRPC_EXEC_RESERVED = Gauge(
-    "tcd_service_grpc_executor_reserved",
-    "Reserved slots in bounded executors",
-    labelnames=("pool",),
-)
-_GRPC_EXEC_REJECT = Counter(
-    "tcd_service_grpc_executor_reject_total",
-    "Rejected submissions to bounded executors",
-    labelnames=("pool",),
 )
 _GRPC_OUTBOX_DEPTH = Gauge(
     "tcd_service_grpc_outbox_depth",
@@ -375,116 +402,16 @@ _GRPC_REPLAY_REJECT = Counter(
 )
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name, "") or "").strip().lower()
-    if not raw:
-        return bool(default)
-    return raw in ("1", "true", "yes", "y", "on", "ok")
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = (os.getenv(name, "") or "").strip()
-    if not raw:
-        return int(default)
-    try:
-        return int(raw)
-    except Exception:
-        return int(default)
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = (os.getenv(name, "") or "").strip()
-    if not raw:
-        return float(default)
-    try:
-        v = float(raw)
-    except Exception:
-        return float(default)
-    return v if math.isfinite(v) else float(default)
-
-
-def _split_env_list(name: str) -> Optional[List[str]]:
-    raw = os.getenv(name, "")
-    xs = [x.strip() for x in raw.split(",") if x.strip()]
-    return xs or None
-
-
-def _truncate(s: str, n: int) -> str:
-    if n <= 0:
-        return ""
-    if len(s) <= n:
-        return s
-    return s[: max(0, n - 3)] + "..."
-
-
-def _safe_text(v: Any, *, max_len: int = 256) -> str:
-    try:
-        if isinstance(v, bytes):
-            s = v.decode("utf-8", errors="replace")
-        else:
-            s = str(v)
-    except Exception:
-        s = "<unprintable>"
-    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    s = _CTRL_CHARS_RE.sub("", s)
-    s = s.strip()
-    return _truncate(s, max_len)
-
-
-def _safe_taglike(v: Any, *, max_len: int = 128) -> Optional[str]:
-    s = _safe_text(v, max_len=max_len)
-    if not s:
-        return None
-    if not _SAFE_TAG_RE.fullmatch(s):
-        return None
-    return s
-
-
-def _normalize_auth_mode(v: Any) -> str:
-    s = _safe_text(v, max_len=32).strip().lower()
-    if s in {"", "none", "disabled"}:
-        return "none"
-    if s in {"bearer", "token"}:
-        return "bearer"
-    if s in {"jwt"}:
-        return "jwt"
-    if s in {"hmac", "signature"}:
-        return "hmac"
-    if s in {"mtls", "m_tls", "m-tls", "tls"}:
-        return "mtls"
-    return "other"
-
-
-def _looks_sensitive_value(s: str) -> bool:
-    if not s:
-        return False
-    if _JWT_RE.match(s):
-        return True
-    if _PEM_RE.search(s):
-        return True
-    if _BEARER_RE.search(s):
-        return True
-    if _BASE64ISH_RE.match(s) and len(s) > 120:
-        return True
-    return False
-
-
-def _redact_if_needed(s: str) -> str:
-    return "[redacted]" if _looks_sensitive_value(s) else s
-
-
 def _canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
-
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str, allow_nan=False)
 
 def _canonical_json_bytes(obj: Any) -> bytes:
     return _canonical_json(obj).encode("utf-8", errors="strict")
 
-
-def _blake3_hex(data: bytes, *, ctx: str) -> str:
+def _blake3_or_sha256(data: bytes, *, ctx: str) -> str:
     try:
         from .crypto import Blake3Hash  # type: ignore
         return Blake3Hash().hex(data, ctx=ctx)
@@ -495,10 +422,8 @@ def _blake3_hex(data: bytes, *, ctx: str) -> str:
         h.update(data)
         return h.hexdigest()
 
-
 def _hash_token(s: str, *, ctx: str, n: int = 16) -> str:
-    return _blake3_hex(s.encode("utf-8", errors="ignore"), ctx=ctx)[: max(8, min(64, int(n)))]
-
+    return _blake3_or_sha256(s.encode("utf-8", errors="ignore"), ctx=ctx)[: max(8, min(64, int(n)))]
 
 def _model_dump(obj: Any) -> Dict[str, Any]:
     if obj is None:
@@ -514,85 +439,36 @@ def _model_dump(obj: Any) -> Dict[str, Any]:
             return dataclasses.asdict(obj)
     return {}
 
+def _normalize_auth_mode(v: Any) -> str:
+    s = _safe_text(v, max_len=32).strip().lower()
+    if s in {"", "none", "disabled"}:
+        return "none"
+    if s in {"service_token"}:
+        return "service_token"
+    if s in {"bearer", "token"}:
+        return "bearer"
+    if s in {"jwt"}:
+        return "jwt"
+    if s in {"hmac", "signature"}:
+        return "hmac"
+    if s in {"mtls", "m_tls", "m-tls", "tls"}:
+        return "mtls"
+    if s in {"loopback_bypass"}:
+        return "loopback_bypass"
+    return "other"
 
-def _coerce_float(v: Any) -> Optional[float]:
-    if type(v) is bool:
-        return None
-    if isinstance(v, (int, float)):
-        try:
-            x = float(v)
-        except Exception:
-            return None
-        return x if math.isfinite(x) else None
-    if isinstance(v, str):
-        s = v.strip()
-        if not s or len(s) > 64:
-            return None
-        try:
-            x = float(s)
-        except Exception:
-            return None
-        return x if math.isfinite(x) else None
-    return None
-
-
-def _coerce_int(v: Any) -> Optional[int]:
-    if type(v) is int:
-        return int(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if not s or len(s) > 64:
-            return None
-        try:
-            return int(s, 10)
-        except Exception:
-            return None
-    return None
-
-
-def _coerce_bool(v: Any, *, default: bool = False) -> bool:
-    if type(v) is bool:
-        return v
-    if type(v) is int:
-        if v == 0:
-            return False
-        if v == 1:
-            return True
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
-            return True
-        if s in {"0", "false", "no", "n", "off"}:
-            return False
-    return default
-
-
-def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
-    x = _coerce_float(v)
-    if x is None:
-        return float(default)
-    if x < lo:
-        return float(lo)
-    if x > hi:
-        return float(hi)
-    return float(x)
-
-
-def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
-    x = _coerce_int(v)
-    if x is None:
-        return int(default)
-    if x < lo:
-        return int(lo)
-    if x > hi:
-        return int(hi)
-    return int(x)
-
-
-def _p_cons(score: float) -> float:
-    s = max(0.0, min(1.0, float(score)))
-    return max(1e-12, 1.0 - s)
-
+def _looks_sensitive_value(s: str) -> bool:
+    if not s:
+        return False
+    if _JWT_RE.match(s):
+        return True
+    if _PEM_RE.search(s):
+        return True
+    if _BEARER_RE.search(s):
+        return True
+    if _BASE64ISH_RE.match(s) and len(s) > 120:
+        return True
+    return False
 
 def _status_label_for_code(code: Any) -> str:
     if code is None:
@@ -614,7 +490,6 @@ def _status_label_for_code(code: Any) -> str:
         return "unavailable"
     return "error"
 
-
 def _deterministic_proto_bytes(msg: Any) -> bytes:
     try:
         return msg.SerializeToString(deterministic=True)  # type: ignore[attr-defined]
@@ -627,13 +502,11 @@ def _deterministic_proto_bytes(msg: Any) -> bytes:
             return msg.SerializeToString()  # type: ignore[attr-defined]
         return b""
 
-
 def _has_field(msg: Any, name: str) -> bool:
     try:
         return msg.HasField(name)  # type: ignore[attr-defined]
     except Exception:
         return getattr(msg, name, None) is not None
-
 
 def _metadata_pairs(context: Any) -> List[Tuple[str, str]]:
     try:
@@ -644,11 +517,9 @@ def _metadata_pairs(context: Any) -> List[Tuple[str, str]]:
     for k, v in items:
         ks = _safe_text(k, max_len=128).lower()
         vs = _safe_text(v, max_len=4096)
-        if not ks:
-            continue
-        out.append((ks, vs))
+        if ks:
+            out.append((ks, vs))
     return out
-
 
 def _metadata_dict(context: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -656,14 +527,12 @@ def _metadata_dict(context: Any) -> Dict[str, str]:
         out[k] = v
     return out
 
-
 def _metadata_size_bytes(md: Mapping[str, str]) -> int:
     total = 0
     for k, v in md.items():
         total += len(str(k).encode("utf-8", errors="ignore"))
         total += len(str(v).encode("utf-8", errors="ignore"))
     return total
-
 
 def _peer_ip(context: Any) -> str:
     try:
@@ -686,14 +555,12 @@ def _peer_ip(context: Any) -> str:
         return "unix"
     return peer[:128]
 
-
 def _has_time_remaining(context: Any, min_remaining_s: float = 0.001) -> bool:
     try:
         rem = context.time_remaining()
         return (rem is None) or (float(rem) > min_remaining_s)
     except Exception:
         return True
-
 
 def _time_remaining_s(context: Any) -> Optional[float]:
     try:
@@ -705,36 +572,42 @@ def _time_remaining_s(context: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def _client_active(context: Any) -> bool:
     try:
         return bool(context.is_active())  # type: ignore[attr-defined]
     except Exception:
         return True
 
-
 def _set_trailing_metadata(
     context: Any,
     *,
-    request_id: Optional[str],
-    event_id: Optional[str],
-    api_version: Optional[str],
-    schema_version: Optional[str],
+    request_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    route_plan_id: Optional[str] = None,
+    api_version: Optional[str] = None,
+    schema_version: Optional[str] = None,
+    cfg_fp: Optional[str] = None,
 ) -> None:
     pairs: List[Tuple[str, str]] = []
     if request_id:
         pairs.append(("x-tcd-request-id", request_id))
     if event_id:
         pairs.append(("x-tcd-event-id", event_id))
+    if decision_id:
+        pairs.append(("x-tcd-decision-id", decision_id))
+    if route_plan_id:
+        pairs.append(("x-tcd-route-plan-id", route_plan_id))
     if api_version:
         pairs.append(("x-tcd-api-version", api_version))
     if schema_version:
         pairs.append(("x-tcd-schema-version", schema_version))
+    if cfg_fp:
+        pairs.append(("x-tcd-config-fingerprint", cfg_fp))
     if not pairs:
         return
     with contextlib.suppress(Exception):
         context.set_trailing_metadata(tuple(pairs))
-
 
 def _set_grpc_error(
     context: Any,
@@ -743,8 +616,11 @@ def _set_grpc_error(
     *,
     request_id: Optional[str] = None,
     event_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    route_plan_id: Optional[str] = None,
     api_version: Optional[str] = None,
     schema_version: Optional[str] = None,
+    cfg_fp: Optional[str] = None,
 ) -> None:
     if not _HAS_GRPC:
         return
@@ -755,104 +631,126 @@ def _set_grpc_error(
         context,
         request_id=request_id,
         event_id=event_id,
+        decision_id=decision_id,
+        route_plan_id=route_plan_id,
         api_version=api_version,
         schema_version=schema_version,
+        cfg_fp=cfg_fp,
     )
 
-
 def _bounded_json_dumps(obj: Any, *, max_bytes: int) -> str:
-    txt = _canonical_json(obj or {})
+    try:
+        txt = _canonical_json(obj or {})
+    except Exception:
+        return "{}"
     if len(txt.encode("utf-8", errors="strict")) <= max_bytes:
         return txt
     return "{}"
 
+def _normalize_threat_kind(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = _safe_label(v, default="")
+    return s or None
 
-def _safe_json_value(
-    v: Any,
-    *,
-    max_depth: int,
-    max_items: int,
-    max_str_len: int,
-    total_budget: List[int],
-) -> Any:
-    if total_budget[0] <= 0:
-        return "[truncated]"
-    if max_depth <= 0:
-        return "[truncated]"
-    if v is None or isinstance(v, (bool, int, float)):
-        return v
-    if isinstance(v, (bytes, bytearray, memoryview)):
-        return "[bytes]"
-    if isinstance(v, str):
-        s = _redact_if_needed(_safe_text(v, max_len=max_str_len))
-        total_budget[0] -= len(s.encode("utf-8", errors="ignore"))
-        return s
-    if isinstance(v, Mapping):
-        out: Dict[str, Any] = {}
-        for i, (k, vv) in enumerate(list(v.items())[: max_items]):
-            if total_budget[0] <= 0:
-                break
-            out[_redact_if_needed(_safe_text(k, max_len=64))] = _safe_json_value(
-                vv,
-                max_depth=max_depth - 1,
-                max_items=max_items,
-                max_str_len=max_str_len,
-                total_budget=total_budget,
-            )
-        if len(v) > max_items:
-            out["_truncated"] = True
-        return out
-    if isinstance(v, (list, tuple)):
-        out: List[Any] = []
-        for vv in list(v)[: max_items]:
-            if total_budget[0] <= 0:
-                break
-            out.append(
-                _safe_json_value(
-                    vv,
-                    max_depth=max_depth - 1,
-                    max_items=max_items,
-                    max_str_len=max_str_len,
-                    total_budget=total_budget,
-                )
-            )
-        if len(v) > max_items:
-            out.append("[truncated]")
-        return out
-    s2 = _redact_if_needed(_safe_text(v, max_len=max_str_len))
-    total_budget[0] -= len(s2.encode("utf-8", errors="ignore"))
-    return s2
-
-
-def _sanitize_components(components: Any, *, max_depth: int, max_items: int, max_str_len: int, max_total_bytes: int) -> Dict[str, Any]:
-    if not isinstance(components, Mapping):
-        return {}
-    budget = [max(256, int(max_total_bytes))]
-    out = _safe_json_value(dict(components), max_depth=max_depth, max_items=max_items, max_str_len=max_str_len, total_budget=budget)
-    return out if isinstance(out, dict) else {}
-
-
-def _normalize_out(raw: Dict[str, Any]) -> Dict[str, Any]:
-    if DiagnoseOut is None:
-        return raw
-    try:
-        if hasattr(DiagnoseOut, "model_validate"):
-            out = DiagnoseOut.model_validate(raw)  # type: ignore[attr-defined]
-            return out.model_dump(exclude_none=True)  # type: ignore[attr-defined]
-        out = DiagnoseOut(**raw)  # type: ignore
-        return out.dict(exclude_none=True)  # type: ignore[attr-defined]
-    except Exception:
-        return raw
-
+def _safe_pb_set(msg: Any, name: str, value: Any) -> None:
+    if value is None:
+        return
+    with contextlib.suppress(Exception):
+        if hasattr(msg, name):
+            setattr(msg, name, value)
 
 # ---------------------------------------------------------------------------
-# Protocol / identity policy
+# Protocol / identity policies
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class _AuthProjection:
+    ok: bool
+    mode: str
+    principal: Optional[str]
+    scopes: Tuple[str, ...]
+    roles: Tuple[str, ...]
+    key_id: Optional[str]
+    policy_digest: Optional[str]
+    authn_strength: Optional[str]
+    trusted: bool
+    reason: Optional[str]
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @staticmethod
+    def from_auth_result(res: Any) -> "_AuthProjection":
+        if res is None:
+            return _AuthProjection(False, "none", None, tuple(), tuple(), None, None, None, False, "missing")
+        ok = bool(getattr(res, "ok", False))
+        ctx = getattr(res, "ctx", None)
+        if not ok or ctx is None:
+            return _AuthProjection(
+                False,
+                "none",
+                None,
+                tuple(),
+                tuple(),
+                None,
+                None,
+                None,
+                False,
+                _safe_text(getattr(res, "reason", None), max_len=64) or "denied",
+            )
+
+        mode = _normalize_auth_mode(getattr(ctx, "mode", None))
+        principal = _safe_text(getattr(ctx, "principal", None), max_len=256) or None
+        key_id = _safe_text(getattr(ctx, "key_id", None), max_len=128) or None
+        policy_digest = _safe_text(getattr(ctx, "policy_digest", None) or getattr(ctx, "policy_digest_hex", None), max_len=128) or None
+        authn_strength = _safe_text(getattr(ctx, "authn_strength", None), max_len=64) or None
+
+        try:
+            scopes = tuple(sorted({_safe_text(x, max_len=64) for x in list(getattr(ctx, "scopes", None) or []) if _safe_text(x, max_len=64)}))
+        except Exception:
+            scopes = tuple()
+        try:
+            roles = tuple(sorted({_safe_text(x, max_len=64) for x in list(getattr(ctx, "roles", None) or []) if _safe_text(x, max_len=64)}))
+        except Exception:
+            roles = tuple()
+
+        raw = {}
+        raw_ctx = getattr(ctx, "raw", None)
+        if isinstance(raw_ctx, Mapping):
+            raw = {str(k): raw_ctx[k] for k in raw_ctx.keys()}
+
+        trusted = True
+        if raw:
+            trusted = _coerce_bool(raw.get("trusted"), default=True)
+
+        return _AuthProjection(True, mode, principal, scopes, roles, key_id, policy_digest, authn_strength, trusted, None, raw)
+
+    def to_public_dict(self, *, record_principal: bool, record_key_id: bool) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"mode": self.mode, "trusted": bool(self.trusted)}
+        if self.principal:
+            if record_principal:
+                out["principal"] = self.principal
+            out["principal_hash"] = _hash_token(self.principal, ctx="tcd:grpc:auth:principal", n=16)
+        if self.scopes:
+            out["scopes"] = list(self.scopes[:32])
+        if self.roles:
+            out["roles"] = list(self.roles[:32])
+        if self.key_id:
+            if record_key_id:
+                out["key_id"] = self.key_id
+            out["key_id_hash"] = _hash_token(self.key_id, ctx="tcd:grpc:auth:key", n=16)
+        if self.policy_digest:
+            out["policy_digest"] = self.policy_digest
+        if self.authn_strength:
+            out["authn_strength"] = self.authn_strength
+        if self.reason:
+            out["reason"] = self.reason
+        return out
+
+
+@dataclass(frozen=True)
 class GrpcProtocolCompatPolicy:
-    api_version: str = "grpc.v1"
-    schema_version: str = "1"
+    api_version: str = "grpc.v3"
+    schema_version: str = "3"
     compatibility_epoch: str = "2026-04"
     require_api_version: bool = False
     require_compatibility_epoch: bool = False
@@ -862,8 +760,8 @@ class GrpcProtocolCompatPolicy:
 
     def normalized(self) -> "GrpcProtocolCompatPolicy":
         return GrpcProtocolCompatPolicy(
-            api_version=_safe_text(self.api_version, max_len=32) or "grpc.v1",
-            schema_version=_safe_text(self.schema_version, max_len=16) or "1",
+            api_version=_safe_text(self.api_version, max_len=32) or "grpc.v3",
+            schema_version=_safe_text(self.schema_version, max_len=16) or "3",
             compatibility_epoch=_safe_text(self.compatibility_epoch, max_len=32) or "2026-04",
             require_api_version=bool(self.require_api_version),
             require_compatibility_epoch=bool(self.require_compatibility_epoch),
@@ -1055,7 +953,7 @@ def _subject_part(v: Optional[str], *, policy: SubjectIdentityPolicy) -> Tuple[O
 
 
 def _pseudonymize_subject(*, request_id: str, body_digest: str, peer: GrpcPeerIdentity, cfg_fp: str) -> Tuple[str, str, str]:
-    base = _blake3_hex(
+    base = _blake3_or_sha256(
         _canonical_json_bytes({"rid": request_id, "body": body_digest, "peer": peer.peer_hash, "cfg_fp": cfg_fp}),
         ctx="tcd:grpc:subject",
     )[:18]
@@ -1117,8 +1015,43 @@ def _parse_subject_identity(
     )
 
 
+def _resolve_request_identity(req: Any, context: Any) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    md = _metadata_dict(context)
+    request_id = (
+        _safe_text(md.get("x-request-id") or md.get("request-id") or getattr(req, "request_id", None), max_len=128)
+        or uuid.uuid4().hex[:16]
+    )
+    trace_id = _safe_text(md.get("x-trace-id") or getattr(req, "trace_id", None), max_len=128) or None
+    idem = _safe_text(md.get("idempotency-key") or getattr(req, "idempotency_key", None), max_len=128) or None
+    if idem and not _IDEMPOTENCY_KEY_RE.fullmatch(idem):
+        idem = None
+    principal_hint = _safe_text(md.get("x-principal-id") or getattr(req, "user", None), max_len=128) or None
+    return request_id, trace_id, idem, principal_hint
+
+
+def _enforce_method_authz(auth: _AuthProjection, policy: MethodAuthzPolicy, peer: GrpcPeerIdentity) -> bool:
+    if policy.require_auth and not auth.ok:
+        return False
+    if policy.allowed_auth_modes and auth.mode not in set(policy.allowed_auth_modes):
+        return False
+    if policy.require_mtls and not peer.mtls_present:
+        return False
+    if policy.require_trusted_identity and not auth.trusted:
+        return False
+    if policy.required_scopes:
+        have = set(auth.scopes)
+        for s in policy.required_scopes:
+            if s not in have:
+                return False
+    if policy.required_roles:
+        have_r = set(auth.roles)
+        for r in policy.required_roles:
+            if r not in have_r:
+                return False
+    return True
+
 # ---------------------------------------------------------------------------
-# Executor / breaker / gates
+# Async runner / executors / breakers
 # ---------------------------------------------------------------------------
 
 class _AsyncLoopThread:
@@ -1206,7 +1139,10 @@ class _BoundedExecutor:
         self._sem = threading.BoundedSemaphore(self.capacity)
         self._reserved = 0
         self._reserved_lock = threading.Lock()
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=f"tcd-grpc-{self.pool}")
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix=f"tcd-grpc-{self.pool}",
+        )
         _GRPC_EXEC_RESERVED.labels(self.pool).set(0.0)
 
     def _inc_reserved(self) -> None:
@@ -1294,18 +1230,6 @@ class _CircuitBreaker:
         self._next_probe_at = 0.0
         self._lock = threading.Lock()
         _GRPC_BREAKER_STATE.labels(self.dep).set(float(self._state))
-
-    def snapshot(self) -> Dict[str, Any]:
-        now = time.monotonic()
-        with self._lock:
-            st = self._state
-            open_rem = max(0.0, self._opened_until - now) if st == _BreakerState.OPEN else 0.0
-            probe_rem = max(0.0, self._next_probe_at - now) if st == _BreakerState.HALF_OPEN else 0.0
-        return {
-            "state": {0: "CLOSED", 1: "OPEN", 2: "HALF_OPEN"}.get(st, "UNKNOWN"),
-            "open_remaining_s": round(open_rem, 3),
-            "probe_delay_s": round(probe_rem, 3),
-        }
 
     def before_call(self) -> Tuple[bool, bool]:
         now = time.monotonic()
@@ -1511,9 +1435,8 @@ class _InFlightGate:
             with contextlib.suppress(Exception):
                 self._sema.release()
 
-
 # ---------------------------------------------------------------------------
-# Outbox / registry
+# Durable outbox / control registry
 # ---------------------------------------------------------------------------
 
 class _SQLiteOutbox:
@@ -1523,7 +1446,7 @@ class _SQLiteOutbox:
         self.max_db_bytes = max(1, int(max_db_bytes))
         self.max_payload_bytes = max(1024, int(max_payload_bytes))
         self.drop_policy = str(drop_policy or "drop_oldest").lower()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._init_db()
         with contextlib.suppress(Exception):
@@ -1621,13 +1544,15 @@ class _SQLiteOutbox:
                 return "rejected"
             c = self._conn()
             try:
-                c.execute(
+                cur_insert = c.execute(
                     """
                     INSERT OR IGNORE INTO outbox(kind,dedupe_key,payload_json,payload_digest,conflict_count,attempts,next_ts,created_ts,updated_ts,last_error)
                     VALUES(?,?,?,?,0,0,?,?,?, '')
                     """,
                     (str(kind), str(dedupe_key), payload_json, payload_digest, now, now, now),
                 )
+                inserted = int(getattr(cur_insert, "rowcount", 0) or 0) > 0
+
                 cur = c.execute("SELECT payload_digest, conflict_count FROM outbox WHERE kind=? AND dedupe_key=?", (str(kind), str(dedupe_key)))
                 row = cur.fetchone()
                 if row is None:
@@ -1635,17 +1560,17 @@ class _SQLiteOutbox:
                 old_digest = str(row[0])
                 conflicts = int(row[1] or 0)
                 if old_digest == payload_digest:
-                    return "ignored"
+                    return "queued" if inserted else "ignored"
                 c.execute(
                     """
                     UPDATE outbox
-                    SET payload_json=?, payload_digest=?, conflict_count=?, updated_ts=?, attempts=0, next_ts=?
+                    SET conflict_count=?, updated_ts=?, last_error=?
                     WHERE kind=? AND dedupe_key=?
                     """,
-                    (payload_json, payload_digest, conflicts + 1, now, now, str(kind), str(dedupe_key)),
+                    (conflicts + 1, now, "dedupe_conflict", str(kind), str(dedupe_key)),
                 )
                 _GRPC_OUTBOX_CONFLICT.labels(kind).inc()
-                return "updated"
+                return "conflict"
             finally:
                 c.close()
 
@@ -1770,8 +1695,59 @@ class _SQLiteControlRegistry:
 # Verify worker
 # ---------------------------------------------------------------------------
 
+def _verify_supply_chain_and_pq_from_body(
+    *,
+    receipt_body_json: str,
+    pq_required: bool,
+    runtime_build_id: Optional[str],
+    runtime_image_digest: Optional[str],
+) -> None:
+    try:
+        body_obj = json.loads(receipt_body_json)
+    except Exception:
+        body_obj = None
+    if not isinstance(body_obj, dict):
+        return
+
+    sec_block: Dict[str, Any] = {}
+    comps = body_obj.get("components")
+    if isinstance(comps, dict):
+        sec_candidate = comps.get("security")
+        if isinstance(sec_candidate, dict):
+            sec_block = sec_candidate
+    if not sec_block and isinstance(body_obj.get("security"), dict):
+        sec_block = body_obj["security"]
+
+    pq_required_eff = bool(sec_block.get("pq_required") or body_obj.get("pq_required") or pq_required)
+    pq_ok_eff = sec_block.get("pq_ok")
+    if pq_required_eff and (pq_ok_eff is False or pq_ok_eff is None):
+        raise PermissionError("pq_violation")
+
+    rec_build = _safe_text(sec_block.get("build_id"), max_len=128) if isinstance(sec_block, dict) else None
+    rec_image = _safe_text(sec_block.get("image_digest"), max_len=256) if isinstance(sec_block, dict) else None
+    if runtime_build_id and rec_build and rec_build != runtime_build_id:
+        raise PermissionError("supply_chain_mismatch_build")
+    if runtime_image_digest and rec_image and rec_image != runtime_image_digest:
+        raise PermissionError("supply_chain_mismatch_image")
+
+
+def _verify_report_to_dict(report: Any) -> Dict[str, Any]:
+    return {
+        "head_verified": getattr(report, "head_verified", None),
+        "body_canonical_verified": getattr(report, "body_canonical_verified", None),
+        "integrity_hash_verified": getattr(report, "integrity_hash_verified", None),
+        "signature_verified": getattr(report, "signature_verified", None),
+        "verify_key_allowed": getattr(report, "verify_key_allowed", None),
+        "policy_binding_verified": getattr(report, "policy_binding_verified", None),
+        "cfg_binding_verified": getattr(report, "cfg_binding_verified", None),
+        "integrity_ok": getattr(report, "ok", None),
+        "errors": list(getattr(report, "errors", []) or []),
+        "warnings": list(getattr(report, "warnings", []) or []),
+    }
+
+
 def _verify_worker_entry(args_json_path: str, result_json_path: str) -> None:
-    result: Dict[str, Any] = {"ok": False, "kind": ERR_VERIFY}
+    result: Dict[str, Any] = {"ok": False, "kind": "VERIFY", "report": {}}
     try:
         with open(args_json_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -1780,26 +1756,41 @@ def _verify_worker_entry(args_json_path: str, result_json_path: str) -> None:
             heads = list(payload.get("heads") or [])
             bodies = list(payload.get("bodies") or [])
             ok = bool(verify_chain(heads, bodies))
-            result = {"ok": ok, "kind": "ok" if ok else "verify_false"}
+            result = {"ok": ok, "kind": "ok" if ok else "verify_false", "report": {}}
         elif mode == "receipt":
-            ok = bool(
-                verify_receipt(
-                    receipt_head_hex=str(payload["receipt_head_hex"]),
-                    receipt_body_json=str(payload["receipt_body_json"]),
-                    verify_key_hex=(str(payload["verify_key_hex"]) if payload.get("verify_key_hex") else None),
-                    receipt_sig_hex=(str(payload["receipt_sig_hex"]) if payload.get("receipt_sig_hex") else None),
-                    req_obj=payload.get("req_obj"),
-                    comp_obj=payload.get("comp_obj"),
-                    e_obj=payload.get("e_obj"),
-                    witness_segments=payload.get("witness_segments"),
-                    strict=True,
-                )
+            report = verify_receipt_ex(
+                receipt_head_hex=str(payload["receipt_head_hex"]),
+                receipt_body_json=str(payload["receipt_body_json"]),
+                verify_key_hex=(str(payload["verify_key"]) if payload.get("verify_key") else None),
+                receipt_sig_hex=(str(payload["receipt_sig_hex"]) if payload.get("receipt_sig_hex") else None),
+                req_obj=payload.get("req_obj"),
+                comp_obj=payload.get("comp_obj"),
+                e_obj=payload.get("e_obj"),
+                witness_segments=payload.get("witness_segments"),
+                strict=True,
+                expected_policy_ref=payload.get("expected_policy_ref"),
+                expected_policyset_ref=payload.get("expected_policyset_ref"),
+                expected_policy_digest=payload.get("expected_policy_digest"),
+                expected_cfg_fp=payload.get("expected_cfg_fp"),
+                expected_build_id=payload.get("expected_build_id"),
+                expected_image_digest=payload.get("expected_image_digest"),
+                require_signature=payload.get("require_signature"),
             )
-            result = {"ok": ok, "kind": "ok" if ok else "verify_false"}
+            ok = bool(getattr(report, "ok", False))
+            if ok:
+                _verify_supply_chain_and_pq_from_body(
+                    receipt_body_json=str(payload["receipt_body_json"]),
+                    pq_required=bool(payload.get("pq_required", False)),
+                    runtime_build_id=payload.get("runtime_build_id"),
+                    runtime_image_digest=payload.get("runtime_image_digest"),
+                )
+            result = {"ok": ok, "kind": "ok" if ok else "verify_false", "report": _verify_report_to_dict(report)}
         else:
-            result = {"ok": False, "kind": "bad_input"}
+            result = {"ok": False, "kind": "bad_input", "report": {}}
+    except PermissionError as e:
+        result = {"ok": False, "kind": "permission", "error": _safe_text(e, max_len=256), "report": {}}
     except Exception as e:
-        result = {"ok": False, "kind": "exception", "error": _safe_text(e, max_len=256)}
+        result = {"ok": False, "kind": "exception", "error": _safe_text(e, max_len=256), "report": {}}
     try:
         with open(result_json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, sort_keys=True, ensure_ascii=False)
@@ -1825,18 +1816,18 @@ def _verify_via_process(payload: Mapping[str, Any], *, timeout_s: float, start_m
             if proc.is_alive():
                 with contextlib.suppress(Exception):
                     proc.kill()  # type: ignore[attr-defined]
-            return {"ok": False, "kind": "timeout"}
+            return {"ok": False, "kind": "timeout", "report": {}}
         if not os.path.exists(res_path):
-            return {"ok": False, "kind": "missing_result"}
+            return {"ok": False, "kind": "missing_result", "report": {}}
         with open(res_path, "r", encoding="utf-8") as f:
             out = json.load(f)
-        return out if isinstance(out, dict) else {"ok": False, "kind": "bad_result"}
+        return out if isinstance(out, dict) else {"ok": False, "kind": "bad_result", "report": {}}
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmpdir)
 
 # ---------------------------------------------------------------------------
-# gRPC auth adapter
+# Auth request adapter
 # ---------------------------------------------------------------------------
 
 class _GrpcReceiveOnce:
@@ -1881,76 +1872,6 @@ def _build_request_like_for_auth(*, method_name: str, metadata: Mapping[str, str
     return req
 
 
-@dataclass
-class _AuthProjection:
-    ok: bool
-    mode: str
-    principal: Optional[str]
-    scopes: Tuple[str, ...]
-    roles: Tuple[str, ...]
-    key_id: Optional[str]
-    policy_digest: Optional[str]
-    authn_strength: Optional[str]
-    trusted: bool
-    reason: Optional[str]
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-    @staticmethod
-    def from_auth_result(res: Any) -> "_AuthProjection":
-        if res is None:
-            return _AuthProjection(False, "none", None, tuple(), tuple(), None, None, None, False, "missing")
-        ok = bool(getattr(res, "ok", False))
-        ctx = getattr(res, "ctx", None)
-        if not ok or ctx is None:
-            return _AuthProjection(False, "none", None, tuple(), tuple(), None, None, None, False, getattr(res, "reason", None) or "denied")
-        mode = _normalize_auth_mode(getattr(ctx, "mode", None))
-        principal = _safe_text(getattr(ctx, "principal", None), max_len=256) or None
-        key_id = _safe_text(getattr(ctx, "key_id", None), max_len=128) or None
-        policy_digest = _safe_text(getattr(ctx, "policy_digest", None) or getattr(ctx, "policy_digest_hex", None), max_len=128) or None
-        authn_strength = _safe_text(getattr(ctx, "authn_strength", None), max_len=64) or None
-
-        scopes_raw = getattr(ctx, "scopes", None)
-        roles_raw = getattr(ctx, "roles", None)
-        try:
-            scopes = tuple(sorted({_safe_text(x, max_len=64) for x in list(scopes_raw or []) if _safe_text(x, max_len=64)}))
-        except Exception:
-            scopes = tuple()
-        try:
-            roles = tuple(sorted({_safe_text(x, max_len=64) for x in list(roles_raw or []) if _safe_text(x, max_len=64)}))
-        except Exception:
-            roles = tuple()
-
-        raw = {}
-        raw_ctx = getattr(ctx, "raw", None)
-        if isinstance(raw_ctx, Mapping):
-            raw = {str(k): raw_ctx[k] for k in raw_ctx.keys()}
-
-        trusted = True
-        if raw:
-            trusted = _coerce_bool(raw.get("trusted"), default=True)
-        return _AuthProjection(True, mode, principal, scopes, roles, key_id, policy_digest, authn_strength, trusted, None, raw)
-
-    def to_public_dict(self, *, record_principal: bool, record_key_id: bool) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"mode": self.mode, "trusted": bool(self.trusted)}
-        if self.principal:
-            if record_principal:
-                out["principal"] = self.principal
-            out["principal_hash"] = _hash_token(self.principal, ctx="tcd:grpc:auth:principal", n=16)
-        if self.scopes:
-            out["scopes"] = list(self.scopes[:32])
-        if self.roles:
-            out["roles"] = list(self.roles[:32])
-        if self.key_id:
-            if record_key_id:
-                out["key_id"] = self.key_id
-            out["key_id_hash"] = _hash_token(self.key_id, ctx="tcd:grpc:auth:key", n=16)
-        if self.policy_digest:
-            out["policy_digest"] = self.policy_digest
-        if self.authn_strength:
-            out["authn_strength"] = self.authn_strength
-        return out
-
-
 class GrpcAuthAdapter:
     def __init__(self, *, runtime: "_Runtime") -> None:
         self._rt = runtime
@@ -1972,7 +1893,6 @@ class GrpcAuthAdapter:
         if authn is None:
             return _AuthProjection(False, "none", None, tuple(), tuple(), None, None, None, False, "missing")
 
-        # Preferred native gRPC entrypoints
         for meth_name in ("authenticate_grpc", "verify_grpc"):
             meth = getattr(authn, meth_name, None)
             if not callable(meth):
@@ -1993,7 +1913,7 @@ class GrpcAuthAdapter:
                         "mtls_present": peer.mtls_present,
                     },
                     body_bytes=body_bytes,
-                    body_digest=_blake3_hex(body_bytes, ctx="tcd:grpc:auth:body"),
+                    body_digest=_blake3_or_sha256(body_bytes, ctx="tcd:grpc:auth:body"),
                     request_id=request_id,
                     event_id=event_id,
                     api_version=api_version,
@@ -2052,6 +1972,9 @@ class GrpcAuthAdapter:
         except Exception as e:
             return _AuthProjection(False, "none", None, tuple(), tuple(), None, None, None, False, _safe_text(e, max_len=64))
 
+# ---------------------------------------------------------------------------
+# Detector runtime glue
+# ---------------------------------------------------------------------------
 
 class _GrpcDetectorRuntime:
     def __init__(self) -> None:
@@ -2073,679 +1996,61 @@ class _GrpcDetectorRuntime:
         return {}
 
 
-class SecurityRouterAdapterV3:
-    def __init__(self, router: Any) -> None:
-        self._router = router
+class _DetectorRuntimeUnavailable:
+    def __init__(self, *, reason: str = "formal_detector_unavailable") -> None:
+        self.reason = _safe_text(reason, max_len=128) or "formal_detector_unavailable"
 
-    def route(self, sctx: Any) -> Any:
-        return self._router.route(sctx)
-
-    @staticmethod
-    def to_diagnose_dict(decision: Any) -> Dict[str, Any]:
-        if decision is None:
-            return {}
-        if hasattr(decision, "to_diagnose_out"):
-            with contextlib.suppress(Exception):
-                out = decision.to_diagnose_out()
-                if isinstance(out, Mapping):
-                    return dict(out)
-        return {}
-
-# ---------------------------------------------------------------------------
-# Runtime config
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GrpcServiceConfig:
-    route_name: str = "grpc.diagnose"
-    strict_mode: bool = False
-    max_end_to_end_latency_s: float = 2.0
-
-    protocol: GrpcProtocolCompatPolicy = field(default_factory=GrpcProtocolCompatPolicy)
-    subject_policy: SubjectIdentityPolicy = field(default_factory=SubjectIdentityPolicy)
-    diagnose_authz: MethodAuthzPolicy = field(default_factory=lambda: MethodAuthzPolicy(require_auth=True))
-    verify_authz: MethodAuthzPolicy = field(default_factory=lambda: MethodAuthzPolicy(require_auth=False))
-
-    metadata_allowlist: Tuple[str, ...] = tuple(sorted(_ALLOWED_AUTH_METADATA))
-    max_metadata_items: int = 96
-    max_metadata_bytes: int = 16 * 1024
-
-    max_trace: int = _MAX_TRACE
-    max_spectrum: int = _MAX_SPECT
-    max_features: int = _MAX_FEATS
-    max_proto_bytes: int = 2 * 1024 * 1024
-    max_components_bytes: int = _JSON_COMPONENT_LIMIT
-
-    max_verify_chain_items: int = 4096
-    max_verify_body_bytes: int = 256 * 1024
-    max_verify_total_bytes: int = 8 * 1024 * 1024
-    verify_hard_timeout_mode: str = "thread"  # thread | process
-    verify_process_start_method: str = "spawn"
-
-    max_inflight_diagnose: int = 64
-    max_inflight_verify: int = 16
-    gate_wait_ms: int = 0
-
-    exec_auth_workers: int = 8
-    exec_auth_queue: int = 64
-    exec_verify_workers: int = 4
-    exec_verify_queue: int = 32
-    exec_controller_workers: int = 8
-    exec_controller_queue: int = 64
-    exec_attest_workers: int = 4
-    exec_attest_queue: int = 32
-    exec_ledger_workers: int = 4
-    exec_ledger_queue: int = 64
-
-    auth_timeout_ms: int = 350
-    controller_timeout_ms: int = 1200
-    verify_timeout_ms: int = 5000
-    attestor_timeout_ms: int = 1200
-    ledger_timeout_ms: int = 600
-
-    breaker_failures: int = 5
-    breaker_window_s: float = 30.0
-    breaker_open_seconds: float = 15.0
-    breaker_probe_jitter_s: float = 2.0
-    breaker_probe_probability: float = 0.25
-
-    dep_retry_max: int = 1
-    dep_retry_base_ms: int = 40
-
-    grpc_auth_fallback_mode: str = "compat"
-    allowed_auth_modes: Optional[List[str]] = None
-    allowed_sig_algs: Optional[List[str]] = None
-    require_pq_sig: bool = False
-
-    use_security_router: bool = True
-    require_security_router_when_strict: bool = False
-    pq_required_zones: Tuple[str, ...] = ("admin", "partner")
-
-    require_attestor: bool = False
-    require_ledger: bool = False
-
-    outbox_enabled: bool = True
-    outbox_path: str = "tcd_service_grpc_outbox.sqlite3"
-    outbox_per_process: bool = True
-    outbox_max_payload_bytes: int = 48 * 1024
-    outbox_max_rows: int = 50_000
-    outbox_max_db_bytes: int = 128 * 1024 * 1024
-    outbox_drop_policy: str = "drop_oldest"
-
-    event_registry_path: str = "tcd_service_grpc_registry.sqlite3"
-    replay_ttl_s: int = 900
-
-    edge_rate_capacity: float = 120.0
-    edge_rate_refill_per_s: float = 60.0
-    token_cost_divisor_default: float = 50.0
-
-    node_id: str = ""
-    proc_id: str = ""
-    build_id: str = ""
-    image_digest: str = ""
-
-    record_raw_principal: bool = False
-    record_raw_key_id: bool = False
-    log_requests: bool = True
-    debug_errors: bool = False
-
-    idempotency_time_bucket_s: int = 60
-
-    recommended_server_max_receive_bytes: int = 4 * 1024 * 1024
-    recommended_server_max_send_bytes: int = 4 * 1024 * 1024
-    recommended_max_concurrent_rpcs: int = 256
-
-    def normalized(self) -> "GrpcServiceConfig":
-        cfg = dataclasses.replace(self)
-        cfg.protocol = self.protocol.normalized()
-        cfg.subject_policy = self.subject_policy.normalized()
-        cfg.diagnose_authz = self.diagnose_authz.normalized()
-        cfg.verify_authz = self.verify_authz.normalized()
-        cfg.route_name = _safe_text(self.route_name, max_len=64) or "grpc.diagnose"
-        cfg.strict_mode = bool(self.strict_mode)
-        cfg.max_end_to_end_latency_s = _clamp_float(self.max_end_to_end_latency_s, default=2.0, lo=0.1, hi=60.0)
-
-        cfg.metadata_allowlist = tuple(sorted({x for x in self.metadata_allowlist if isinstance(x, str) and x in _ALLOWED_AUTH_METADATA})) or tuple(sorted(_ALLOWED_AUTH_METADATA))
-        cfg.max_metadata_items = _clamp_int(self.max_metadata_items, default=96, lo=8, hi=1024)
-        cfg.max_metadata_bytes = _clamp_int(self.max_metadata_bytes, default=16 * 1024, lo=512, hi=512 * 1024)
-
-        cfg.max_trace = _clamp_int(self.max_trace, default=_MAX_TRACE, lo=1, hi=65_536)
-        cfg.max_spectrum = _clamp_int(self.max_spectrum, default=_MAX_SPECT, lo=1, hi=65_536)
-        cfg.max_features = _clamp_int(self.max_features, default=_MAX_FEATS, lo=1, hi=65_536)
-        cfg.max_proto_bytes = _clamp_int(self.max_proto_bytes, default=2 * 1024 * 1024, lo=4096, hi=32 * 1024 * 1024)
-        cfg.max_components_bytes = _clamp_int(self.max_components_bytes, default=_JSON_COMPONENT_LIMIT, lo=1024, hi=4 * 1024 * 1024)
-
-        cfg.max_verify_chain_items = _clamp_int(self.max_verify_chain_items, default=4096, lo=1, hi=100_000)
-        cfg.max_verify_body_bytes = _clamp_int(self.max_verify_body_bytes, default=256 * 1024, lo=1024, hi=8 * 1024 * 1024)
-        cfg.max_verify_total_bytes = _clamp_int(self.max_verify_total_bytes, default=8 * 1024 * 1024, lo=4096, hi=128 * 1024 * 1024)
-        cfg.verify_hard_timeout_mode = _safe_text(self.verify_hard_timeout_mode, max_len=16).lower() or "thread"
-        if cfg.verify_hard_timeout_mode not in {"thread", "process"}:
-            cfg.verify_hard_timeout_mode = "thread"
-        cfg.verify_process_start_method = _safe_text(self.verify_process_start_method, max_len=16).lower() or "spawn"
-        if cfg.verify_process_start_method not in {"spawn", "fork", "forkserver"}:
-            cfg.verify_process_start_method = "spawn"
-
-        cfg.max_inflight_diagnose = _clamp_int(self.max_inflight_diagnose, default=64, lo=1, hi=10_000)
-        cfg.max_inflight_verify = _clamp_int(self.max_inflight_verify, default=16, lo=1, hi=10_000)
-        cfg.gate_wait_ms = _clamp_int(self.gate_wait_ms, default=0, lo=0, hi=10_000)
-
-        cfg.exec_auth_workers = _clamp_int(self.exec_auth_workers, default=8, lo=1, hi=512)
-        cfg.exec_auth_queue = _clamp_int(self.exec_auth_queue, default=64, lo=0, hi=100_000)
-        cfg.exec_verify_workers = _clamp_int(self.exec_verify_workers, default=4, lo=1, hi=128)
-        cfg.exec_verify_queue = _clamp_int(self.exec_verify_queue, default=32, lo=0, hi=100_000)
-        cfg.exec_controller_workers = _clamp_int(self.exec_controller_workers, default=8, lo=1, hi=512)
-        cfg.exec_controller_queue = _clamp_int(self.exec_controller_queue, default=64, lo=0, hi=100_000)
-        cfg.exec_attest_workers = _clamp_int(self.exec_attest_workers, default=4, lo=1, hi=128)
-        cfg.exec_attest_queue = _clamp_int(self.exec_attest_queue, default=32, lo=0, hi=100_000)
-        cfg.exec_ledger_workers = _clamp_int(self.exec_ledger_workers, default=4, lo=1, hi=128)
-        cfg.exec_ledger_queue = _clamp_int(self.exec_ledger_queue, default=64, lo=0, hi=100_000)
-
-        cfg.auth_timeout_ms = _clamp_int(self.auth_timeout_ms, default=350, lo=1, hi=60_000)
-        cfg.controller_timeout_ms = _clamp_int(self.controller_timeout_ms, default=1200, lo=1, hi=60_000)
-        cfg.verify_timeout_ms = _clamp_int(self.verify_timeout_ms, default=5000, lo=1, hi=120_000)
-        cfg.attestor_timeout_ms = _clamp_int(self.attestor_timeout_ms, default=1200, lo=1, hi=60_000)
-        cfg.ledger_timeout_ms = _clamp_int(self.ledger_timeout_ms, default=600, lo=1, hi=60_000)
-
-        cfg.breaker_failures = _clamp_int(self.breaker_failures, default=5, lo=1, hi=1000)
-        cfg.breaker_window_s = _clamp_float(self.breaker_window_s, default=30.0, lo=1.0, hi=3600.0)
-        cfg.breaker_open_seconds = _clamp_float(self.breaker_open_seconds, default=15.0, lo=0.1, hi=3600.0)
-        cfg.breaker_probe_jitter_s = _clamp_float(self.breaker_probe_jitter_s, default=2.0, lo=0.0, hi=60.0)
-        cfg.breaker_probe_probability = _clamp_float(self.breaker_probe_probability, default=0.25, lo=0.01, hi=1.0)
-
-        cfg.dep_retry_max = _clamp_int(self.dep_retry_max, default=1, lo=0, hi=8)
-        cfg.dep_retry_base_ms = _clamp_int(self.dep_retry_base_ms, default=40, lo=1, hi=5000)
-
-        cfg.grpc_auth_fallback_mode = _safe_text(self.grpc_auth_fallback_mode, max_len=16).lower() or "compat"
-        if cfg.grpc_auth_fallback_mode not in {"compat", "disabled"}:
-            cfg.grpc_auth_fallback_mode = "compat"
-        cfg.allowed_auth_modes = [m for m in (_normalize_auth_mode(x) for x in (self.allowed_auth_modes or [])) if m != "none"] or None
-        cfg.allowed_sig_algs = [str(x).strip() for x in (self.allowed_sig_algs or []) if str(x).strip()] or None
-        cfg.require_pq_sig = bool(self.require_pq_sig)
-
-        cfg.use_security_router = bool(self.use_security_router)
-        cfg.require_security_router_when_strict = bool(self.require_security_router_when_strict)
-        cfg.pq_required_zones = tuple(sorted({_safe_text(x, max_len=32).lower() for x in self.pq_required_zones if _safe_text(x, max_len=32)})) or ("admin", "partner")
-
-        cfg.require_attestor = bool(self.require_attestor)
-        cfg.require_ledger = bool(self.require_ledger)
-
-        cfg.outbox_enabled = bool(self.outbox_enabled)
-        cfg.outbox_path = _safe_text(self.outbox_path, max_len=512) or "tcd_service_grpc_outbox.sqlite3"
-        cfg.outbox_per_process = bool(self.outbox_per_process)
-        cfg.outbox_max_payload_bytes = _clamp_int(self.outbox_max_payload_bytes, default=48 * 1024, lo=1024, hi=2 * 1024 * 1024)
-        cfg.outbox_max_rows = _clamp_int(self.outbox_max_rows, default=50_000, lo=1, hi=10_000_000)
-        cfg.outbox_max_db_bytes = _clamp_int(self.outbox_max_db_bytes, default=128 * 1024 * 1024, lo=1024 * 1024, hi=8 * 1024 * 1024 * 1024)
-        cfg.outbox_drop_policy = _safe_text(self.outbox_drop_policy, max_len=32).lower() or "drop_oldest"
-        if cfg.outbox_drop_policy not in {"drop_oldest", "drop_newest", "reject_request"}:
-            cfg.outbox_drop_policy = "drop_oldest"
-
-        cfg.event_registry_path = _safe_text(self.event_registry_path, max_len=512) or "tcd_service_grpc_registry.sqlite3"
-        cfg.replay_ttl_s = _clamp_int(self.replay_ttl_s, default=900, lo=1, hi=86400)
-
-        cfg.edge_rate_capacity = _clamp_float(self.edge_rate_capacity, default=120.0, lo=1.0, hi=10_000_000.0)
-        cfg.edge_rate_refill_per_s = _clamp_float(self.edge_rate_refill_per_s, default=60.0, lo=0.1, hi=10_000_000.0)
-        cfg.token_cost_divisor_default = _clamp_float(self.token_cost_divisor_default, default=50.0, lo=1.0, hi=1_000_000.0)
-
-        cfg.node_id = _safe_text(self.node_id, max_len=128)
-        cfg.proc_id = _safe_text(self.proc_id, max_len=64)
-        cfg.build_id = _safe_text(self.build_id, max_len=128)
-        cfg.image_digest = _safe_text(self.image_digest, max_len=128)
-
-        cfg.record_raw_principal = bool(self.record_raw_principal)
-        cfg.record_raw_key_id = bool(self.record_raw_key_id)
-        cfg.log_requests = bool(self.log_requests)
-        cfg.debug_errors = bool(self.debug_errors)
-        cfg.idempotency_time_bucket_s = _clamp_int(self.idempotency_time_bucket_s, default=60, lo=1, hi=86400)
-
-        cfg.recommended_server_max_receive_bytes = _clamp_int(self.recommended_server_max_receive_bytes, default=4 * 1024 * 1024, lo=1024, hi=128 * 1024 * 1024)
-        cfg.recommended_server_max_send_bytes = _clamp_int(self.recommended_server_max_send_bytes, default=4 * 1024 * 1024, lo=1024, hi=128 * 1024 * 1024)
-        cfg.recommended_max_concurrent_rpcs = _clamp_int(self.recommended_max_concurrent_rpcs, default=256, lo=1, hi=100_000)
-
-        return cfg
-
-    def digest_material(self) -> Dict[str, Any]:
-        c = self.normalized()
+    def detect(self, req: Any) -> Dict[str, Any]:
         return {
-            "route_name": c.route_name,
-            "strict_mode": c.strict_mode,
-            "max_end_to_end_latency_s": c.max_end_to_end_latency_s,
-            "protocol": dataclasses.asdict(c.protocol),
-            "subject_policy": dataclasses.asdict(c.subject_policy),
-            "diagnose_authz": dataclasses.asdict(c.diagnose_authz),
-            "verify_authz": dataclasses.asdict(c.verify_authz),
-            "metadata_allowlist": list(c.metadata_allowlist),
-            "max_metadata_items": c.max_metadata_items,
-            "max_metadata_bytes": c.max_metadata_bytes,
-            "max_trace": c.max_trace,
-            "max_spectrum": c.max_spectrum,
-            "max_features": c.max_features,
-            "max_proto_bytes": c.max_proto_bytes,
-            "max_components_bytes": c.max_components_bytes,
-            "max_verify_chain_items": c.max_verify_chain_items,
-            "max_verify_body_bytes": c.max_verify_body_bytes,
-            "max_verify_total_bytes": c.max_verify_total_bytes,
-            "verify_hard_timeout_mode": c.verify_hard_timeout_mode,
-            "verify_process_start_method": c.verify_process_start_method,
-            "max_inflight_diagnose": c.max_inflight_diagnose,
-            "max_inflight_verify": c.max_inflight_verify,
-            "gate_wait_ms": c.gate_wait_ms,
-            "auth_timeout_ms": c.auth_timeout_ms,
-            "controller_timeout_ms": c.controller_timeout_ms,
-            "verify_timeout_ms": c.verify_timeout_ms,
-            "attestor_timeout_ms": c.attestor_timeout_ms,
-            "ledger_timeout_ms": c.ledger_timeout_ms,
-            "breaker_failures": c.breaker_failures,
-            "breaker_window_s": c.breaker_window_s,
-            "breaker_open_seconds": c.breaker_open_seconds,
-            "breaker_probe_jitter_s": c.breaker_probe_jitter_s,
-            "breaker_probe_probability": c.breaker_probe_probability,
-            "dep_retry_max": c.dep_retry_max,
-            "dep_retry_base_ms": c.dep_retry_base_ms,
-            "grpc_auth_fallback_mode": c.grpc_auth_fallback_mode,
-            "allowed_auth_modes": list(c.allowed_auth_modes or []),
-            "allowed_sig_algs": list(c.allowed_sig_algs or []),
-            "require_pq_sig": c.require_pq_sig,
-            "use_security_router": c.use_security_router,
-            "require_security_router_when_strict": c.require_security_router_when_strict,
-            "pq_required_zones": list(c.pq_required_zones),
-            "require_attestor": c.require_attestor,
-            "require_ledger": c.require_ledger,
-            "outbox_enabled": c.outbox_enabled,
-            "outbox_path": c.outbox_path,
-            "outbox_per_process": c.outbox_per_process,
-            "outbox_max_payload_bytes": c.outbox_max_payload_bytes,
-            "outbox_max_rows": c.outbox_max_rows,
-            "outbox_max_db_bytes": c.outbox_max_db_bytes,
-            "outbox_drop_policy": c.outbox_drop_policy,
-            "event_registry_path": c.event_registry_path,
-            "replay_ttl_s": c.replay_ttl_s,
-            "edge_rate_capacity": c.edge_rate_capacity,
-            "edge_rate_refill_per_s": c.edge_rate_refill_per_s,
-            "token_cost_divisor_default": c.token_cost_divisor_default,
-            "node_id": c.node_id,
-            "proc_id": c.proc_id,
-            "build_id": c.build_id,
-            "image_digest": c.image_digest,
-            "record_raw_principal": c.record_raw_principal,
-            "record_raw_key_id": c.record_raw_key_id,
-            "log_requests": c.log_requests,
-            "debug_errors": c.debug_errors,
-            "idempotency_time_bucket_s": c.idempotency_time_bucket_s,
-            "recommended_server_max_receive_bytes": c.recommended_server_max_receive_bytes,
-            "recommended_server_max_send_bytes": c.recommended_server_max_send_bytes,
-            "recommended_max_concurrent_rpcs": c.recommended_max_concurrent_rpcs,
+            "ok": False,
+            "decision": "block",
+            "action_hint": "BLOCK",
+            "reason_code": "FORMAL_DETECTOR_UNAVAILABLE",
+            "error_code": "INTERNAL_ERROR",
+            "score_raw": 1.0,
+            "p_value": 1e-12,
+            "risk": 1.0,
+            "latency_ms": 0.0,
+            "budget_left_ms": 0.0,
+            "engine_version": "detector_unavailable",
+            "config_hash": "detcfg:" + _hash_token(self.reason, ctx="tcd:grpc:detcfg", n=32),
+            "policy_digest": "detpol:" + _hash_token(self.reason, ctx="tcd:grpc:detpol", n=32),
+            "state_digest": "detstate:" + _hash_token(self.reason, ctx="tcd:grpc:detstate", n=32),
+            "decision_id": "detdec:" + _hash_token(self.reason, ctx="tcd:grpc:detdec", n=32),
+            "evidence_hash": "detev:" + _hash_token(self.reason, ctx="tcd:grpc:detev", n=32),
+            "evidence": {"error": self.reason},
         }
 
+    def state_snapshot(self) -> Dict[str, Any]:
+        return {"mode": "unavailable", "reason": self.reason}
 
-def _build_cfg_from_env() -> GrpcServiceConfig:
-    require_auth = _env_bool("TCD_GRPC_REQUIRE_AUTH", True)
-    cfg = GrpcServiceConfig(
-        route_name=os.getenv("TCD_GRPC_ROUTE_NAME", "grpc.diagnose"),
-        strict_mode=_env_bool("TCD_GRPC_STRICT_MODE", False),
-        max_end_to_end_latency_s=_env_float("TCD_GRPC_MAX_E2E_LATENCY_S", 2.0),
+    def snapshot_state(self) -> Dict[str, Any]:
+        return self.state_snapshot()
 
-        protocol=GrpcProtocolCompatPolicy(
-            api_version=os.getenv("TCD_GRPC_API_VERSION", "grpc.v1"),
-            schema_version=os.getenv("TCD_GRPC_SCHEMA_VERSION", "1"),
-            compatibility_epoch=os.getenv("TCD_GRPC_COMPAT_EPOCH", "2026-04"),
-            require_api_version=_env_bool("TCD_GRPC_REQUIRE_API_VERSION", False),
-            require_compatibility_epoch=_env_bool("TCD_GRPC_REQUIRE_COMPAT_EPOCH", False),
-            require_client_capabilities=_env_bool("TCD_GRPC_REQUIRE_CAPS", False),
-            required_capabilities_diagnose=tuple(_split_env_list("TCD_GRPC_REQUIRED_CAPS_DIAGNOSE") or []),
-            required_capabilities_verify=tuple(_split_env_list("TCD_GRPC_REQUIRED_CAPS_VERIFY") or []),
-        ),
-        subject_policy=SubjectIdentityPolicy(
-            allow_pseudonymized_subject=_env_bool("TCD_GRPC_ALLOW_PSEUDONYMIZED_SUBJECT", True),
-            on_missing=os.getenv("TCD_GRPC_SUBJECT_ON_MISSING", "pseudonymize"),
-            on_invalid=os.getenv("TCD_GRPC_SUBJECT_ON_INVALID", "pseudonymize"),
-            max_part_bytes=_env_int("TCD_GRPC_SUBJECT_MAX_PART_BYTES", 128),
-        ),
-        diagnose_authz=MethodAuthzPolicy(
-            require_auth=require_auth,
-            allowed_auth_modes=tuple(_split_env_list("TCD_GRPC_ALLOWED_AUTH_MODES") or []),
-            required_scopes=tuple(_split_env_list("TCD_GRPC_DIAGNOSE_REQUIRED_SCOPES") or []),
-            required_roles=tuple(_split_env_list("TCD_GRPC_DIAGNOSE_REQUIRED_ROLES") or []),
-            require_mtls=_env_bool("TCD_GRPC_DIAGNOSE_REQUIRE_MTLS", False),
-            require_trusted_identity=_env_bool("TCD_GRPC_DIAGNOSE_REQUIRE_TRUSTED_ID", False),
-        ),
-        verify_authz=MethodAuthzPolicy(
-            require_auth=_env_bool("TCD_GRPC_VERIFY_REQUIRE_AUTH", False),
-            allowed_auth_modes=tuple(_split_env_list("TCD_GRPC_VERIFY_ALLOWED_AUTH_MODES") or []),
-            required_scopes=tuple(_split_env_list("TCD_GRPC_VERIFY_REQUIRED_SCOPES") or []),
-            required_roles=tuple(_split_env_list("TCD_GRPC_VERIFY_REQUIRED_ROLES") or []),
-            require_mtls=_env_bool("TCD_GRPC_VERIFY_REQUIRE_MTLS", False),
-            require_trusted_identity=_env_bool("TCD_GRPC_VERIFY_REQUIRE_TRUSTED_ID", False),
-        ),
-
-        max_metadata_items=_env_int("TCD_GRPC_MAX_METADATA_ITEMS", 96),
-        max_metadata_bytes=_env_int("TCD_GRPC_MAX_METADATA_BYTES", 16 * 1024),
-        max_trace=_env_int("TCD_GRPC_MAX_TRACE", _MAX_TRACE),
-        max_spectrum=_env_int("TCD_GRPC_MAX_SPECTRUM", _MAX_SPECT),
-        max_features=_env_int("TCD_GRPC_MAX_FEATURES", _MAX_FEATS),
-        max_proto_bytes=_env_int("TCD_GRPC_MAX_PROTO_BYTES", 2 * 1024 * 1024),
-        max_components_bytes=_env_int("TCD_GRPC_MAX_COMPONENTS_BYTES", _JSON_COMPONENT_LIMIT),
-
-        max_verify_chain_items=_env_int("TCD_GRPC_MAX_VERIFY_CHAIN_ITEMS", 4096),
-        max_verify_body_bytes=_env_int("TCD_GRPC_MAX_VERIFY_BODY_BYTES", 256 * 1024),
-        max_verify_total_bytes=_env_int("TCD_GRPC_MAX_VERIFY_TOTAL_BYTES", 8 * 1024 * 1024),
-        verify_hard_timeout_mode=os.getenv("TCD_GRPC_VERIFY_TIMEOUT_MODE", "thread"),
-        verify_process_start_method=os.getenv("TCD_GRPC_VERIFY_PROCESS_START_METHOD", "spawn"),
-
-        max_inflight_diagnose=_env_int("TCD_GRPC_MAX_INFLIGHT_DIAGNOSE", 64),
-        max_inflight_verify=_env_int("TCD_GRPC_MAX_INFLIGHT_VERIFY", 16),
-        gate_wait_ms=_env_int("TCD_GRPC_GATE_WAIT_MS", 0),
-
-        exec_auth_workers=_env_int("TCD_GRPC_EXEC_AUTH_WORKERS", 8),
-        exec_auth_queue=_env_int("TCD_GRPC_EXEC_AUTH_QUEUE", 64),
-        exec_verify_workers=_env_int("TCD_GRPC_EXEC_VERIFY_WORKERS", 4),
-        exec_verify_queue=_env_int("TCD_GRPC_EXEC_VERIFY_QUEUE", 32),
-        exec_controller_workers=_env_int("TCD_GRPC_EXEC_CONTROLLER_WORKERS", 8),
-        exec_controller_queue=_env_int("TCD_GRPC_EXEC_CONTROLLER_QUEUE", 64),
-        exec_attest_workers=_env_int("TCD_GRPC_EXEC_ATTEST_WORKERS", 4),
-        exec_attest_queue=_env_int("TCD_GRPC_EXEC_ATTEST_QUEUE", 32),
-        exec_ledger_workers=_env_int("TCD_GRPC_EXEC_LEDGER_WORKERS", 4),
-        exec_ledger_queue=_env_int("TCD_GRPC_EXEC_LEDGER_QUEUE", 64),
-
-        auth_timeout_ms=_env_int("TCD_GRPC_AUTH_TIMEOUT_MS", 350),
-        controller_timeout_ms=_env_int("TCD_GRPC_CONTROLLER_TIMEOUT_MS", 1200),
-        verify_timeout_ms=_env_int("TCD_GRPC_VERIFY_TIMEOUT_MS", 5000),
-        attestor_timeout_ms=_env_int("TCD_GRPC_ATTESTOR_TIMEOUT_MS", 1200),
-        ledger_timeout_ms=_env_int("TCD_GRPC_LEDGER_TIMEOUT_MS", 600),
-
-        breaker_failures=_env_int("TCD_GRPC_BREAKER_FAILURES", 5),
-        breaker_window_s=_env_float("TCD_GRPC_BREAKER_WINDOW_S", 30.0),
-        breaker_open_seconds=_env_float("TCD_GRPC_BREAKER_OPEN_SECONDS", 15.0),
-        breaker_probe_jitter_s=_env_float("TCD_GRPC_BREAKER_PROBE_JITTER_S", 2.0),
-        breaker_probe_probability=_env_float("TCD_GRPC_BREAKER_PROBE_PROBABILITY", 0.25),
-
-        dep_retry_max=_env_int("TCD_GRPC_DEP_RETRY_MAX", 1),
-        dep_retry_base_ms=_env_int("TCD_GRPC_DEP_RETRY_BASE_MS", 40),
-
-        grpc_auth_fallback_mode=os.getenv("TCD_GRPC_AUTH_FALLBACK_MODE", "compat"),
-        allowed_auth_modes=_split_env_list("TCD_GRPC_ALLOWED_AUTH_MODES"),
-        allowed_sig_algs=_split_env_list("TCD_GRPC_ALLOWED_SIG_ALGS"),
-        require_pq_sig=_env_bool("TCD_GRPC_REQUIRE_PQ_SIG", False),
-
-        use_security_router=_env_bool("TCD_GRPC_USE_SECURITY_ROUTER", True),
-        require_security_router_when_strict=_env_bool("TCD_GRPC_REQUIRE_SECURITY_ROUTER_WHEN_STRICT", False),
-        pq_required_zones=tuple(_split_env_list("TCD_GRPC_PQ_REQUIRED_ZONES") or ("admin", "partner")),
-
-        require_attestor=_env_bool("TCD_GRPC_REQUIRE_ATTESTOR", False),
-        require_ledger=_env_bool("TCD_GRPC_REQUIRE_LEDGER", False),
-
-        outbox_enabled=_env_bool("TCD_GRPC_OUTBOX_ENABLED", True),
-        outbox_path=os.getenv("TCD_GRPC_OUTBOX_PATH", "tcd_service_grpc_outbox.sqlite3"),
-        outbox_per_process=_env_bool("TCD_GRPC_OUTBOX_PER_PROCESS", True),
-        outbox_max_payload_bytes=_env_int("TCD_GRPC_OUTBOX_MAX_PAYLOAD_BYTES", 48 * 1024),
-        outbox_max_rows=_env_int("TCD_GRPC_OUTBOX_MAX_ROWS", 50_000),
-        outbox_max_db_bytes=_env_int("TCD_GRPC_OUTBOX_MAX_DB_BYTES", 128 * 1024 * 1024),
-        outbox_drop_policy=os.getenv("TCD_GRPC_OUTBOX_DROP_POLICY", "drop_oldest"),
-
-        event_registry_path=os.getenv("TCD_GRPC_EVENT_REGISTRY_PATH", "tcd_service_grpc_registry.sqlite3"),
-        replay_ttl_s=_env_int("TCD_GRPC_REPLAY_TTL_S", 900),
-
-        edge_rate_capacity=_env_float("TCD_GRPC_RATE_CAPACITY", 120.0),
-        edge_rate_refill_per_s=_env_float("TCD_GRPC_RATE_REFILL_PER_S", 60.0),
-        token_cost_divisor_default=_env_float("TCD_GRPC_TOKEN_COST_DIVISOR_DEFAULT", 50.0),
-
-        node_id=os.getenv("TCD_NODE_ID", os.getenv("HOSTNAME", ""))[:128],
-        proc_id=os.getenv("TCD_PROC_ID", str(os.getpid()))[:64],
-        build_id=os.getenv("TCD_BUILD_ID", "")[:128],
-        image_digest=os.getenv("TCD_IMAGE_DIGEST", "")[:128],
-
-        record_raw_principal=_env_bool("TCD_GRPC_RECORD_RAW_PRINCIPAL", False),
-        record_raw_key_id=_env_bool("TCD_GRPC_RECORD_RAW_KEY_ID", False),
-        log_requests=_env_bool("TCD_GRPC_LOG_REQUESTS", True),
-        debug_errors=_env_bool("TCD_GRPC_DEBUG_ERRORS", False),
-
-        idempotency_time_bucket_s=_env_int("TCD_GRPC_IDEMPOTENCY_BUCKET_S", 60),
-        recommended_server_max_receive_bytes=_env_int("TCD_GRPC_SERVER_MAX_RECV", 4 * 1024 * 1024),
-        recommended_server_max_send_bytes=_env_int("TCD_GRPC_SERVER_MAX_SEND", 4 * 1024 * 1024),
-        recommended_max_concurrent_rpcs=_env_int("TCD_GRPC_SERVER_MAX_CONCURRENT_RPCS", 256),
-    )
-
-    cfg = cfg.normalized()
-    if cfg.outbox_enabled and cfg.outbox_per_process:
-        p = cfg.outbox_path
-        if "{pid}" in p or "{proc_id}" in p:
-            p = p.replace("{pid}", str(os.getpid())).replace("{proc_id}", cfg.proc_id or str(os.getpid()))
-        else:
-            p = f"{p}.{os.getpid()}"
-        cfg.outbox_path = p
-    return cfg
-
-# ---------------------------------------------------------------------------
-# Security router glue
-# ---------------------------------------------------------------------------
-
-class _SecurityAuditSinkAdapter:
-    def __init__(self, ledger: Any) -> None:
-        self._ledger = ledger
-
-    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Optional[str]:
-        if self._ledger is None:
-            return None
-        record = {"kind": "grpc_security_audit", "event_type": str(event_type), "payload": dict(payload)}
-        try:
-            if hasattr(self._ledger, "append_ex"):
-                out = self._ledger.append_ex(record, stage="event")  # type: ignore[attr-defined]
-                return getattr(out, "head", None) or None
-            out2 = self._ledger.append(record)  # type: ignore[attr-defined]
-            return getattr(out2, "head", None) if out2 is not None else None
-        except Exception:
-            return None
-
-
-class _Runtime:
-    def __init__(
-        self,
-        *,
-        cfg: Optional[GrpcServiceConfig] = None,
-        prom: Optional[TCDPrometheusExporter] = None,
-        otel: Optional[TCDOtelExporter] = None,
-        policy_store: Optional[Any] = None,
-        rate_limiter: Optional[Any] = None,
-        authenticator: Optional[Any] = None,
-        attestor: Optional[Any] = None,
-        attestor_cfg: Optional[Any] = None,
-        ledger: Optional[Any] = None,
-        outbox: Optional[_SQLiteOutbox] = None,
-        security_router: Optional[Any] = None,
-        strategy_router: Optional[Any] = None,
-    ) -> None:
-        self.settings = _settings.get()
-        self.cfg = (cfg or _build_cfg_from_env()).normalized()
-        self.cfg_fp = self._compute_cfg_digest(self.cfg)
-
-        self.node_id = self.cfg.node_id or _safe_text(getattr(self.settings, "node_id", ""), max_len=128)
-        self.proc_id = self.cfg.proc_id or str(os.getpid())
-        self.build_id = self.cfg.build_id or _safe_text(getattr(self.settings, "build_id", ""), max_len=128)
-        self.image_digest = self.cfg.image_digest or _safe_text(getattr(self.settings, "image_digest", ""), max_len=128)
-
-        self.prom = prom or TCDPrometheusExporter(
-            port=int(getattr(self.settings, "prometheus_port", 8001) or 8001),
-            version=str(getattr(self.settings, "version", "0.0.0") or "0.0.0"),
-            config_hash=self.cfg_fp,
-        )
-        if bool(getattr(self.settings, "prom_http_enable", False)):
-            with contextlib.suppress(Exception):
-                self.prom.ensure_server()
-
-        self.otel = otel or TCDOtelExporter(endpoint=getattr(self.settings, "otel_endpoint", None))
-        self.async_runner = _AsyncLoopThread()
-
-        self.det_lock = threading.RLock()
-        self.detectors: Dict[Tuple[str, str, str, str], TraceCollapseDetector] = {}
-        self.av_lock = threading.RLock()
-        self.av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = {}
-        self.mv_lock = threading.RLock()
-        self.mv_by_model: Dict[str, MultiVarDetector] = {}
-
-        self.exec_auth = _BoundedExecutor(pool="auth", max_workers=self.cfg.exec_auth_workers, max_queue=self.cfg.exec_auth_queue)
-        self.exec_verify = _BoundedExecutor(pool="verify", max_workers=self.cfg.exec_verify_workers, max_queue=self.cfg.exec_verify_queue)
-        self.exec_controller = _BoundedExecutor(pool="controller", max_workers=self.cfg.exec_controller_workers, max_queue=self.cfg.exec_controller_queue)
-        self.exec_attest = _BoundedExecutor(pool="attest", max_workers=self.cfg.exec_attest_workers, max_queue=self.cfg.exec_attest_queue)
-        self.exec_ledger = _BoundedExecutor(pool="ledger", max_workers=self.cfg.exec_ledger_workers, max_queue=self.cfg.exec_ledger_queue)
-
-        self.br_auth = _CircuitBreaker(
-            dep="auth",
-            threshold=self.cfg.breaker_failures,
-            window_s=self.cfg.breaker_window_s,
-            open_seconds=self.cfg.breaker_open_seconds,
-            probe_jitter_s=self.cfg.breaker_probe_jitter_s,
-            probe_probability=self.cfg.breaker_probe_probability,
-        )
-        self.br_verify = _CircuitBreaker(
-            dep="verify",
-            threshold=self.cfg.breaker_failures,
-            window_s=self.cfg.breaker_window_s,
-            open_seconds=self.cfg.breaker_open_seconds,
-            probe_jitter_s=self.cfg.breaker_probe_jitter_s,
-            probe_probability=self.cfg.breaker_probe_probability,
-        )
-        self.br_controller = _CircuitBreaker(
-            dep="controller",
-            threshold=self.cfg.breaker_failures,
-            window_s=self.cfg.breaker_window_s,
-            open_seconds=self.cfg.breaker_open_seconds,
-            probe_jitter_s=self.cfg.breaker_probe_jitter_s,
-            probe_probability=self.cfg.breaker_probe_probability,
-        )
-        self.br_attestor = _CircuitBreaker(
-            dep="attestor",
-            threshold=self.cfg.breaker_failures,
-            window_s=self.cfg.breaker_window_s,
-            open_seconds=self.cfg.breaker_open_seconds,
-            probe_jitter_s=self.cfg.breaker_probe_jitter_s,
-            probe_probability=self.cfg.breaker_probe_probability,
-        )
-        self.br_ledger = _CircuitBreaker(
-            dep="ledger",
-            threshold=self.cfg.breaker_failures,
-            window_s=self.cfg.breaker_window_s,
-            open_seconds=self.cfg.breaker_open_seconds,
-            probe_jitter_s=self.cfg.breaker_probe_jitter_s,
-            probe_probability=self.cfg.breaker_probe_probability,
-        )
-
-        self.gate_diagnose = _InFlightGate("Diagnose", self.cfg.max_inflight_diagnose)
-        self.gate_verify = _InFlightGate("Verify", self.cfg.max_inflight_verify)
-
-        self.rate_limiter = rate_limiter or self._build_rate_limiter()
-
-        self.authenticator = authenticator
-        if self.authenticator is None and build_authenticator_from_env is not None:
-            with contextlib.suppress(Exception):
-                self.authenticator = build_authenticator_from_env()
-
-        self.attestor_cfg = attestor_cfg
-        self.attestor = attestor
-        if self.attestor is None and Attestor is not None and AttestorConfig is not None:
-            with contextlib.suppress(Exception):
-                self.attestor_cfg = AttestorConfig(
-                    attestor_id="tcd-grpc",
-                    proc_id=self.proc_id or None,
-                    strict_mode=self.cfg.strict_mode,
-                    default_auth_policy=None,
-                    default_chain_policy=None,
-                    default_ledger_policy=None,
-                    default_cfg_digest=self.cfg_fp,
-                )
-                self.attestor = Attestor(cfg=self.attestor_cfg)
-
-        self.ledger = ledger
-        if self.ledger is None and AuditLedger is not None:
-            with contextlib.suppress(Exception):
-                self.ledger = AuditLedger()
-
-        self.outbox = outbox
-        if self.outbox is None and self.cfg.outbox_enabled:
-            with contextlib.suppress(Exception):
-                self.outbox = _SQLiteOutbox(
-                    self.cfg.outbox_path,
-                    max_rows=self.cfg.outbox_max_rows,
-                    max_db_bytes=self.cfg.outbox_max_db_bytes,
-                    max_payload_bytes=self.cfg.outbox_max_payload_bytes,
-                    drop_policy=self.cfg.outbox_drop_policy,
-                )
-
-        self.registry = _SQLiteControlRegistry(self.cfg.event_registry_path, replay_ttl_s=self.cfg.replay_ttl_s)
-
-        self.strategy_router = strategy_router or StrategyRouter()
-        self.detector_adapter = _GrpcDetectorRuntime()
-
-        self.security_router = security_router
-        if self.security_router is None and self.cfg.use_security_router and policy_store is not None and SecurityRouter is not None:
-            self.security_router = self._build_security_router(policy_store)
-
-        self.auth_adapter = GrpcAuthAdapter(runtime=self)
-
-    def _compute_cfg_digest(self, cfg: GrpcServiceConfig) -> str:
-        if canonical_kv_hash is not None:
-            with contextlib.suppress(Exception):
-                return canonical_kv_hash(cfg.digest_material(), ctx="tcd:service_grpc_cfg", label="grpc_cfg")
-        return _blake3_hex(_canonical_json_bytes(cfg.digest_material()), ctx="tcd:service_grpc_cfg")
-
-    def _build_rate_limiter(self) -> Any:
-        with contextlib.suppress(Exception):
-            if RateLimitConfig is not Any and RateLimitZoneConfig is not Any:
-                rlc = RateLimitConfig(
-                    zones={"default": RateLimitZoneConfig(capacity=self.cfg.edge_rate_capacity, refill_per_s=self.cfg.edge_rate_refill_per_s)},
-                    default_zone="default",
-                )
-                return RateLimiter(rlc)
-        try:
-            return RateLimiter(capacity=self.cfg.edge_rate_capacity, refill_per_s=self.cfg.edge_rate_refill_per_s)  # type: ignore[call-arg]
-        except Exception:
-            return RateLimiter()  # type: ignore[call-arg]
-
-    def _build_security_router(self, policy_store: Any) -> Optional[Any]:
-        if SecurityRouter is None:
-            return None
-        candidates = [
-            {
-                "policy_store": policy_store,
-                "rate_limiter": self.rate_limiter,
-                "attestor": self.attestor,
-                "detector_runtime": self.detector_adapter,
-                "base_av": AlwaysValidConfig(),
-                "strategy_router": self.strategy_router,
-                "audit_sink": _SecurityAuditSinkAdapter(self.ledger) if self.ledger is not None else None,
-            },
-            {
-                "policy_store": policy_store,
-                "rate_limiter": self.rate_limiter,
-                "attestor": self.attestor,
-                "detector_runtime": self.detector_adapter,
-                "base_av": AlwaysValidConfig(),
-                "strategy_router": self.strategy_router,
-            },
-            {
-                "policy_store": policy_store,
-                "rate_limiter": self.rate_limiter,
-                "attestor": self.attestor,
-                "detector_runtime": self.detector_adapter,
-                "base_av": AlwaysValidConfig(),
-            },
-            {
-                "policy_store": policy_store,
-                "rate_limiter": self.rate_limiter,
-                "attestor": self.attestor,
-                "detector_runtime": self.detector_adapter,
-            },
-        ]
-        for kwargs in candidates:
-            try:
-                return SecurityRouter(**kwargs)
-            except Exception:
-                continue
+    def load_state(self, state: Mapping[str, Any]) -> None:
         return None
 
-    def get_detector(self, key: Tuple[str, str, str, str]) -> TraceCollapseDetector:
+
+@dataclass
+class DetectorRegistry:
+    settings: Any
+    det_lock: threading.RLock = field(default_factory=threading.RLock)
+    av_lock: threading.RLock = field(default_factory=threading.RLock)
+    mv_lock: threading.RLock = field(default_factory=threading.RLock)
+    detectors: Dict[Tuple[str, str, str, str], Any] = field(default_factory=dict)
+    av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = field(default_factory=dict)
+    mv_by_model: Dict[str, MultiVarDetector] = field(default_factory=dict)
+
+    def get_detector_runtime(self, key: Tuple[str, str, str, str]) -> Any:
         with self.det_lock:
             inst = self.detectors.get(key)
             if inst is None:
-                inst = TraceCollapseDetector(config=TCDConfig())
+                inst = None
+                if callable(build_default_detector):
+                    with contextlib.suppress(Exception):
+                        inst = build_default_detector()
+                if inst is None:
+                    inst = _DetectorRuntimeUnavailable(reason="formal_detector_build_failed")
                 self.detectors[key] = inst
             return inst
 
@@ -2753,12 +2058,8 @@ class _Runtime:
         with self.av_lock:
             inst = self.av_by_subject.get(subject)
             if inst is None:
-                cfg = AlwaysValidConfig(
-                    alpha_base=float(getattr(self.settings, "alpha", 0.05) or 0.05),
-                    label="grpc",
-                    policyset_ref=getattr(self.settings, "policyset_ref", None),
-                )
-                inst = AlwaysValidRiskController(config=cfg)
+                alpha = float(getattr(self.settings, "alpha", 0.05) or 0.05)
+                inst = AlwaysValidRiskController(AlwaysValidConfig(alpha_base=alpha))
                 self.av_by_subject[subject] = inst
             return inst
 
@@ -2770,118 +2071,275 @@ class _Runtime:
                 self.mv_by_model[model_id] = inst
             return inst
 
-    def shutdown(self) -> None:
-        for ex in (self.exec_auth, self.exec_verify, self.exec_controller, self.exec_attest, self.exec_ledger):
-            with contextlib.suppress(Exception):
-                ex.shutdown()
+
+def _build_detector_compat_text(
+    req: Any,
+    *,
+    trace_vec: Sequence[float],
+    spectrum: Sequence[float],
+    features: Sequence[float],
+    http_cfg: ServiceHttpConfig,
+) -> Optional[str]:
+    ctx = getattr(req, "context", None)
+    if isinstance(ctx, Mapping):
+        raw_text = _safe_text(ctx.get("detector_text"), max_len=16_384)
+        if raw_text:
+            return raw_text
+    if not http_cfg.allow_detector_text_synthesis_for_compat:
+        return None
+    payload = {
+        "trace_vector": [round(float(x), 6) for x in list(trace_vec)[:256]],
+        "entropy": _coerce_float(getattr(req, "entropy", None)),
+        "spectrum": [round(float(x), 6) for x in list(spectrum)[:256]],
+        "features": [round(float(x), 6) for x in list(features)[:256]],
+        "task": _safe_text(getattr(req, "task", None), max_len=64),
+        "gpu_id": _safe_text(getattr(req, "gpu_id", None), max_len=64),
+        "drift_score": _coerce_float(getattr(req, "drift_score", None)),
+        "step_id": _coerce_int(getattr(req, "step_id", None)),
+        "context": _safe_context_subset(dict(ctx or {})) if isinstance(ctx, Mapping) else {},
+    }
+    txt = _bounded_json_dumps(payload, max_bytes=16_384)
+    return txt if txt != "{}" else None
+
+
+def _make_detector_request(
+    req: Any,
+    *,
+    trace_vec: Sequence[float],
+    spectrum: Sequence[float],
+    features: Sequence[float],
+    http_cfg: ServiceHttpConfig,
+) -> Any:
+    if DetectRequest is None:
+        return None
+    detector_text = _build_detector_compat_text(req, trace_vec=trace_vec, spectrum=spectrum, features=features, http_cfg=http_cfg)
+    if not detector_text:
+        return None
+    ctx = getattr(req, "context", None)
+    meta = {
+        "entropy": _coerce_float(getattr(req, "entropy", None)),
+        "step_id": _coerce_int(getattr(req, "step_id", None)),
+        "task": _safe_text(getattr(req, "task", None), max_len=64),
+        "gpu_id": _safe_text(getattr(req, "gpu_id", None), max_len=64),
+        "trust_zone": _safe_text(getattr(req, "trust_zone", None), max_len=32),
+        "route_profile": _safe_text(getattr(req, "route_profile", None), max_len=32),
+        "risk_label": _safe_text(getattr(req, "risk_label", None), max_len=32),
+        "drift_score": _coerce_float(getattr(req, "drift_score", None)),
+        "trace_len": len(trace_vec),
+        "spectrum_len": len(spectrum),
+        "feature_len": len(features),
+        "context": _safe_context_subset(dict(ctx or {})) if isinstance(ctx, Mapping) else {},
+    }
+    kwargs = {
+        "tenant": _safe_text(getattr(req, "tenant", None), max_len=128) or "tenant0",
+        "user": _safe_text(getattr(req, "user", None), max_len=128) or "user0",
+        "session": _safe_text(getattr(req, "session", None), max_len=128) or "sess0",
+        "model_id": _safe_text(getattr(req, "model_id", None), max_len=128) or "model0",
+        "lang": _safe_text(getattr(req, "lang", None), max_len=32) or "en",
+        "kind": "completion",
+        "text": detector_text,
+        "meta": meta,
+    }
+    with contextlib.suppress(Exception):
+        return DetectRequest(**kwargs)
+    return None
+
+
+def _normalize_detector_runtime_out(out: Any) -> Dict[str, Any]:
+    if out is None:
+        return {}
+    if isinstance(out, Mapping):
+        return dict(out)
+    if hasattr(out, "model_dump"):
         with contextlib.suppress(Exception):
-            self.async_runner.stop()
+            dumped = out.model_dump()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+    if dataclasses.is_dataclass(out):
+        with contextlib.suppress(Exception):
+            dumped = dataclasses.asdict(out)
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+    return {}
 
-    def dod(self) -> GrpcServiceDOD:
-        return GrpcServiceDOD(
-            schema="grpc.dod.v1",
-            light_rpc_p95_ms=200,
-            light_rpc_p99_ms=1000,
-            heavy_rpc_p95_ms=1200,
-            heavy_rpc_p99_ms=5000,
-            max_proto_bytes=int(self.cfg.max_proto_bytes),
-            max_metadata_bytes=int(self.cfg.max_metadata_bytes),
-            max_verify_total_bytes=int(self.cfg.max_verify_total_bytes),
-            consistency_level="local_best_effort_with_deterministic_event_identity",
-            evidence_delivery="prepare_commit_with_outbox_fallback",
-            verify_isolation=self.cfg.verify_hard_timeout_mode,
-        )
 
-    def runtime_public_view(self) -> Dict[str, Any]:
-        sec_public = None
-        sec_diag = None
-        if self.security_router is not None:
-            with contextlib.suppress(Exception):
-                pub = getattr(self.security_router, "public_config_view", None)
-                if callable(pub):
-                    sec_public = _model_dump(pub())
-            with contextlib.suppress(Exception):
-                diag = getattr(self.security_router, "bundle_diagnostics", None)
-                if callable(diag):
-                    sec_diag = _model_dump(diag())
+def _detector_runtime_to_verdict_pack(out: Any, *, step_id: Optional[int]) -> Dict[str, Any]:
+    raw = _normalize_detector_runtime_out(out)
+    if not raw:
         return {
-            "schema": "grpc.runtime.v1",
-            "cfg_fp": self.cfg_fp,
-            "node_id": self.node_id,
-            "proc_id": self.proc_id,
-            "build_id": self.build_id,
-            "image_digest": self.image_digest,
-            "api_version": self.cfg.protocol.api_version,
-            "schema_version": self.cfg.protocol.schema_version,
-            "compatibility_epoch": self.cfg.protocol.compatibility_epoch,
-            "dod": dataclasses.asdict(self.dod()),
-            "security_router": {"public": sec_public, "diagnostics": sec_diag},
+            "verdict": True,
+            "score": 1.0,
+            "risk": 1.0,
+            "p_value": 1e-12,
+            "decision": "block",
+            "action": "block",
+            "step": int(step_id or 0),
+            "components": {"reason": "detector_runtime_empty"},
         }
 
-# ---------------------------------------------------------------------------
-# Global runtime
-# ---------------------------------------------------------------------------
+    decision = _safe_text(raw.get("decision"), max_len=32).lower()
+    if decision not in {"allow", "throttle", "block"}:
+        decision = "block" if not _coerce_bool(raw.get("ok"), default=True) else "allow"
 
-_RUNTIME: Optional[_Runtime] = None
-_RUNTIME_LOCK = threading.Lock()
+    action = "degrade" if decision == "throttle" else decision
+
+    risk = _coerce_float(raw.get("risk"))
+    if risk is None:
+        risk = _coerce_float(raw.get("score"))
+    if risk is None:
+        risk = _coerce_float(raw.get("score_raw"))
+    if risk is None:
+        risk = 1.0 if decision != "allow" else 0.0
+    risk = max(0.0, min(1.0, float(risk)))
+
+    p_value = _coerce_float(raw.get("p_value"))
+    if p_value is None:
+        p_value = max(1e-12, min(1.0, 1.0 - risk))
+    p_value = max(1e-12, min(1.0, float(p_value)))
+
+    components = {
+        "detector_runtime": True,
+        "decision": decision,
+        "action": action,
+        "action_hint": _safe_text(raw.get("action_hint"), max_len=32) or None,
+        "reason_code": _safe_text(raw.get("reason_code"), max_len=128) or None,
+        "error_code": _safe_text(raw.get("error_code"), max_len=128) or None,
+        "risk": risk,
+        "p_value": p_value,
+        "score_raw": _coerce_float(raw.get("score_raw")),
+        "latency_ms": _coerce_float(raw.get("latency_ms")),
+        "budget_left_ms": _coerce_float(raw.get("budget_left_ms")),
+        "engine_version": _safe_text(raw.get("engine_version"), max_len=64) or None,
+        "config_hash": _safe_text(raw.get("config_hash"), max_len=128) or None,
+        "policy_digest": _safe_text(raw.get("policy_digest"), max_len=128) or None,
+        "state_digest": _safe_text(raw.get("state_digest"), max_len=128) or None,
+        "decision_id": _safe_text(raw.get("decision_id"), max_len=128) or None,
+        "evidence_hash": _safe_text(raw.get("evidence_hash"), max_len=128) or None,
+        "thresholds": raw.get("thresholds") if isinstance(raw.get("thresholds"), Mapping) else {},
+        "calibrator": raw.get("calibrator") if isinstance(raw.get("calibrator"), Mapping) else {},
+        "calibrator_state": raw.get("calibrator_state") if isinstance(raw.get("calibrator_state"), Mapping) else {},
+        "model": raw.get("model") if isinstance(raw.get("model"), Mapping) else {},
+        "evidence": raw.get("evidence") if isinstance(raw.get("evidence"), Mapping) else {},
+    }
+
+    return {
+        "verdict": decision != "allow",
+        "score": risk,
+        "risk": risk,
+        "p_value": p_value,
+        "decision": decision,
+        "action": action,
+        "reason_code": _safe_text(raw.get("reason_code"), max_len=128) or None,
+        "error_code": _safe_text(raw.get("error_code"), max_len=128) or None,
+        "decision_id": _safe_text(raw.get("decision_id"), max_len=128) or None,
+        "config_hash": _safe_text(raw.get("config_hash"), max_len=128) or None,
+        "policy_digest": _safe_text(raw.get("policy_digest"), max_len=128) or None,
+        "state_digest": _safe_text(raw.get("state_digest"), max_len=128) or None,
+        "step": int(step_id or 0),
+        "components": components,
+    }
 
 
-def _rt() -> _Runtime:
-    global _RUNTIME
-    with _RUNTIME_LOCK:
-        if _RUNTIME is None:
-            _RUNTIME = _Runtime()
-        return _RUNTIME
-
-
-def create_grpc_runtime(
+def _run_detector_runtime(
+    det: Any,
     *,
-    cfg: Optional[GrpcServiceConfig] = None,
-    prom: Optional[TCDPrometheusExporter] = None,
-    otel: Optional[TCDOtelExporter] = None,
-    policy_store: Optional[Any] = None,
-    rate_limiter: Optional[Any] = None,
-    authenticator: Optional[Any] = None,
-    attestor: Optional[Any] = None,
-    attestor_cfg: Optional[Any] = None,
-    ledger: Optional[Any] = None,
-    outbox: Optional[_SQLiteOutbox] = None,
-    security_router: Optional[Any] = None,
-    strategy_router: Optional[Any] = None,
-) -> _Runtime:
-    return _Runtime(
-        cfg=cfg,
-        prom=prom,
-        otel=otel,
-        policy_store=policy_store,
-        rate_limiter=rate_limiter,
-        authenticator=authenticator,
-        attestor=attestor,
-        attestor_cfg=attestor_cfg,
-        ledger=ledger,
-        outbox=outbox,
-        security_router=security_router,
-        strategy_router=strategy_router,
+    req: Any,
+    trace_vec: Sequence[float],
+    spectrum: Sequence[float],
+    features: Sequence[float],
+    http_cfg: ServiceHttpConfig,
+) -> Dict[str, Any]:
+    detect_fn = getattr(det, "detect", None)
+    if callable(detect_fn):
+        dreq = _make_detector_request(req, trace_vec=trace_vec, spectrum=spectrum, features=features, http_cfg=http_cfg)
+        if dreq is not None:
+            with contextlib.suppress(Exception):
+                return _detector_runtime_to_verdict_pack(detect_fn(dreq), step_id=_coerce_int(getattr(req, "step_id", None)))
+        return {
+            "verdict": True,
+            "score": 1.0,
+            "risk": 1.0,
+            "p_value": 1e-12,
+            "decision": "block",
+            "action": "block",
+            "step": int(_coerce_int(getattr(req, "step_id", None)) or 0),
+            "reason_code": "FORMAL_DETECTOR_INPUT_UNAVAILABLE",
+            "components": {"reason": "formal_detector_input_unavailable"},
+        }
+
+    diagnose_fn = getattr(det, "diagnose", None)
+    if callable(diagnose_fn):
+        with contextlib.suppress(Exception):
+            vp = diagnose_fn(trace_vec, _coerce_float(getattr(req, "entropy", None)), spectrum, step_id=_coerce_int(getattr(req, "step_id", None)))
+            if isinstance(vp, Mapping):
+                out = dict(vp)
+                if "p_value" not in out:
+                    score0 = float(_coerce_float(out.get("score")) or 0.0)
+                    out["p_value"] = max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score0))))
+                if "action" not in out:
+                    out["action"] = "block" if _coerce_bool(out.get("verdict"), default=False) else "allow"
+                if "risk" not in out and _coerce_float(out.get("score")) is not None:
+                    out["risk"] = float(_coerce_float(out.get("score")) or 0.0)
+                return out
+
+    return {
+        "verdict": True,
+        "score": 1.0,
+        "risk": 1.0,
+        "p_value": 1e-12,
+        "decision": "block",
+        "action": "block",
+        "step": int(_coerce_int(getattr(req, "step_id", None)) or 0),
+        "components": {"reason": "detector_runtime_unavailable"},
+    }
+
+
+def _extract_detector_signal(verdict_pack: Mapping[str, Any]) -> Dict[str, Any]:
+    decision = _safe_text(verdict_pack.get("decision"), max_len=32).lower()
+    action = _safe_text(verdict_pack.get("action"), max_len=32).lower()
+    if decision not in {"allow", "throttle", "block"}:
+        decision = ""
+    if action not in {"allow", "degrade", "block", "deny", "advisory"}:
+        if decision == "throttle":
+            action = "degrade"
+        elif decision == "block":
+            action = "block"
+        else:
+            action = "allow"
+
+    risk_score = _coerce_float(verdict_pack.get("risk"))
+    if risk_score is None:
+        risk_score = _coerce_float(verdict_pack.get("score"))
+    if risk_score is None:
+        risk_score = 1.0 if _coerce_bool(verdict_pack.get("verdict"), default=False) else 0.0
+    risk_score = max(0.0, min(1.0, float(risk_score)))
+
+    p_value = _coerce_float(verdict_pack.get("p_value"))
+    if p_value is None:
+        p_value = max(1e-12, min(1.0, 1.0 - risk_score))
+    p_value = max(1e-12, min(1.0, float(p_value)))
+
+    decision_fail = bool(
+        _coerce_bool(verdict_pack.get("verdict"), default=False)
+        or decision in {"block", "throttle"}
+        or action in {"block", "degrade", "deny", "advisory"}
     )
-
-
-def grpc_supported() -> bool:
-    return bool(_HAS_GRPC and _HAS_STUBS)
-
-
-def grpc_server_options(cfg: Optional[GrpcServiceConfig] = None) -> Tuple[Tuple[str, int], ...]:
-    c = (cfg or _build_cfg_from_env()).normalized()
-    return (
-        ("grpc.max_receive_message_length", int(c.recommended_server_max_receive_bytes)),
-        ("grpc.max_send_message_length", int(c.recommended_server_max_send_bytes)),
-        ("grpc.max_concurrent_streams", int(c.recommended_max_concurrent_rpcs)),
-        ("grpc.keepalive_time_ms", 30_000),
-        ("grpc.keepalive_timeout_ms", 10_000),
-        ("grpc.http2.max_pings_without_data", 0),
-    )
+    return {
+        "decision": decision,
+        "action": action,
+        "risk_score": risk_score,
+        "p_value": p_value,
+        "decision_fail": decision_fail,
+        "reason_code": _safe_text(verdict_pack.get("reason_code"), max_len=128) or None,
+        "error_code": _safe_text(verdict_pack.get("error_code"), max_len=128) or None,
+        "decision_id": _safe_text(verdict_pack.get("decision_id"), max_len=128) or None,
+        "config_hash": _safe_text(verdict_pack.get("config_hash"), max_len=128) or None,
+        "policy_digest": _safe_text(verdict_pack.get("policy_digest"), max_len=128) or None,
+        "state_digest": _safe_text(verdict_pack.get("state_digest"), max_len=128) or None,
+    }
 
 # ---------------------------------------------------------------------------
-# Shared service helpers
+# Request / security / routing helpers
 # ---------------------------------------------------------------------------
 
 def _request_summary_digest(req: Any, *, method_name: str, sec_ctx: Mapping[str, Any]) -> str:
@@ -2900,7 +2358,7 @@ def _request_summary_digest(req: Any, *, method_name: str, sec_ctx: Mapping[str,
         "trust_zone": sec_ctx.get("trust_zone"),
         "route_profile": sec_ctx.get("route_profile"),
     }
-    return _blake3_hex(_canonical_json_bytes(payload), ctx="tcd:grpc:reqsum")
+    return _blake3_or_sha256(_canonical_json_bytes(payload), ctx="tcd:grpc:reqsum")
 
 
 def _derive_event_id(
@@ -2932,7 +2390,7 @@ def _derive_event_id(
             "body_digest": body_digest,
             "bucket": bucket,
         }
-    return "gev2:" + _blake3_hex(_canonical_json_bytes(payload), ctx="tcd:grpc:event")[:40]
+    return "gev3:" + _blake3_or_sha256(_canonical_json_bytes(payload), ctx="tcd:grpc:event")[:40]
 
 
 def _event_fingerprint(
@@ -2950,10 +2408,10 @@ def _event_fingerprint(
         "body_digest": body_digest,
         "request_digest": canonical_request_digest,
     }
-    return _blake3_hex(_canonical_json_bytes(payload), ctx="tcd:grpc:event_fingerprint")
+    return _blake3_or_sha256(_canonical_json_bytes(payload), ctx="tcd:grpc:event_fingerprint")
 
 
-def _normalize_security_context(context: Any, req: Any, cfg: GrpcServiceConfig) -> Dict[str, Any]:
+def _normalize_security_context(context: Any, req: Any, cfg: "GrpcServiceConfig") -> Dict[str, Any]:
     md = _metadata_dict(context)
     trust_zone = md.get("x-trust-zone") or getattr(req, "trust_zone", "") or "internet"
     route_profile = md.get("x-route-profile") or getattr(req, "route_profile", "") or "inference"
@@ -3007,9 +2465,9 @@ def _normalize_security_context(context: Any, req: Any, cfg: GrpcServiceConfig) 
     }
 
 
-def _rate_limit_cost(cfg: GrpcServiceConfig, sec_ctx: Mapping[str, Any], req: Any, threat_kind: Optional[str], threat_conf: Optional[float]) -> float:
+def _rate_limit_cost(cfg: "GrpcServiceConfig", sec_ctx: Mapping[str, Any], req: Any, threat_kind: Optional[str], threat_conf: Optional[float]) -> float:
     tokens_delta = float(getattr(req, "tokens_delta", 0.0) or 0.0)
-    divisor = float(cfg.token_cost_divisor_default or 50.0)
+    divisor = float(cfg.http_contract.tokens_divisor_default or cfg.token_cost_divisor_default or 50.0)
     base_cost = max(1.0, tokens_delta / max(1.0, divisor))
     tz = sec_ctx.get("trust_zone")
     mult = 1.0
@@ -3025,7 +2483,7 @@ def _rate_limit_cost(cfg: GrpcServiceConfig, sec_ctx: Mapping[str, Any], req: An
     return cost
 
 
-def _consume_rate(rt: _Runtime, *, subject: Tuple[str, str, str], principal_id: Optional[str], model_id: str, cost: float) -> bool:
+def _consume_rate(rt: "_Runtime", *, subject: Tuple[str, str, str], principal_id: Optional[str], model_id: str, cost: float) -> bool:
     try:
         if RateKey is not Any:
             rk = RateKey(
@@ -3047,15 +2505,6 @@ def _consume_rate(rt: _Runtime, *, subject: Tuple[str, str, str], principal_id: 
             return True
 
 
-def _decision_to_action(decision: Any) -> str:
-    req_action = _safe_text(getattr(decision, "required_action", ""), max_len=32).lower()
-    if req_action == "block":
-        return "block"
-    if req_action == "degrade":
-        return "degrade"
-    return "none"
-
-
 def _manual_route_action(route: Any, decision_fail: bool, *, threat_kind: Optional[str], threat_conf: Optional[float], pq_required: bool, pq_ok: Optional[bool]) -> str:
     req_action = _safe_text(getattr(route, "required_action", ""), max_len=32).lower() if route is not None else ""
     if req_action == "block":
@@ -3071,41 +2520,848 @@ def _manual_route_action(route: Any, decision_fail: bool, *, threat_kind: Option
     return "none"
 
 
-def _receipt_public_from_mapping(att: Mapping[str, Any]) -> Dict[str, Any]:
-    out = {
-        "head": att.get("receipt") or att.get("receipt_ref"),
-        "receipt_ref": att.get("receipt_ref") or att.get("receipt"),
-        "audit_ref": att.get("audit_ref"),
-        "event_id": att.get("event_id"),
-        "decision_id": att.get("decision_id"),
-        "route_plan_id": att.get("route_plan_id"),
-        "policy_ref": att.get("policy_ref"),
-        "policyset_ref": att.get("policyset_ref"),
-        "cfg_fp": att.get("cfg_fp"),
-        "state_domain_id": att.get("state_domain_id"),
-        "verify_key_id": att.get("verify_key_id") or att.get("sig_key_id"),
-        "verify_key_fp": att.get("verify_key_fp"),
-        "receipt_integrity": att.get("receipt_integrity"),
-        "pq_signature_required": att.get("pq_signature_required"),
-        "pq_signature_ok": att.get("pq_signature_ok"),
-        "integrity_ok": att.get("integrity_ok", True),
-        "integrity_errors": list(att.get("integrity_errors", ()) or ()),
+def _build_synthetic_route_contract(
+    *,
+    req: Any,
+    request_id: str,
+    event_id: str,
+    score: float,
+    decision_fail: bool,
+    av_trigger: bool,
+    controller_mode: Optional[str],
+    guarantee_scope: Optional[str],
+    av_label: Optional[str],
+    threat_kind: Optional[str],
+    cfg_fp: str,
+    bundle_version: int,
+    strict_mode: bool,
+) -> Dict[str, Any]:
+    threat_conf = _coerce_float(getattr(req, "threat_confidence", None)) or 0.0
+    required_action = "block" if (
+        decision_fail
+        and (
+            (_safe_text(getattr(req, "risk_label", None), max_len=32).lower() == "critical")
+            or (threat_kind in {"apt", "supply_chain"} and threat_conf >= 0.9)
+        )
+    ) else ("degrade" if (decision_fail or strict_mode) else "allow")
+    return {
+        "schema": "tcd.route.synthetic.v1",
+        "router": "tcd.service_grpc",
+        "version": "1.0.0",
+        "config_fingerprint": cfg_fp,
+        "bundle_version": bundle_version,
+        "router_mode": "degraded",
+        "route_id_kind": "plan",
+        "route_plan_id": "rp1:sha256:" + _blake3_or_sha256(_canonical_json_bytes({"event_id": event_id, "reason": "route_unavailable"}), ctx="tcd:grpc:route_plan")[:32],
+        "route_id": None,
+        "decision_id": "rd1:sha256:" + _blake3_or_sha256(_canonical_json_bytes({"event_id": event_id, "reason": "route_unavailable"}), ctx="tcd:grpc:route_decision")[:32],
+        "decision_ts_unix_ns": time.time_ns(),
+        "decision_ts_mono_ns": time.monotonic_ns(),
+        "safety_tier": "strict" if required_action == "block" else ("elevated" if required_action == "degrade" else "normal"),
+        "required_action": required_action,
+        "action_hint": required_action,
+        "enforcement_mode": "fail_closed" if required_action == "block" else ("must_enforce" if (required_action != "allow" and strict_mode) else "advisory"),
+        "temperature": 0.2 if required_action == "block" else (0.4 if required_action == "degrade" else float(_coerce_float(getattr(req, "base_temp", None)) or 0.7)),
+        "top_p": 0.4 if required_action == "block" else (0.6 if required_action == "degrade" else float(_coerce_float(getattr(req, "base_top_p", None)) or 0.9)),
+        "decoder": "safe" if required_action != "allow" else "default",
+        "latency_hint": "high_safety" if required_action != "allow" else "normal",
+        "trust_zone": _safe_text(getattr(req, "trust_zone", None), max_len=32).lower() or "internet",
+        "route_profile": _safe_text(getattr(req, "route_profile", None), max_len=32).lower() or "inference",
+        "risk_label": _safe_text(getattr(req, "risk_label", None), max_len=32).lower() or "normal",
+        "score": score,
+        "decision_fail": decision_fail,
+        "e_triggered": av_trigger,
+        "pq_unhealthy": False,
+        "av_label": av_label,
+        "av_trigger": av_trigger,
+        "threat_tags": [threat_kind] if threat_kind else [],
+        "controller_mode": controller_mode,
+        "guarantee_scope": guarantee_scope,
+        "signal_digest": "sg1:sha256:" + _blake3_or_sha256(_canonical_json_bytes({"score": score, "decision_fail": decision_fail, "e_triggered": av_trigger, "threat_kind": threat_kind}), ctx="tcd:grpc:signal")[:32],
+        "context_digest": "cx1:sha256:" + _blake3_or_sha256(_canonical_json_bytes({"request_id": request_id, "trust_zone": getattr(req, 'trust_zone', 'internet'), "route_profile": getattr(req, 'route_profile', 'inference')}), ctx="tcd:grpc:context")[:32],
+        "primary_reason_code": "ROUTE_UNAVAILABLE",
+        "reason_codes": ["ROUTE_UNAVAILABLE"],
+        "degraded_reason_codes": ["ROUTE_UNAVAILABLE"],
+        "reason": "route_unavailable",
     }
-    if ReceiptPublicView is not None:
+
+# ---------------------------------------------------------------------------
+# Runtime config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GrpcServiceConfig:
+    http_contract: ServiceHttpConfig = field(default_factory=lambda: _build_http_cfg_from_env()[0].normalized_copy())
+    verify_limits: VerifyLimits = field(default_factory=lambda: _build_http_cfg_from_env()[1].normalized_copy())
+
+    protocol: GrpcProtocolCompatPolicy = field(default_factory=GrpcProtocolCompatPolicy)
+    subject_policy: SubjectIdentityPolicy = field(default_factory=SubjectIdentityPolicy)
+    diagnose_authz: MethodAuthzPolicy = field(default_factory=lambda: MethodAuthzPolicy(require_auth=True))
+    verify_authz: MethodAuthzPolicy = field(default_factory=lambda: MethodAuthzPolicy(require_auth=False))
+
+    metadata_allowlist: Tuple[str, ...] = tuple(sorted(_ALLOWED_AUTH_METADATA))
+    max_metadata_items: int = _DEFAULT_MAX_METADATA_ITEMS
+    max_metadata_bytes: int = _DEFAULT_MAX_METADATA_BYTES
+    max_proto_bytes: int = _DEFAULT_MAX_PROTO_BYTES
+    max_components_bytes: int = _JSON_COMPONENT_LIMIT
+
+    verify_hard_timeout_mode: str = "thread"   # thread | process
+    verify_process_start_method: str = "spawn"
+
+    max_inflight_diagnose: int = 64
+    max_inflight_verify: int = 16
+    gate_wait_ms: int = 0
+
+    exec_auth_workers: int = 8
+    exec_auth_queue: int = 64
+    exec_verify_workers: int = 4
+    exec_verify_queue: int = 32
+    exec_controller_workers: int = 8
+    exec_controller_queue: int = 64
+    exec_attest_workers: int = 4
+    exec_attest_queue: int = 32
+    exec_ledger_workers: int = 4
+    exec_ledger_queue: int = 64
+
+    auth_timeout_ms: int = 350
+    controller_timeout_ms: int = 1200
+    verify_timeout_ms: int = 5000
+    attestor_timeout_ms: int = 1200
+    ledger_timeout_ms: int = 600
+
+    breaker_failures: int = 5
+    breaker_window_s: float = 30.0
+    breaker_open_seconds: float = 15.0
+    breaker_probe_jitter_s: float = 2.0
+    breaker_probe_probability: float = 0.25
+
+    dep_retry_max: int = 1
+    dep_retry_base_ms: int = 40
+
+    use_security_router: bool = True
+    require_security_router_when_strict: bool = False
+    pq_required_zones: Tuple[str, ...] = ("admin", "partner")
+    require_attestor: bool = False
+    require_ledger: bool = False
+
+    outbox_enabled: bool = True
+    outbox_path: str = "tcd_service_grpc_outbox.sqlite3"
+    outbox_per_process: bool = True
+    outbox_max_payload_bytes: int = 48 * 1024
+    outbox_max_rows: int = 50_000
+    outbox_max_db_bytes: int = 128 * 1024 * 1024
+    outbox_drop_policy: str = "drop_oldest"
+
+    event_registry_path: str = "tcd_service_grpc_registry.sqlite3"
+    replay_ttl_s: int = 900
+
+    edge_rate_capacity: float = 120.0
+    edge_rate_refill_per_s: float = 60.0
+    token_cost_divisor_default: float = 50.0
+
+    grpc_auth_fallback_mode: str = "compat"
+    allowed_auth_modes: Optional[List[str]] = None
+    allowed_sig_algs: Optional[List[str]] = None
+    require_pq_sig: bool = False
+
+    node_id: str = ""
+    proc_id: str = ""
+    build_id: str = ""
+    image_digest: str = ""
+    record_raw_principal: bool = False
+    record_raw_key_id: bool = False
+    log_requests: bool = True
+    debug_errors: bool = False
+    idempotency_time_bucket_s: int = 60
+
+    recommended_server_max_receive_bytes: int = 4 * 1024 * 1024
+    recommended_server_max_send_bytes: int = 4 * 1024 * 1024
+    recommended_max_concurrent_rpcs: int = 256
+
+    def normalized(self) -> "GrpcServiceConfig":
+        cfg = dataclasses.replace(self)
+        cfg.http_contract = self.http_contract.normalized_copy()
+        cfg.verify_limits = self.verify_limits.normalized_copy()
+        cfg.protocol = self.protocol.normalized()
+        cfg.subject_policy = self.subject_policy.normalized()
+        cfg.diagnose_authz = self.diagnose_authz.normalized()
+        cfg.verify_authz = self.verify_authz.normalized()
+
+        cfg.metadata_allowlist = tuple(sorted({x for x in self.metadata_allowlist if isinstance(x, str) and x in _ALLOWED_AUTH_METADATA})) or tuple(sorted(_ALLOWED_AUTH_METADATA))
+        cfg.max_metadata_items = _clamp_int(self.max_metadata_items, default=_DEFAULT_MAX_METADATA_ITEMS, lo=8, hi=1024)
+        cfg.max_metadata_bytes = _clamp_int(self.max_metadata_bytes, default=_DEFAULT_MAX_METADATA_BYTES, lo=512, hi=512 * 1024)
+        cfg.max_proto_bytes = _clamp_int(self.max_proto_bytes, default=_DEFAULT_MAX_PROTO_BYTES, lo=4096, hi=64 * 1024 * 1024)
+        cfg.max_components_bytes = _clamp_int(self.max_components_bytes, default=_JSON_COMPONENT_LIMIT, lo=1024, hi=4 * 1024 * 1024)
+
+        cfg.verify_hard_timeout_mode = _safe_text(self.verify_hard_timeout_mode, max_len=16).lower() or "thread"
+        if cfg.verify_hard_timeout_mode not in {"thread", "process"}:
+            cfg.verify_hard_timeout_mode = "thread"
+        cfg.verify_process_start_method = _safe_text(self.verify_process_start_method, max_len=16).lower() or "spawn"
+        if cfg.verify_process_start_method not in {"spawn", "fork", "forkserver"}:
+            cfg.verify_process_start_method = "spawn"
+
+        cfg.max_inflight_diagnose = _clamp_int(self.max_inflight_diagnose, default=64, lo=1, hi=10_000)
+        cfg.max_inflight_verify = _clamp_int(self.max_inflight_verify, default=16, lo=1, hi=10_000)
+        cfg.gate_wait_ms = _clamp_int(self.gate_wait_ms, default=0, lo=0, hi=10_000)
+
+        cfg.exec_auth_workers = _clamp_int(self.exec_auth_workers, default=8, lo=1, hi=512)
+        cfg.exec_auth_queue = _clamp_int(self.exec_auth_queue, default=64, lo=0, hi=100_000)
+        cfg.exec_verify_workers = _clamp_int(self.exec_verify_workers, default=4, lo=1, hi=128)
+        cfg.exec_verify_queue = _clamp_int(self.exec_verify_queue, default=32, lo=0, hi=100_000)
+        cfg.exec_controller_workers = _clamp_int(self.exec_controller_workers, default=8, lo=1, hi=512)
+        cfg.exec_controller_queue = _clamp_int(self.exec_controller_queue, default=64, lo=0, hi=100_000)
+        cfg.exec_attest_workers = _clamp_int(self.exec_attest_workers, default=4, lo=1, hi=128)
+        cfg.exec_attest_queue = _clamp_int(self.exec_attest_queue, default=32, lo=0, hi=100_000)
+        cfg.exec_ledger_workers = _clamp_int(self.exec_ledger_workers, default=4, lo=1, hi=128)
+        cfg.exec_ledger_queue = _clamp_int(self.exec_ledger_queue, default=64, lo=0, hi=100_000)
+
+        cfg.auth_timeout_ms = _clamp_int(self.auth_timeout_ms, default=350, lo=1, hi=60_000)
+        cfg.controller_timeout_ms = _clamp_int(self.controller_timeout_ms, default=1200, lo=1, hi=60_000)
+        cfg.verify_timeout_ms = _clamp_int(self.verify_timeout_ms, default=5000, lo=1, hi=120_000)
+        cfg.attestor_timeout_ms = _clamp_int(self.attestor_timeout_ms, default=1200, lo=1, hi=60_000)
+        cfg.ledger_timeout_ms = _clamp_int(self.ledger_timeout_ms, default=600, lo=1, hi=60_000)
+
+        cfg.breaker_failures = _clamp_int(self.breaker_failures, default=5, lo=1, hi=1000)
+        cfg.breaker_window_s = _clamp_float(self.breaker_window_s, default=30.0, lo=1.0, hi=3600.0)
+        cfg.breaker_open_seconds = _clamp_float(self.breaker_open_seconds, default=15.0, lo=0.1, hi=3600.0)
+        cfg.breaker_probe_jitter_s = _clamp_float(self.breaker_probe_jitter_s, default=2.0, lo=0.0, hi=60.0)
+        cfg.breaker_probe_probability = _clamp_float(self.breaker_probe_probability, default=0.25, lo=0.01, hi=1.0)
+
+        cfg.dep_retry_max = _clamp_int(self.dep_retry_max, default=1, lo=0, hi=8)
+        cfg.dep_retry_base_ms = _clamp_int(self.dep_retry_base_ms, default=40, lo=1, hi=5000)
+
+        cfg.use_security_router = bool(self.use_security_router)
+        cfg.require_security_router_when_strict = bool(self.require_security_router_when_strict)
+        cfg.pq_required_zones = tuple(sorted({_safe_text(x, max_len=32).lower() for x in self.pq_required_zones if _safe_text(x, max_len=32)})) or ("admin", "partner")
+        cfg.require_attestor = bool(self.require_attestor)
+        cfg.require_ledger = bool(self.require_ledger)
+
+        cfg.outbox_enabled = bool(self.outbox_enabled)
+        cfg.outbox_path = _safe_text(self.outbox_path, max_len=512) or "tcd_service_grpc_outbox.sqlite3"
+        cfg.outbox_per_process = bool(self.outbox_per_process)
+        cfg.outbox_max_payload_bytes = _clamp_int(self.outbox_max_payload_bytes, default=48 * 1024, lo=1024, hi=2 * 1024 * 1024)
+        cfg.outbox_max_rows = _clamp_int(self.outbox_max_rows, default=50_000, lo=1, hi=10_000_000)
+        cfg.outbox_max_db_bytes = _clamp_int(self.outbox_max_db_bytes, default=128 * 1024 * 1024, lo=1024 * 1024, hi=8 * 1024 * 1024 * 1024)
+        cfg.outbox_drop_policy = _safe_text(self.outbox_drop_policy, max_len=32).lower() or "drop_oldest"
+        if cfg.outbox_drop_policy not in {"drop_oldest", "drop_newest", "reject_request"}:
+            cfg.outbox_drop_policy = "drop_oldest"
+
+        cfg.event_registry_path = _safe_text(self.event_registry_path, max_len=512) or "tcd_service_grpc_registry.sqlite3"
+        cfg.replay_ttl_s = _clamp_int(self.replay_ttl_s, default=900, lo=1, hi=86400)
+
+        cfg.edge_rate_capacity = _clamp_float(self.edge_rate_capacity, default=120.0, lo=1.0, hi=10_000_000.0)
+        cfg.edge_rate_refill_per_s = _clamp_float(self.edge_rate_refill_per_s, default=60.0, lo=0.1, hi=10_000_000.0)
+        cfg.token_cost_divisor_default = _clamp_float(self.token_cost_divisor_default, default=50.0, lo=1.0, hi=10_000_000.0)
+
+        cfg.grpc_auth_fallback_mode = _safe_text(self.grpc_auth_fallback_mode, max_len=16).lower() or "compat"
+        if cfg.grpc_auth_fallback_mode not in {"compat", "disabled"}:
+            cfg.grpc_auth_fallback_mode = "compat"
+        cfg.allowed_auth_modes = [m for m in (_normalize_auth_mode(x) for x in (self.allowed_auth_modes or [])) if m != "none"] or None
+        cfg.allowed_sig_algs = [str(x).strip() for x in (self.allowed_sig_algs or []) if str(x).strip()] or None
+        cfg.require_pq_sig = bool(self.require_pq_sig)
+
+        cfg.node_id = _safe_text(self.node_id, max_len=128)
+        cfg.proc_id = _safe_text(self.proc_id, max_len=64)
+        cfg.build_id = _safe_text(self.build_id, max_len=128)
+        cfg.image_digest = _safe_text(self.image_digest, max_len=256)
+        cfg.record_raw_principal = bool(self.record_raw_principal)
+        cfg.record_raw_key_id = bool(self.record_raw_key_id)
+        cfg.log_requests = bool(self.log_requests)
+        cfg.debug_errors = bool(self.debug_errors)
+        cfg.idempotency_time_bucket_s = _clamp_int(self.idempotency_time_bucket_s, default=60, lo=1, hi=86400)
+
+        cfg.recommended_server_max_receive_bytes = _clamp_int(self.recommended_server_max_receive_bytes, default=4 * 1024 * 1024, lo=1024, hi=128 * 1024 * 1024)
+        cfg.recommended_server_max_send_bytes = _clamp_int(self.recommended_server_max_send_bytes, default=4 * 1024 * 1024, lo=1024, hi=128 * 1024 * 1024)
+        cfg.recommended_max_concurrent_rpcs = _clamp_int(self.recommended_max_concurrent_rpcs, default=256, lo=1, hi=100_000)
+
+        return cfg
+
+    def digest_material(self) -> Dict[str, Any]:
+        c = self.normalized()
+        return {
+            "http_contract_fp": c.http_contract.fingerprint(),
+            "verify_limits": dataclasses.asdict(c.verify_limits),
+            "protocol": dataclasses.asdict(c.protocol),
+            "subject_policy": dataclasses.asdict(c.subject_policy),
+            "diagnose_authz": dataclasses.asdict(c.diagnose_authz),
+            "verify_authz": dataclasses.asdict(c.verify_authz),
+            "metadata_allowlist": list(c.metadata_allowlist),
+            "max_metadata_items": c.max_metadata_items,
+            "max_metadata_bytes": c.max_metadata_bytes,
+            "max_proto_bytes": c.max_proto_bytes,
+            "max_components_bytes": c.max_components_bytes,
+            "verify_hard_timeout_mode": c.verify_hard_timeout_mode,
+            "verify_process_start_method": c.verify_process_start_method,
+            "max_inflight_diagnose": c.max_inflight_diagnose,
+            "max_inflight_verify": c.max_inflight_verify,
+            "gate_wait_ms": c.gate_wait_ms,
+            "exec_auth_workers": c.exec_auth_workers,
+            "exec_auth_queue": c.exec_auth_queue,
+            "exec_verify_workers": c.exec_verify_workers,
+            "exec_verify_queue": c.exec_verify_queue,
+            "exec_controller_workers": c.exec_controller_workers,
+            "exec_controller_queue": c.exec_controller_queue,
+            "exec_attest_workers": c.exec_attest_workers,
+            "exec_attest_queue": c.exec_attest_queue,
+            "exec_ledger_workers": c.exec_ledger_workers,
+            "exec_ledger_queue": c.exec_ledger_queue,
+            "auth_timeout_ms": c.auth_timeout_ms,
+            "controller_timeout_ms": c.controller_timeout_ms,
+            "verify_timeout_ms": c.verify_timeout_ms,
+            "attestor_timeout_ms": c.attestor_timeout_ms,
+            "ledger_timeout_ms": c.ledger_timeout_ms,
+            "breaker_failures": c.breaker_failures,
+            "breaker_window_s": c.breaker_window_s,
+            "breaker_open_seconds": c.breaker_open_seconds,
+            "breaker_probe_jitter_s": c.breaker_probe_jitter_s,
+            "breaker_probe_probability": c.breaker_probe_probability,
+            "dep_retry_max": c.dep_retry_max,
+            "dep_retry_base_ms": c.dep_retry_base_ms,
+            "use_security_router": c.use_security_router,
+            "require_security_router_when_strict": c.require_security_router_when_strict,
+            "pq_required_zones": list(c.pq_required_zones),
+            "require_attestor": c.require_attestor,
+            "require_ledger": c.require_ledger,
+            "outbox_enabled": c.outbox_enabled,
+            "outbox_path": c.outbox_path,
+            "outbox_per_process": c.outbox_per_process,
+            "outbox_max_payload_bytes": c.outbox_max_payload_bytes,
+            "outbox_max_rows": c.outbox_max_rows,
+            "outbox_max_db_bytes": c.outbox_max_db_bytes,
+            "outbox_drop_policy": c.outbox_drop_policy,
+            "event_registry_path": c.event_registry_path,
+            "replay_ttl_s": c.replay_ttl_s,
+            "edge_rate_capacity": c.edge_rate_capacity,
+            "edge_rate_refill_per_s": c.edge_rate_refill_per_s,
+            "token_cost_divisor_default": c.token_cost_divisor_default,
+            "grpc_auth_fallback_mode": c.grpc_auth_fallback_mode,
+            "allowed_auth_modes": list(c.allowed_auth_modes or []),
+            "allowed_sig_algs": list(c.allowed_sig_algs or []),
+            "require_pq_sig": c.require_pq_sig,
+            "node_id": c.node_id,
+            "proc_id": c.proc_id,
+            "build_id": c.build_id,
+            "image_digest": c.image_digest,
+            "record_raw_principal": c.record_raw_principal,
+            "record_raw_key_id": c.record_raw_key_id,
+            "log_requests": c.log_requests,
+            "debug_errors": c.debug_errors,
+            "idempotency_time_bucket_s": c.idempotency_time_bucket_s,
+            "recommended_server_max_receive_bytes": c.recommended_server_max_receive_bytes,
+            "recommended_server_max_send_bytes": c.recommended_server_max_send_bytes,
+            "recommended_max_concurrent_rpcs": c.recommended_max_concurrent_rpcs,
+        }
+
+
+def _build_cfg_from_env() -> GrpcServiceConfig:
+    http_cfg, verify_limits = _build_http_cfg_from_env()
+    cfg = GrpcServiceConfig(
+        http_contract=http_cfg,
+        verify_limits=verify_limits,
+        protocol=GrpcProtocolCompatPolicy(
+            api_version=os.getenv("TCD_GRPC_API_VERSION", "grpc.v3"),
+            schema_version=os.getenv("TCD_GRPC_SCHEMA_VERSION", "3"),
+            compatibility_epoch=os.getenv("TCD_GRPC_COMPAT_EPOCH", "2026-04"),
+            require_api_version=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_API_VERSION"), default=False),
+            require_compatibility_epoch=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_COMPAT_EPOCH"), default=False),
+            require_client_capabilities=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_CAPS"), default=False),
+            required_capabilities_diagnose=tuple([x.strip() for x in (os.getenv("TCD_GRPC_REQUIRED_CAPS_DIAGNOSE", "") or "").split(",") if x.strip()]),
+            required_capabilities_verify=tuple([x.strip() for x in (os.getenv("TCD_GRPC_REQUIRED_CAPS_VERIFY", "") or "").split(",") if x.strip()]),
+        ),
+        subject_policy=SubjectIdentityPolicy(
+            allow_pseudonymized_subject=_coerce_bool(os.getenv("TCD_GRPC_ALLOW_PSEUDONYMIZED_SUBJECT"), default=True),
+            on_missing=os.getenv("TCD_GRPC_SUBJECT_ON_MISSING", "pseudonymize"),
+            on_invalid=os.getenv("TCD_GRPC_SUBJECT_ON_INVALID", "pseudonymize"),
+            max_part_bytes=_coerce_int(os.getenv("TCD_GRPC_SUBJECT_MAX_PART_BYTES")) or 128,
+        ),
+        diagnose_authz=MethodAuthzPolicy(
+            require_auth=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_AUTH"), default=True),
+            allowed_auth_modes=tuple([x.strip() for x in (os.getenv("TCD_GRPC_ALLOWED_AUTH_MODES", "") or "").split(",") if x.strip()]),
+            required_scopes=tuple([x.strip() for x in (os.getenv("TCD_GRPC_DIAGNOSE_REQUIRED_SCOPES", "") or "").split(",") if x.strip()]),
+            required_roles=tuple([x.strip() for x in (os.getenv("TCD_GRPC_DIAGNOSE_REQUIRED_ROLES", "") or "").split(",") if x.strip()]),
+            require_mtls=_coerce_bool(os.getenv("TCD_GRPC_DIAGNOSE_REQUIRE_MTLS"), default=False),
+            require_trusted_identity=_coerce_bool(os.getenv("TCD_GRPC_DIAGNOSE_REQUIRE_TRUSTED_ID"), default=False),
+        ),
+        verify_authz=MethodAuthzPolicy(
+            require_auth=_coerce_bool(os.getenv("TCD_GRPC_VERIFY_REQUIRE_AUTH"), default=False),
+            allowed_auth_modes=tuple([x.strip() for x in (os.getenv("TCD_GRPC_VERIFY_ALLOWED_AUTH_MODES", "") or "").split(",") if x.strip()]),
+            required_scopes=tuple([x.strip() for x in (os.getenv("TCD_GRPC_VERIFY_REQUIRED_SCOPES", "") or "").split(",") if x.strip()]),
+            required_roles=tuple([x.strip() for x in (os.getenv("TCD_GRPC_VERIFY_REQUIRED_ROLES", "") or "").split(",") if x.strip()]),
+            require_mtls=_coerce_bool(os.getenv("TCD_GRPC_VERIFY_REQUIRE_MTLS"), default=False),
+            require_trusted_identity=_coerce_bool(os.getenv("TCD_GRPC_VERIFY_REQUIRE_TRUSTED_ID"), default=False),
+        ),
+        max_metadata_items=_coerce_int(os.getenv("TCD_GRPC_MAX_METADATA_ITEMS")) or _DEFAULT_MAX_METADATA_ITEMS,
+        max_metadata_bytes=_coerce_int(os.getenv("TCD_GRPC_MAX_METADATA_BYTES")) or _DEFAULT_MAX_METADATA_BYTES,
+        max_proto_bytes=_coerce_int(os.getenv("TCD_GRPC_MAX_PROTO_BYTES")) or _DEFAULT_MAX_PROTO_BYTES,
+        max_components_bytes=_coerce_int(os.getenv("TCD_GRPC_MAX_COMPONENTS_BYTES")) or _JSON_COMPONENT_LIMIT,
+        verify_hard_timeout_mode=os.getenv("TCD_GRPC_VERIFY_TIMEOUT_MODE", "thread"),
+        verify_process_start_method=os.getenv("TCD_GRPC_VERIFY_PROCESS_START_METHOD", "spawn"),
+        max_inflight_diagnose=_coerce_int(os.getenv("TCD_GRPC_MAX_INFLIGHT_DIAGNOSE")) or 64,
+        max_inflight_verify=_coerce_int(os.getenv("TCD_GRPC_MAX_INFLIGHT_VERIFY")) or 16,
+        gate_wait_ms=_coerce_int(os.getenv("TCD_GRPC_GATE_WAIT_MS")) or 0,
+        exec_auth_workers=_coerce_int(os.getenv("TCD_GRPC_EXEC_AUTH_WORKERS")) or 8,
+        exec_auth_queue=_coerce_int(os.getenv("TCD_GRPC_EXEC_AUTH_QUEUE")) or 64,
+        exec_verify_workers=_coerce_int(os.getenv("TCD_GRPC_EXEC_VERIFY_WORKERS")) or 4,
+        exec_verify_queue=_coerce_int(os.getenv("TCD_GRPC_EXEC_VERIFY_QUEUE")) or 32,
+        exec_controller_workers=_coerce_int(os.getenv("TCD_GRPC_EXEC_CONTROLLER_WORKERS")) or 8,
+        exec_controller_queue=_coerce_int(os.getenv("TCD_GRPC_EXEC_CONTROLLER_QUEUE")) or 64,
+        exec_attest_workers=_coerce_int(os.getenv("TCD_GRPC_EXEC_ATTEST_WORKERS")) or 4,
+        exec_attest_queue=_coerce_int(os.getenv("TCD_GRPC_EXEC_ATTEST_QUEUE")) or 32,
+        exec_ledger_workers=_coerce_int(os.getenv("TCD_GRPC_EXEC_LEDGER_WORKERS")) or 4,
+        exec_ledger_queue=_coerce_int(os.getenv("TCD_GRPC_EXEC_LEDGER_QUEUE")) or 64,
+        auth_timeout_ms=_coerce_int(os.getenv("TCD_GRPC_AUTH_TIMEOUT_MS")) or 350,
+        controller_timeout_ms=_coerce_int(os.getenv("TCD_GRPC_CONTROLLER_TIMEOUT_MS")) or 1200,
+        verify_timeout_ms=_coerce_int(os.getenv("TCD_GRPC_VERIFY_TIMEOUT_MS")) or 5000,
+        attestor_timeout_ms=_coerce_int(os.getenv("TCD_GRPC_ATTESTOR_TIMEOUT_MS")) or 1200,
+        ledger_timeout_ms=_coerce_int(os.getenv("TCD_GRPC_LEDGER_TIMEOUT_MS")) or 600,
+        breaker_failures=_coerce_int(os.getenv("TCD_GRPC_BREAKER_FAILURES")) or 5,
+        breaker_window_s=_coerce_float(os.getenv("TCD_GRPC_BREAKER_WINDOW_S")) or 30.0,
+        breaker_open_seconds=_coerce_float(os.getenv("TCD_GRPC_BREAKER_OPEN_SECONDS")) or 15.0,
+        breaker_probe_jitter_s=_coerce_float(os.getenv("TCD_GRPC_BREAKER_PROBE_JITTER_S")) or 2.0,
+        breaker_probe_probability=_coerce_float(os.getenv("TCD_GRPC_BREAKER_PROBE_PROBABILITY")) or 0.25,
+        dep_retry_max=_coerce_int(os.getenv("TCD_GRPC_DEP_RETRY_MAX")) or 1,
+        dep_retry_base_ms=_coerce_int(os.getenv("TCD_GRPC_DEP_RETRY_BASE_MS")) or 40,
+        use_security_router=_coerce_bool(os.getenv("TCD_GRPC_USE_SECURITY_ROUTER"), default=True),
+        require_security_router_when_strict=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_SECURITY_ROUTER_WHEN_STRICT"), default=False),
+        pq_required_zones=tuple([x.strip() for x in (os.getenv("TCD_GRPC_PQ_REQUIRED_ZONES", "admin,partner") or "").split(",") if x.strip()]),
+        require_attestor=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_ATTESTOR"), default=False),
+        require_ledger=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_LEDGER"), default=False),
+        outbox_enabled=_coerce_bool(os.getenv("TCD_GRPC_OUTBOX_ENABLED"), default=True),
+        outbox_path=os.getenv("TCD_GRPC_OUTBOX_PATH", "tcd_service_grpc_outbox.sqlite3"),
+        outbox_per_process=_coerce_bool(os.getenv("TCD_GRPC_OUTBOX_PER_PROCESS"), default=True),
+        outbox_max_payload_bytes=_coerce_int(os.getenv("TCD_GRPC_OUTBOX_MAX_PAYLOAD_BYTES")) or 48 * 1024,
+        outbox_max_rows=_coerce_int(os.getenv("TCD_GRPC_OUTBOX_MAX_ROWS")) or 50_000,
+        outbox_max_db_bytes=_coerce_int(os.getenv("TCD_GRPC_OUTBOX_MAX_DB_BYTES")) or 128 * 1024 * 1024,
+        outbox_drop_policy=os.getenv("TCD_GRPC_OUTBOX_DROP_POLICY", "drop_oldest"),
+        event_registry_path=os.getenv("TCD_GRPC_EVENT_REGISTRY_PATH", "tcd_service_grpc_registry.sqlite3"),
+        replay_ttl_s=_coerce_int(os.getenv("TCD_GRPC_REPLAY_TTL_S")) or 900,
+        edge_rate_capacity=_coerce_float(os.getenv("TCD_GRPC_RATE_CAPACITY")) or 120.0,
+        edge_rate_refill_per_s=_coerce_float(os.getenv("TCD_GRPC_RATE_REFILL_PER_S")) or 60.0,
+        token_cost_divisor_default=_coerce_float(os.getenv("TCD_GRPC_TOKEN_COST_DIVISOR_DEFAULT")) or 50.0,
+        grpc_auth_fallback_mode=os.getenv("TCD_GRPC_AUTH_FALLBACK_MODE", "compat"),
+        allowed_auth_modes=[x.strip() for x in (os.getenv("TCD_GRPC_ALLOWED_AUTH_MODES", "") or "").split(",") if x.strip()],
+        allowed_sig_algs=[x.strip() for x in (os.getenv("TCD_GRPC_ALLOWED_SIG_ALGS", "") or "").split(",") if x.strip()],
+        require_pq_sig=_coerce_bool(os.getenv("TCD_GRPC_REQUIRE_PQ_SIG"), default=False),
+        node_id=os.getenv("TCD_NODE_ID", os.getenv("HOSTNAME", ""))[:128],
+        proc_id=os.getenv("TCD_PROC_ID", str(os.getpid()))[:64],
+        build_id=os.getenv("TCD_BUILD_ID", "")[:128],
+        image_digest=os.getenv("TCD_IMAGE_DIGEST", "")[:256],
+        record_raw_principal=_coerce_bool(os.getenv("TCD_GRPC_RECORD_RAW_PRINCIPAL"), default=False),
+        record_raw_key_id=_coerce_bool(os.getenv("TCD_GRPC_RECORD_RAW_KEY_ID"), default=False),
+        log_requests=_coerce_bool(os.getenv("TCD_GRPC_LOG_REQUESTS"), default=True),
+        debug_errors=_coerce_bool(os.getenv("TCD_GRPC_DEBUG_ERRORS"), default=False),
+        idempotency_time_bucket_s=_coerce_int(os.getenv("TCD_GRPC_IDEMPOTENCY_BUCKET_S")) or 60,
+        recommended_server_max_receive_bytes=_coerce_int(os.getenv("TCD_GRPC_SERVER_MAX_RECV")) or 4 * 1024 * 1024,
+        recommended_server_max_send_bytes=_coerce_int(os.getenv("TCD_GRPC_SERVER_MAX_SEND")) or 4 * 1024 * 1024,
+        recommended_max_concurrent_rpcs=_coerce_int(os.getenv("TCD_GRPC_SERVER_MAX_CONCURRENT_RPCS")) or 256,
+    )
+    cfg = cfg.normalized()
+    if cfg.outbox_enabled and cfg.outbox_per_process:
+        p = cfg.outbox_path
+        if "{pid}" in p or "{proc_id}" in p:
+            p = p.replace("{pid}", str(os.getpid())).replace("{proc_id}", cfg.proc_id or str(os.getpid()))
+        else:
+            p = f"{p}.{os.getpid()}"
+        cfg.outbox_path = p
+    return cfg
+
+# ---------------------------------------------------------------------------
+# Runtime + builder
+# ---------------------------------------------------------------------------
+
+class _SecurityAuditSinkAdapter:
+    def __init__(self, ledger: Any) -> None:
+        self._ledger = ledger
+
+    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Optional[str]:
+        if self._ledger is None:
+            return None
+        record = {"kind": "grpc_security_audit", "event_type": str(event_type), "payload": dict(payload)}
+        try:
+            if hasattr(self._ledger, "append_ex"):
+                out = self._ledger.append_ex(record, stage="event")  # type: ignore[attr-defined]
+                return getattr(out, "head", None) or None
+            out2 = self._ledger.append(record)  # type: ignore[attr-defined]
+            return getattr(out2, "head", None) if out2 is not None else None
+        except Exception:
+            return None
+
+
+@dataclass
+class _Runtime:
+    cfg: GrpcServiceConfig
+    prom: TCDPrometheusExporter
+    otel: TCDOtelExporter
+    settings: Any
+    cfg_fp: str
+    node_id: str
+    proc_id: str
+    build_id: str
+    image_digest: str
+    async_runner: _AsyncLoopThread
+    detector_registry: DetectorRegistry
+    exec_auth: _BoundedExecutor
+    exec_verify: _BoundedExecutor
+    exec_controller: _BoundedExecutor
+    exec_attest: _BoundedExecutor
+    exec_ledger: _BoundedExecutor
+    br_auth: _CircuitBreaker
+    br_verify: _CircuitBreaker
+    br_controller: _CircuitBreaker
+    br_attestor: _CircuitBreaker
+    br_ledger: _CircuitBreaker
+    gate_diagnose: _InFlightGate
+    gate_verify: _InFlightGate
+    rate_limiter: Any
+    authenticator: Optional[Any]
+    attestor: Optional[Any]
+    attestor_cfg: Optional[Any]
+    ledger: Optional[Any]
+    outbox: Optional[_SQLiteOutbox]
+    control_registry: _SQLiteControlRegistry
+    strategy_router: Any
+    detector_adapter: _GrpcDetectorRuntime
+    security_router: Optional[Any]
+    auth_adapter: GrpcAuthAdapter
+    receipt_mgr: ReceiptManager
+    http_cfg: ServiceHttpConfig
+    verify_limits: VerifyLimits
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        cfg: Optional[GrpcServiceConfig] = None,
+        prom: Optional[TCDPrometheusExporter] = None,
+        otel: Optional[TCDOtelExporter] = None,
+        policy_store: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
+        authenticator: Optional[Any] = None,
+        attestor: Optional[Any] = None,
+        ledger: Optional[Any] = None,
+        outbox: Optional[_SQLiteOutbox] = None,
+        security_router: Optional[Any] = None,
+        strategy_router: Optional[Any] = None,
+    ) -> "_Runtime":
+        settings = _settings.get()
+        cfg0 = (cfg or _build_cfg_from_env()).normalized()
+        http_cfg = cfg0.http_contract.normalized_copy()
+        verify_limits = cfg0.verify_limits.normalized_copy()
+
+        cfg_fp = cls._cfg_digest(cfg0)
+        node_id = cfg0.node_id or _safe_text(getattr(settings, "node_id", ""), max_len=128)
+        proc_id = cfg0.proc_id or str(os.getpid())
+        build_id = cfg0.build_id or http_cfg.build_id or _safe_text(getattr(settings, "build_id", ""), max_len=128)
+        image_digest = cfg0.image_digest or http_cfg.image_digest or _safe_text(getattr(settings, "image_digest", ""), max_len=256)
+
+        prom0 = prom or TCDPrometheusExporter(
+            port=int(getattr(settings, "prometheus_port", 8001) or 8001),
+            version=str(getattr(settings, "version", http_cfg.api_version) or http_cfg.api_version),
+            config_hash=cfg_fp,
+        )
+        if bool(getattr(settings, "prom_http_enable", False)):
+            with contextlib.suppress(Exception):
+                prom0.ensure_server()
+
+        otel0 = otel or TCDOtelExporter(endpoint=getattr(settings, "otel_endpoint", None))
+        async_runner = _AsyncLoopThread()
+        detector_registry = DetectorRegistry(settings=settings)
+
+        exec_auth = _BoundedExecutor(pool="auth", max_workers=cfg0.exec_auth_workers, max_queue=cfg0.exec_auth_queue)
+        exec_verify = _BoundedExecutor(pool="verify", max_workers=cfg0.exec_verify_workers, max_queue=cfg0.exec_verify_queue)
+        exec_controller = _BoundedExecutor(pool="controller", max_workers=cfg0.exec_controller_workers, max_queue=cfg0.exec_controller_queue)
+        exec_attest = _BoundedExecutor(pool="attest", max_workers=cfg0.exec_attest_workers, max_queue=cfg0.exec_attest_queue)
+        exec_ledger = _BoundedExecutor(pool="ledger", max_workers=cfg0.exec_ledger_workers, max_queue=cfg0.exec_ledger_queue)
+
+        br_auth = _CircuitBreaker(dep="auth", threshold=cfg0.breaker_failures, window_s=cfg0.breaker_window_s, open_seconds=cfg0.breaker_open_seconds, probe_jitter_s=cfg0.breaker_probe_jitter_s, probe_probability=cfg0.breaker_probe_probability)
+        br_verify = _CircuitBreaker(dep="verify", threshold=cfg0.breaker_failures, window_s=cfg0.breaker_window_s, open_seconds=cfg0.breaker_open_seconds, probe_jitter_s=cfg0.breaker_probe_jitter_s, probe_probability=cfg0.breaker_probe_probability)
+        br_controller = _CircuitBreaker(dep="controller", threshold=cfg0.breaker_failures, window_s=cfg0.breaker_window_s, open_seconds=cfg0.breaker_open_seconds, probe_jitter_s=cfg0.breaker_probe_jitter_s, probe_probability=cfg0.breaker_probe_probability)
+        br_attestor = _CircuitBreaker(dep="attestor", threshold=cfg0.breaker_failures, window_s=cfg0.breaker_window_s, open_seconds=cfg0.breaker_open_seconds, probe_jitter_s=cfg0.breaker_probe_jitter_s, probe_probability=cfg0.breaker_probe_probability)
+        br_ledger = _CircuitBreaker(dep="ledger", threshold=cfg0.breaker_failures, window_s=cfg0.breaker_window_s, open_seconds=cfg0.breaker_open_seconds, probe_jitter_s=cfg0.breaker_probe_jitter_s, probe_probability=cfg0.breaker_probe_probability)
+
+        gate_diagnose = _InFlightGate("Diagnose", cfg0.max_inflight_diagnose)
+        gate_verify = _InFlightGate("Verify", cfg0.max_inflight_verify)
+
+        rate_limiter0 = rate_limiter
+        if rate_limiter0 is None:
+            with contextlib.suppress(Exception):
+                if RateLimitConfig is not Any and RateLimitZoneConfig is not Any:
+                    rlc = RateLimitConfig(
+                        zones={"default": RateLimitZoneConfig(capacity=cfg0.edge_rate_capacity, refill_per_s=cfg0.edge_rate_refill_per_s)},
+                        default_zone="default",
+                    )
+                    rate_limiter0 = RateLimiter(rlc)
+            if rate_limiter0 is None:
+                try:
+                    rate_limiter0 = RateLimiter(capacity=cfg0.edge_rate_capacity, refill_per_s=cfg0.edge_rate_refill_per_s)  # type: ignore[call-arg]
+                except Exception:
+                    rate_limiter0 = RateLimiter()  # type: ignore[call-arg]
+
+        authenticator0 = authenticator
+        if authenticator0 is None and build_authenticator_from_env is not None:
+            with contextlib.suppress(Exception):
+                authenticator0 = build_authenticator_from_env()
+
+        attestor_cfg0 = None
+        attestor0 = attestor
+        if attestor0 is None and Attestor is not None and AttestorConfig is not None:
+            with contextlib.suppress(Exception):
+                attestor_cfg0 = AttestorConfig(
+                    attestor_id="tcd-grpc",
+                    proc_id=proc_id or None,
+                    strict_mode=http_cfg.strict_mode,
+                    default_cfg_digest=cfg_fp,
+                )
+                attestor0 = Attestor(cfg=attestor_cfg0)
+        if attestor0 is None:
+            attestor0 = _build_attestor_compat(hash_alg=http_cfg.hash_alg)
+
+        ledger0 = ledger
+        if ledger0 is None and AuditLedger is not None:
+            with contextlib.suppress(Exception):
+                ledger0 = AuditLedger()
+
+        outbox0 = outbox
+        if outbox0 is None and cfg0.outbox_enabled:
+            with contextlib.suppress(Exception):
+                outbox0 = _SQLiteOutbox(
+                    cfg0.outbox_path,
+                    max_rows=cfg0.outbox_max_rows,
+                    max_db_bytes=cfg0.outbox_max_db_bytes,
+                    max_payload_bytes=cfg0.outbox_max_payload_bytes,
+                    drop_policy=cfg0.outbox_drop_policy,
+                )
+
+        control_registry = _SQLiteControlRegistry(cfg0.event_registry_path, replay_ttl_s=cfg0.replay_ttl_s)
+
+        strategy_router0 = strategy_router or StrategyRouter()
+        detector_adapter = _GrpcDetectorRuntime()
+
+        security_router0 = security_router
+        if security_router0 is None and cfg0.use_security_router and policy_store is not None:
+            # First try the HTTP-compatible builder to keep semantics aligned.
+            with contextlib.suppress(Exception):
+                security_router0 = _build_security_router_compat(
+                    policy_store=policy_store,
+                    rate_limiter=rate_limiter0,
+                    attestor=attestor0,
+                    detector_runtime=detector_adapter,
+                    strategy_router=strategy_router0,
+                )
+            if security_router0 is None and SecurityRouter is not None:
+                candidates = [
+                    {
+                        "policy_store": policy_store,
+                        "rate_limiter": rate_limiter0,
+                        "attestor": attestor0,
+                        "detector_runtime": detector_adapter,
+                        "base_av": AlwaysValidConfig(),
+                        "strategy_router": strategy_router0,
+                        "audit_sink": _SecurityAuditSinkAdapter(ledger0) if ledger0 is not None else None,
+                    },
+                    {
+                        "policy_store": policy_store,
+                        "rate_limiter": rate_limiter0,
+                        "attestor": attestor0,
+                        "detector_runtime": detector_adapter,
+                        "base_av": AlwaysValidConfig(),
+                        "strategy_router": strategy_router0,
+                    },
+                    {
+                        "policy_store": policy_store,
+                        "rate_limiter": rate_limiter0,
+                        "attestor": attestor0,
+                        "detector_runtime": detector_adapter,
+                        "base_av": AlwaysValidConfig(),
+                    },
+                    {
+                        "policy_store": policy_store,
+                        "rate_limiter": rate_limiter0,
+                        "attestor": attestor0,
+                        "detector_runtime": detector_adapter,
+                    },
+                ]
+                for kwargs in candidates:
+                    try:
+                        security_router0 = SecurityRouter(**kwargs)
+                        break
+                    except Exception:
+                        continue
+
+        auth_adapter = GrpcAuthAdapter(runtime=None)  # type: ignore[arg-type]
+
+        receipt_mgr = ReceiptManager(
+            attestor=attestor0,
+            hash_alg=http_cfg.hash_alg,
+            expose_verify_key_public=http_cfg.expose_verify_key_public,
+            expose_verification_bundle_public=http_cfg.expose_verification_bundle_public,
+        )
+
+        rt = cls(
+            cfg=cfg0,
+            prom=prom0,
+            otel=otel0,
+            settings=settings,
+            cfg_fp=cfg_fp,
+            node_id=node_id,
+            proc_id=proc_id,
+            build_id=build_id,
+            image_digest=image_digest,
+            async_runner=async_runner,
+            detector_registry=detector_registry,
+            exec_auth=exec_auth,
+            exec_verify=exec_verify,
+            exec_controller=exec_controller,
+            exec_attest=exec_attest,
+            exec_ledger=exec_ledger,
+            br_auth=br_auth,
+            br_verify=br_verify,
+            br_controller=br_controller,
+            br_attestor=br_attestor,
+            br_ledger=br_ledger,
+            gate_diagnose=gate_diagnose,
+            gate_verify=gate_verify,
+            rate_limiter=rate_limiter0,
+            authenticator=authenticator0,
+            attestor=attestor0,
+            attestor_cfg=attestor_cfg0,
+            ledger=ledger0,
+            outbox=outbox0,
+            control_registry=control_registry,
+            strategy_router=strategy_router0,
+            detector_adapter=detector_adapter,
+            security_router=security_router0,
+            auth_adapter=auth_adapter,
+            receipt_mgr=receipt_mgr,
+            http_cfg=http_cfg,
+            verify_limits=verify_limits,
+        )
+        rt.auth_adapter = GrpcAuthAdapter(runtime=rt)
+        return rt
+
+    @staticmethod
+    def _cfg_digest(cfg: GrpcServiceConfig) -> str:
+        if canonical_kv_hash is not None:
+            with contextlib.suppress(Exception):
+                return canonical_kv_hash(cfg.digest_material(), ctx="tcd:service_grpc_cfg", label="grpc_cfg")
+        return _blake3_or_sha256(_canonical_json_bytes(cfg.digest_material()), ctx="tcd:service_grpc_cfg")
+
+    def shutdown(self) -> None:
+        for ex in (self.exec_auth, self.exec_verify, self.exec_controller, self.exec_attest, self.exec_ledger):
+            with contextlib.suppress(Exception):
+                ex.shutdown()
         with contextlib.suppress(Exception):
-            if hasattr(ReceiptPublicView, "model_validate"):
-                m = ReceiptPublicView.model_validate(out)  # type: ignore[attr-defined]
-                return m.model_dump(exclude_none=True)  # type: ignore[attr-defined]
-    return {k: v for k, v in out.items() if v is not None}
+            self.async_runner.stop()
+
+    def get_detector_runtime(self, key: Tuple[str, str, str, str]) -> Any:
+        return self.detector_registry.get_detector_runtime(key)
+
+    def get_av(self, subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
+        return self.detector_registry.get_av(subject)
+
+    def get_mv(self, model_id: str) -> MultiVarDetector:
+        return self.detector_registry.get_mv(model_id)
+
+    def dod(self) -> GrpcServiceDOD:
+        return GrpcServiceDOD(
+            schema="grpc.dod.v3",
+            light_rpc_p95_ms=200,
+            light_rpc_p99_ms=1000,
+            heavy_rpc_p95_ms=1200,
+            heavy_rpc_p99_ms=5000,
+            max_proto_bytes=int(self.cfg.max_proto_bytes),
+            max_metadata_bytes=int(self.cfg.max_metadata_bytes),
+            max_verify_total_bytes=int(self.verify_limits.max_chain_payload_bytes),
+            consistency_level="local_best_effort_with_deterministic_event_identity",
+            evidence_delivery="prepare_commit_with_outbox_fallback",
+            verify_isolation=self.cfg.verify_hard_timeout_mode,
+        )
+
+    def runtime_public_view(self) -> Dict[str, Any]:
+        sec_public = None
+        sec_diag = None
+        if self.security_router is not None:
+            with contextlib.suppress(Exception):
+                pub = getattr(self.security_router, "public_config_view", None)
+                if callable(pub):
+                    sec_public = _model_dump(pub())
+            with contextlib.suppress(Exception):
+                diag = getattr(self.security_router, "bundle_diagnostics", None)
+                if callable(diag):
+                    sec_diag = _model_dump(diag())
+        return {
+            "schema": "grpc.runtime.v3",
+            "cfg_fp": self.cfg_fp,
+            "node_id": self.node_id,
+            "proc_id": self.proc_id,
+            "build_id": self.build_id,
+            "image_digest": self.image_digest,
+            "api_version": self.cfg.protocol.api_version,
+            "schema_version": self.cfg.protocol.schema_version,
+            "compatibility_epoch": self.cfg.protocol.compatibility_epoch,
+            "http_contract_fp": self.http_cfg.fingerprint(),
+            "dod": dataclasses.asdict(self.dod()),
+            "security_router": {"public": sec_public, "diagnostics": sec_diag},
+        }
 
 # ---------------------------------------------------------------------------
-# Main runtime singleton
+# Singleton / factories
 # ---------------------------------------------------------------------------
 
-# Already defined above: _rt(), create_grpc_runtime(), grpc_supported(), grpc_server_options
+_RUNTIME: Optional[_Runtime] = None
+_RUNTIME_LOCK = threading.Lock()
+
+def _rt() -> _Runtime:
+    global _RUNTIME
+    with _RUNTIME_LOCK:
+        if _RUNTIME is None:
+            _RUNTIME = _Runtime.build()
+        return _RUNTIME
+
+def create_grpc_runtime(
+    *,
+    cfg: Optional[GrpcServiceConfig] = None,
+    prom: Optional[TCDPrometheusExporter] = None,
+    otel: Optional[TCDOtelExporter] = None,
+    policy_store: Optional[Any] = None,
+    rate_limiter: Optional[Any] = None,
+    authenticator: Optional[Any] = None,
+    attestor: Optional[Any] = None,
+    ledger: Optional[Any] = None,
+    outbox: Optional[_SQLiteOutbox] = None,
+    security_router: Optional[Any] = None,
+    strategy_router: Optional[Any] = None,
+) -> _Runtime:
+    return _Runtime.build(
+        cfg=cfg,
+        prom=prom,
+        otel=otel,
+        policy_store=policy_store,
+        rate_limiter=rate_limiter,
+        authenticator=authenticator,
+        attestor=attestor,
+        ledger=ledger,
+        outbox=outbox,
+        security_router=security_router,
+        strategy_router=strategy_router,
+    )
+
+def grpc_supported() -> bool:
+    return bool(_HAS_GRPC and _HAS_STUBS)
+
+def grpc_server_options(cfg: Optional[GrpcServiceConfig] = None) -> Tuple[Tuple[str, int], ...]:
+    c = (cfg or _build_cfg_from_env()).normalized()
+    return (
+        ("grpc.max_receive_message_length", int(c.recommended_server_max_receive_bytes)),
+        ("grpc.max_send_message_length", int(c.recommended_server_max_send_bytes)),
+        ("grpc.max_concurrent_streams", int(c.recommended_max_concurrent_rpcs)),
+        ("grpc.keepalive_time_ms", 30_000),
+        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.http2.max_pings_without_data", 0),
+    )
 
 # ---------------------------------------------------------------------------
-# gRPC service
+# Service implementation
 # ---------------------------------------------------------------------------
 
 if _HAS_GRPC and _HAS_STUBS:
@@ -3117,13 +3373,17 @@ if _HAS_GRPC and _HAS_STUBS:
         def Diagnose(self, request: Any, context: Any) -> Any:
             rt = self._rt
             cfg = rt.cfg
+            http_cfg = rt.http_cfg
             method = "Diagnose"
             t0 = time.perf_counter()
             status_label = "ok"
             action_label = "none"
             request_id = ""
             event_id = ""
+            decision_id = ""
+            route_plan_id = ""
             gate_ok = False
+            trace_id: Optional[str] = None
 
             try:
                 if not _has_time_remaining(context):
@@ -3134,6 +3394,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "deadline exceeded",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3159,6 +3420,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "server overloaded",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3186,6 +3448,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "metadata too large",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3212,6 +3475,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "payload too large",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3228,9 +3492,9 @@ if _HAS_GRPC and _HAS_STUBS:
                     )
 
                 peer = _extract_peer_identity(context)
-                subject_legacy, request_id, trace_id, idem, principal_hint = _resolve_subject_and_request(context, request)
+                request_id, trace_id, idem, principal_hint = _resolve_request_identity(request, context)
                 sec_ctx = _normalize_security_context(context, request, cfg)
-                body_digest = _blake3_hex(body_bytes, ctx="tcd:grpc:transport_body")
+                body_digest = _body_digest(body_bytes, alg=http_cfg.hash_alg)
 
                 compat = _resolve_protocol_compat(method, request, md, cfg.protocol)
                 if not compat.ok:
@@ -3243,6 +3507,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3286,6 +3551,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3313,12 +3579,14 @@ if _HAS_GRPC and _HAS_STUBS:
                     body_digest=body_digest,
                     bucket_s=cfg.idempotency_time_bucket_s,
                 )
+                request_id_for_md = request_id
                 _set_trailing_metadata(
                     context,
-                    request_id=request_id,
+                    request_id=request_id_for_md,
                     event_id=event_id,
                     api_version=cfg.protocol.api_version,
                     schema_version=cfg.protocol.schema_version,
+                    cfg_fp=rt.cfg_fp,
                 )
 
                 event_fingerprint = _event_fingerprint(
@@ -3328,7 +3596,7 @@ if _HAS_GRPC and _HAS_STUBS:
                     body_digest=body_digest,
                     canonical_request_digest=_request_summary_digest(request, method_name=method, sec_ctx=sec_ctx),
                 )
-                reg_ok, reg_reason = rt.registry.register_event(
+                reg_ok, reg_reason = rt.control_registry.register_event(
                     scope="grpc:event",
                     event_id=event_id,
                     event_digest=event_fingerprint,
@@ -3348,6 +3616,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         event_id=event_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3363,6 +3632,8 @@ if _HAS_GRPC and _HAS_STUBS:
                         alpha_spent=0.0,
                     )
 
+                remaining = _time_remaining_s(context)
+                deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
                 auth = rt.auth_adapter.authenticate(
                     method_name=method,
                     metadata={k: v for k, v in md.items() if k in set(cfg.metadata_allowlist)},
@@ -3372,12 +3643,11 @@ if _HAS_GRPC and _HAS_STUBS:
                     event_id=event_id,
                     api_version=compat.api_version,
                     compatibility_epoch=compat.compatibility_epoch,
-                    deadline_mono=(time.perf_counter() + (rem if (rem := (_time_remaining_s(context) or 0.0)) > 0 else 0.0)) if _time_remaining_s(context) is not None else None,
+                    deadline_mono=deadline_mono,
                 )
                 if not _enforce_method_authz(auth, cfg.diagnose_authz, peer):
                     status_label = "unauthenticated" if not auth.ok else "forbidden"
-                    reason = "auth" if not auth.ok else "method_authz"
-                    _GRPC_REQ_REJECTED.labels(method, reason).inc()
+                    _GRPC_REQ_REJECTED.labels(method, "auth").inc()
                     _set_grpc_error(
                         context,
                         grpc.StatusCode.UNAUTHENTICATED if not auth.ok else grpc.StatusCode.PERMISSION_DENIED,
@@ -3386,13 +3656,14 @@ if _HAS_GRPC and _HAS_STUBS:
                         event_id=event_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
                         score=0.0,
                         threshold=0.0,
                         budget_remaining=0.0,
-                        components=_bounded_json_dumps({"error": reason, "reason": auth.reason or reason}, max_bytes=cfg.max_components_bytes),
+                        components=_bounded_json_dumps({"error": "auth", "reason": auth.reason or "auth"}, max_bytes=cfg.max_components_bytes),
                         cause="auth",
                         action="reject",
                         step=0,
@@ -3401,7 +3672,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         alpha_spent=0.0,
                     )
 
-                if len(request.trace_vector) > cfg.max_trace or len(request.spectrum) > cfg.max_spectrum or len(request.features) > cfg.max_features:
+                if len(list(getattr(request, "trace_vector", []) or [])) > _MAX_TRACE or len(list(getattr(request, "spectrum", []) or [])) > _MAX_SPECT or len(list(getattr(request, "features", []) or [])) > _MAX_FEATS:
                     status_label = "payload_too_large"
                     _GRPC_REQ_REJECTED.labels(method, "vector_too_large").inc()
                     _set_grpc_error(
@@ -3412,6 +3683,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         event_id=event_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3428,7 +3700,7 @@ if _HAS_GRPC and _HAS_STUBS:
                     )
 
                 cost = _rate_limit_cost(cfg, sec_ctx, request, sec_ctx.get("threat_kind"), sec_ctx.get("threat_confidence"))
-                if not _consume_rate(rt, subject=subject_result.subject, principal_id=auth.principal, model_id=_safe_text(getattr(request, "model_id", "model0"), max_len=128) or "model0", cost=cost):
+                if not _consume_rate(rt, subject=subject_result.subject, principal_id=auth.principal or principal_hint, model_id=_safe_text(getattr(request, "model_id", "model0"), max_len=128) or "model0", cost=cost):
                     status_label = "rate_limited"
                     _GRPC_REQ_REJECTED.labels(method, "rate_limited").inc()
                     _set_grpc_error(
@@ -3439,6 +3711,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         event_id=event_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3454,30 +3727,23 @@ if _HAS_GRPC and _HAS_STUBS:
                         alpha_spent=0.0,
                     )
 
-                trace_vec, _ = sanitize_floats(list(request.trace_vector), max_len=cfg.max_trace)
-                spectrum, _ = sanitize_floats(list(request.spectrum), max_len=cfg.max_spectrum)
-                features, _ = sanitize_floats(list(request.features), max_len=cfg.max_features)
+                trace_vec = _sanitize_numeric_array(list(getattr(request, "trace_vector", []) or []), max_len=_MAX_TRACE)
+                spectrum = _sanitize_numeric_array(list(getattr(request, "spectrum", []) or []), max_len=_MAX_SPECT)
+                features = _sanitize_numeric_array(list(getattr(request, "features", []) or []), max_len=_MAX_FEATS)
 
                 model_id = _safe_text(getattr(request, "model_id", "") or "model0", max_len=128)
                 gpu_id = _safe_text(getattr(request, "gpu_id", "") or "gpu0", max_len=128)
                 task = _safe_text(getattr(request, "task", "") or "chat", max_len=64)
                 lang = _safe_text(getattr(request, "lang", "") or "en", max_len=32)
                 risk_label = _safe_text(getattr(request, "risk_label", "") or "normal", max_len=32).lower() or "normal"
-                base_temp = _clamp_float(getattr(request, "base_temp", None), default=float(getattr(rt.settings, "router_base_temp", 1.0) or 1.0), lo=0.0, hi=10.0)
-                base_top_p = _clamp_float(getattr(request, "base_top_p", None), default=float(getattr(rt.settings, "router_base_top_p", 0.95) or 0.95), lo=0.0, hi=1.0)
+                base_temp = _clamp_float(getattr(request, "base_temp", None), default=0.7, lo=0.0, hi=10.0)
+                base_top_p = _clamp_float(getattr(request, "base_top_p", None), default=0.9, lo=0.0, hi=1.0)
                 tokens_delta = float(getattr(request, "tokens_delta", 0.0) or 0.0)
-                entropy = _coerce_float(getattr(request, "entropy", None)) if _has_field(request, "entropy") else None
                 drift_score = _coerce_float(getattr(request, "drift_score", None)) or 0.0
 
-                deadline_mono = None
-                rem = _time_remaining_s(context)
-                if rem is not None:
-                    deadline_mono = time.perf_counter() + rem
-
                 def _run_detector() -> Dict[str, Any]:
-                    det = rt.get_detector((model_id, gpu_id, task, lang))
-                    vp = det.diagnose(trace_vec, entropy, spectrum, step_id=(request.step_id if getattr(request, "step_id", "") else None))
-                    return dict(vp) if isinstance(vp, Mapping) else {}
+                    det = rt.get_detector_runtime((model_id, gpu_id, task, lang))
+                    return _run_detector_runtime(det, req=request, trace_vec=trace_vec, spectrum=spectrum, features=features, http_cfg=http_cfg)
 
                 try:
                     vp = _dep_call_with_retry(
@@ -3501,6 +3767,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         event_id=event_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.RiskResponse(  # type: ignore[misc]
                         verdict=False,
@@ -3516,15 +3783,16 @@ if _HAS_GRPC and _HAS_STUBS:
                         alpha_spent=0.0,
                     )
 
-                det_components = dict(vp.get("components", {})) if isinstance(vp, Mapping) else {}
-                score = float(vp.get("score", 0.0)) if isinstance(vp, Mapping) else 0.0
-                det_trigger = bool(vp.get("verdict", False)) if isinstance(vp, Mapping) else False
-                det_step = int(vp.get("step", 0)) if isinstance(vp, Mapping) else 0
+                verdict_pack = dict(vp or {})
+                det_signal = _extract_detector_signal(verdict_pack)
+                det_components = dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {}
 
                 mv_info: Dict[str, Any] = {}
-                if len(features) > 0:
+                if features:
                     with contextlib.suppress(Exception):
-                        mv_info = dict(rt.get_mv(model_id).decision(features))
+                        mv_info = rt.get_mv(model_id).decision(features)  # type: ignore[assignment]
+                        if not isinstance(mv_info, Mapping):
+                            mv_info = {}
 
                 threat_kind = sec_ctx.get("threat_kind")
                 threat_conf = sec_ctx.get("threat_confidence")
@@ -3535,97 +3803,145 @@ if _HAS_GRPC and _HAS_STUBS:
                 if det_threat_conf is not None:
                     threat_conf = max(threat_conf or 0.0, det_threat_conf) if threat_conf is not None else det_threat_conf
 
-                drift_weight = 1.0 + 0.5 * drift_score
+                score = float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else 0.0)
+                p_final = float(det_signal.get("p_value") if det_signal.get("p_value") is not None else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score)))))
+
+                drift_w = 1.0 + 0.5 * drift_score
                 if threat_kind in ("apt", "supply_chain") and (threat_conf or 0.0) >= 0.5:
-                    drift_weight *= 1.5
+                    drift_w *= 1.5
                 if sec_ctx["trust_zone"] == "admin" and threat_kind == "insider":
-                    drift_weight *= 2.0
-                drift_weight = max(0.0, min(2.0, drift_weight))
+                    drift_w *= 2.0
+                drift_w = max(0.0, min(2.0, drift_w))
 
                 av = rt.get_av(subject_result.subject)
-                stream_id = f"{tenant}:{user}:{model_id}"
-                av_out = av.step(
-                    stream_id=stream_id,
-                    policy_key=(task, lang, model_id),
+                av_out = _av_step_compat(
+                    av,
+                    req=request,
                     subject=subject_result.subject,
-                    scores={"final": score},
-                    pvals={"final": _p_cons(score)},
-                    drift_weight=drift_weight,
+                    model_id=model_id,
+                    gpu_id=gpu_id,
+                    task=task,
+                    lang=lang,
+                    score=score,
+                    p_value=p_final,
+                    drift_weight=drift_w,
                     meta={
                         "trust_zone": sec_ctx["trust_zone"],
                         "route_profile": sec_ctx["route_profile"],
+                        "risk_label": risk_label,
                         "threat_kind": threat_kind,
                         "pq_required": sec_ctx["pq_required"],
-                        "asserted_tenant": subject_result.asserted.get("tenant"),
-                        "asserted_user": subject_result.asserted.get("user"),
-                        "asserted_session": subject_result.asserted.get("session"),
-                        "identity_status": subject_result.status,
+                        "request_id": request_id,
+                        "event_id": event_id,
+                        "body_digest": body_digest,
                     },
                 )
-                av_out = dict(av_out) if isinstance(av_out, Mapping) else {}
-                av_trigger = bool(av_out.get("trigger", False))
-                decision_fail = bool(det_trigger or av_trigger)
-                e_state = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
-                security_av = av_out.get("security") if isinstance(av_out.get("security"), Mapping) else {}
-                controller_mode = _safe_text(security_av.get("controller_mode") if security_av else None, max_len=64) or None
-                guarantee_scope = _safe_text(security_av.get("statistical_guarantee_scope") if security_av else None, max_len=64) or None
-                if not controller_mode and isinstance(e_state, Mapping):
-                    ctrl = e_state.get("controller")
-                    if isinstance(ctrl, Mapping):
-                        controller_mode = _safe_text(ctrl.get("controller_mode"), max_len=64) or None
-                    validity = e_state.get("validity")
-                    if isinstance(validity, Mapping):
-                        guarantee_scope = guarantee_scope or (_safe_text(validity.get("statistical_guarantee_scope"), max_len=64) or None)
+                budget = RiskBudgetEnvelope.from_av_out(av_out)
+                if budget.is_budget_exhausted(http_cfg.alpha_wealth_floor):
+                    status_label = "rate_limited"
+                    _set_grpc_error(
+                        context,
+                        grpc.StatusCode.RESOURCE_EXHAUSTED,
+                        "alpha budget exhausted",
+                        request_id=request_id,
+                        event_id=event_id,
+                        api_version=cfg.protocol.api_version,
+                        schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
+                    )
+                    return pb.RiskResponse(  # type: ignore[misc]
+                        verdict=False,
+                        score=0.0,
+                        threshold=budget.threshold,
+                        budget_remaining=budget.alpha_wealth,
+                        components=_bounded_json_dumps({"error": "alpha_budget_exhausted"}, max_bytes=cfg.max_components_bytes),
+                        cause="alpha_budget",
+                        action="reject",
+                        step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                        e_value=budget.e_value,
+                        alpha_alloc=budget.alpha_alloc,
+                        alpha_spent=budget.alpha_spent,
+                    )
 
-                detector_action = "block" if (decision_fail and threat_kind in ("apt", "supply_chain") and (threat_conf or 0.0) >= 0.9) else ("degrade" if decision_fail else "allow")
+                decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
+                route = _route_decide_compat(
+                    rt.strategy_router,
+                    decision_fail=decision_fail,
+                    score=score,
+                    base_temp=base_temp,
+                    base_top_p=base_top_p,
+                    base_max_tokens=None,
+                    risk_label=risk_label,
+                    route_profile=sec_ctx["route_profile"],
+                    trust_zone=sec_ctx["trust_zone"],
+                    threat_kind=threat_kind,
+                    threat_confidence=threat_conf,
+                    pq_required=bool(sec_ctx["pq_required"]),
+                    pq_unhealthy=False,
+                    av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                    av_trigger=budget.triggered,
+                    controller_mode=budget.controller_mode,
+                    guarantee_scope=budget.statistical_guarantee_scope,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    tenant_id=tenant,
+                    principal_id=auth.principal or principal_hint,
+                    meta={
+                        "event_id": event_id,
+                        "request_id": request_id,
+                        "body_digest": body_digest,
+                        "build_id": sec_ctx["build_id"],
+                        "image_digest": sec_ctx["image_digest"],
+                        "compliance_tags": list(sec_ctx["compliance_tags"]),
+                        "auth_mode": auth.mode,
+                    },
+                )
 
                 security_decision = None
-                route_dict: Dict[str, Any] = {}
                 if rt.security_router is not None:
                     sig_env = None
                     if SecuritySignalEnvelope is not Any:
-                        sig_env = SecuritySignalEnvelope(
-                            source="grpc_service",
-                            trusted=bool(auth.ok and auth.trusted),
-                            signed=(auth.mode in {"hmac", "jwt", "mtls"}),
-                            signer_kid=auth.key_id,
-                            source_cfg_fp=None,
-                            source_policy_ref=auth.policy_digest,
-                            freshness_ms=None,
-                            replay_checked=None,
-                        )
+                        with contextlib.suppress(Exception):
+                            sig_env = SecuritySignalEnvelope(
+                                **_filtered_kwargs_for(
+                                    SecuritySignalEnvelope,
+                                    {
+                                        "source": "grpc_service",
+                                        "trusted": bool(auth.ok and auth.trusted),
+                                        "signed": auth.mode in {"jwt", "hmac", "mtls"},
+                                        "signer_kid": auth.key_id,
+                                        "source_cfg_fp": rt.cfg_fp,
+                                        "source_policy_ref": auth.policy_digest,
+                                        "freshness_ms": None,
+                                        "replay_checked": None,
+                                    },
+                                )
+                            )
+
                     auth_ctx = None
                     if SecurityAuthContext is not Any:
                         with contextlib.suppress(Exception):
                             auth_ctx = SecurityAuthContext(
-                                principal_id=auth.principal,
-                                roles=tuple(auth.roles),
-                                scopes=tuple(auth.scopes),
-                                access_channel="grpc",
-                                approval_id=md.get("x-approval-id"),
-                                approval_system=md.get("x-approval-system"),
-                                mfa_verified=_coerce_bool(md.get("x-mfa-verified"), default=False),
-                                trusted=bool(auth.trusted),
-                                auth_strength=auth.authn_strength,
+                                **_filtered_kwargs_for(
+                                    SecurityAuthContext,
+                                    {
+                                        "principal_id": auth.principal,
+                                        "roles": tuple(auth.roles),
+                                        "scopes": tuple(auth.scopes),
+                                        "access_channel": "grpc",
+                                        "approval_id": md.get("x-approval-id"),
+                                        "approval_system": md.get("x-approval-system"),
+                                        "mfa_verified": _coerce_bool(md.get("x-mfa-verified"), default=False),
+                                        "trusted": bool(auth.trusted),
+                                        "auth_strength": auth.authn_strength,
+                                    },
+                                )
                             )
 
-                    detector_packet = {
-                        "risk_score": score,
-                        "risk_label": risk_label,
-                        "action": detector_action,
-                        "trigger": decision_fail,
-                        "controller_mode": controller_mode,
-                        "guarantee_scope": guarantee_scope,
-                        "av_label": _safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
-                        "av_trigger": av_trigger,
-                        "threat_tags": [threat_kind] if threat_kind else [],
-                        "e_state": dict(e_state) if isinstance(e_state, Mapping) else {},
-                        "security": dict(security_av) if isinstance(security_av, Mapping) else {},
-                    }
-
-                    sctx_kwargs: Dict[str, Any] = {
-                        "subject": SubjectKey(tenant=tenant, user=user, session=sess, model_id=model_id),
-                        "ctx": {
+                    req_like = type(
+                        "ReqLike",
+                        (),
+                        {
                             "tenant": tenant,
                             "user": user,
                             "session": sess,
@@ -3634,610 +3950,694 @@ if _HAS_GRPC and _HAS_STUBS:
                             "task": task,
                             "lang": lang,
                             "trust_zone": sec_ctx["trust_zone"],
-                            "route": sec_ctx["route_profile"],
-                            "client_app": "grpc",
-                            "access_channel": "grpc",
-                        },
-                        "tokens_in": max(0, int(tokens_delta)),
-                        "tokens_out": 0,
-                        "ip": peer.peer_ip,
-                        "kind": "inference",
-                        "request_id": request_id,
-                        "trace_id": trace_id,
-                        "event_id": event_id,
-                        "tenant_id": tenant,
-                        "principal_id": auth.principal or principal_hint,
-                        "trust_zone": sec_ctx["trust_zone"],
-                        "route_profile": sec_ctx["route_profile"],
-                        "base_temp": base_temp,
-                        "base_top_p": base_top_p,
-                        "base_max_tokens": None,
-                        "pq_required": bool(sec_ctx["pq_required"]),
-                        "pq_unhealthy": False,
-                        "signal_envelope": sig_env,
-                        "auth_context": auth_ctx,
-                        "meta": {
-                            "classification": _safe_text(md.get("x-classification", ""), max_len=64) or None,
-                            "client_app": "grpc",
-                            "channel": "grpc",
-                            "region": _safe_text(md.get("x-region", ""), max_len=64) or None,
-                            "cluster": _safe_text(md.get("x-cluster", ""), max_len=64) or None,
-                            "risk_source": "grpc_detector",
-                            "workflow": "diagnose",
-                            "compat_api_version": compat.api_version,
-                            "compat_epoch": compat.compatibility_epoch,
-                        },
-                    }
-
-                    if SecurityContext is not Any:
-                        sctx = None
-                        for drop_keys in ((), ("auth_context",), ("signal_envelope", "auth_context")):
-                            try_kwargs = dict(sctx_kwargs)
-                            for dk in drop_keys:
-                                try_kwargs.pop(dk, None)
-                            try:
-                                sctx = SecurityContext(**try_kwargs)
-                                break
-                            except Exception:
-                                continue
-                        if sctx is not None:
-                            with rt.detector_adapter.bind(detector_packet):
-                                security_decision = rt.security_router.route(sctx)
-                            if getattr(security_decision, "route", None) is not None and hasattr(security_decision.route, "to_dict"):
-                                with contextlib.suppress(Exception):
-                                    route_dict = dict(security_decision.route.to_dict())
-
-                if security_decision is None:
-                    # Fallback local route or synthetic degraded contract
-                    try:
-                        route_obj = rt.strategy_router.decide(
-                            decision_fail=decision_fail,
-                            score=score,
-                            base_temp=base_temp,
-                            base_top_p=base_top_p,
-                            risk_label=risk_label,
-                            route_profile=sec_ctx["route_profile"],
-                            e_triggered=av_trigger,
-                            trust_zone=sec_ctx["trust_zone"],
-                            threat_kind=threat_kind,
-                            pq_unhealthy=False,
-                            av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
-                            av_trigger=av_trigger,
-                            meta={
-                                "request_id": request_id,
-                                "trace_id": trace_id,
-                                "event_id": event_id,
-                                "tenant": tenant,
-                                "user": user,
-                                "session": sess,
-                                "pq_required": sec_ctx["pq_required"],
-                                "threat_confidence": threat_conf,
-                                "build_id": sec_ctx["build_id"],
-                                "image_digest": sec_ctx["image_digest"],
-                            },
-                        )
-                        if hasattr(route_obj, "to_dict"):
-                            with contextlib.suppress(Exception):
-                                route_dict = dict(route_obj.to_dict())
-                        elif dataclasses.is_dataclass(route_obj):
-                            route_dict = dataclasses.asdict(route_obj)
-                    except Exception:
-                        route_dict = {
-                            "schema": "tcd.route.synthetic.v1",
-                            "router": "tcd.service_grpc",
-                            "version": "1.0.0",
-                            "config_fingerprint": rt.cfg_fp,
-                            "bundle_version": 0,
-                            "router_mode": "degraded",
-                            "route_id_kind": "plan",
-                            "route_plan_id": "rp1:sha256:" + _blake3_hex(_canonical_json_bytes({"event_id": event_id, "reason": "route_unavailable"}), ctx="tcd:grpc:route_plan")[:32],
-                            "route_id": None,
-                            "decision_id": "rd1:sha256:" + _blake3_hex(_canonical_json_bytes({"event_id": event_id, "reason": "route_unavailable"}), ctx="tcd:grpc:route_decision")[:32],
-                            "decision_ts_unix_ns": time.time_ns(),
-                            "decision_ts_mono_ns": time.monotonic_ns(),
-                            "safety_tier": "strict" if decision_fail else "normal",
-                            "required_action": "block" if decision_fail else "allow",
-                            "action_hint": "block" if decision_fail else "allow",
-                            "enforcement_mode": "fail_closed" if decision_fail else "advisory",
-                            "temperature": 0.2 if decision_fail else base_temp,
-                            "top_p": 0.4 if decision_fail else base_top_p,
-                            "decoder": "safe" if decision_fail else "default",
-                            "latency_hint": "high_safety" if decision_fail else "normal",
-                            "trust_zone": sec_ctx["trust_zone"],
                             "route_profile": sec_ctx["route_profile"],
-                            "risk_label": risk_label,
-                            "score": score,
-                            "decision_fail": decision_fail,
-                            "e_triggered": av_trigger,
-                            "pq_unhealthy": False,
-                            "av_label": _safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
-                            "av_trigger": av_trigger,
-                            "threat_tags": [threat_kind] if threat_kind else [],
-                            "controller_mode": controller_mode,
-                            "guarantee_scope": guarantee_scope,
-                            "signal_digest": "sg1:sha256:" + _blake3_hex(_canonical_json_bytes({"score": score, "decision_fail": decision_fail, "e_triggered": av_trigger, "threat_kind": threat_kind}), ctx="tcd:grpc:signal")[:32],
-                            "context_digest": "cx1:sha256:" + _blake3_hex(_canonical_json_bytes({"trust_zone": sec_ctx["trust_zone"], "route_profile": sec_ctx["route_profile"], "request_id": request_id}), ctx="tcd:grpc:context")[:32],
-                            "primary_reason_code": "ROUTE_UNAVAILABLE",
-                            "reason_codes": ["ROUTE_UNAVAILABLE"],
-                            "degraded_reason_codes": ["ROUTE_UNAVAILABLE"],
-                            "reason": "route_unavailable",
-                        }
-
-                # Final decision surfaces
-                if security_decision is not None:
-                    required_action = _safe_text(getattr(security_decision, "required_action", None), max_len=16).lower() or "allow"
-                    response_verdict = required_action != "allow"
-                    action_label = _decision_to_action(security_decision)
-                    cause = _safe_text(
-                        getattr(security_decision, "primary_reason_code", None)
-                        or getattr(security_decision, "reason", None)
-                        or ("av" if av_trigger else "detector"),
-                        max_len=128,
-                    )
-                    score_out = float(getattr(security_decision, "risk_score", None) if getattr(security_decision, "risk_score", None) is not None else score)
-                    step_out = int(getattr(security_decision, "decision_seq", 0) or 0)
-                    policy_ref = getattr(security_decision, "policy_ref", None)
-                    policyset_ref = getattr(security_decision, "policyset_ref", None)
-                    config_fp = getattr(security_decision, "config_fingerprint", None)
-                    bundle_version = getattr(security_decision, "bundle_version", None)
-                    decision_id = getattr(security_decision, "decision_id", None)
-                    route_plan_id = getattr(security_decision, "route_plan_id", None)
-                    audit_ref = getattr(security_decision, "audit_ref", None)
-                    receipt_ref = getattr(security_decision, "receipt_ref", None)
-                    route_public = None
-                    if getattr(security_decision, "route", None) is not None and hasattr(security_decision.route, "to_dict"):
-                        with contextlib.suppress(Exception):
-                            route_public = dict(security_decision.route.to_dict())
-                    components = {
-                        "detector": det_components,
-                        "multivariate": mv_info,
-                        "e_process": e_state,
-                        "route": route_public or route_dict,
-                        "security_router": security_decision.to_public_view() if hasattr(security_decision, "to_public_view") else {},
-                        "security": dict(getattr(security_decision, "security", {}) or {}),
-                        "evidence_identity": dict(getattr(security_decision, "evidence_identity", {}) or {}),
-                        "artifacts": dict(getattr(security_decision, "artifacts", {}) or {}),
-                        "auth": auth.to_public_dict(record_principal=cfg.record_raw_principal, record_key_id=cfg.record_raw_key_id) if auth.ok else {},
-                        "peer": {
-                            "peer_hash": peer.peer_hash,
-                            "mtls_present": peer.mtls_present,
-                            "spiffe_ids": list(peer.spiffe_ids[:8]),
-                        },
-                        "request": {
-                            "request_id": request_id,
-                            "trace_id": trace_id,
-                            "event_id": event_id,
-                            "body_digest": body_digest,
-                            "peer_ip_hash": _hash_token(peer.peer_ip, ctx="tcd:grpc:peer", n=12) if peer.peer_ip not in {"", "unknown"} else None,
-                            "subject_status": subject_result.status,
-                        },
-                    }
-                else:
-                    required_action = _safe_text(route_dict.get("required_action"), max_len=16).lower() or ("block" if decision_fail else "allow")
-                    response_verdict = required_action != "allow"
-                    action_label = _manual_route_action(None, decision_fail, threat_kind=threat_kind, threat_conf=threat_conf, pq_required=sec_ctx["pq_required"], pq_ok=route_dict.get("pq_ok"))
-                    cause = _safe_text(route_dict.get("primary_reason_code") or ("detector" if det_trigger else ("av" if av_trigger else "balanced")), max_len=128)
-                    score_out = score
-                    step_out = det_step
-                    policy_ref = route_dict.get("policy_ref")
-                    policyset_ref = route_dict.get("policyset_ref")
-                    config_fp = route_dict.get("config_fingerprint")
-                    bundle_version = route_dict.get("bundle_version")
-                    decision_id = route_dict.get("decision_id")
-                    route_plan_id = route_dict.get("route_plan_id") or route_dict.get("route_id")
-                    audit_ref = None
-                    receipt_ref = None
-                    components = {
-                        "detector": det_components,
-                        "multivariate": mv_info,
-                        "e_process": e_state,
-                        "route": route_dict,
-                        "security": {
-                            "trust_zone": sec_ctx["trust_zone"],
-                            "route_profile": sec_ctx["route_profile"],
-                            "threat_kind": threat_kind,
-                            "threat_confidence": threat_conf,
                             "pq_required": sec_ctx["pq_required"],
-                            "pq_ok": route_dict.get("pq_ok"),
-                            "policy_ref": policy_ref,
-                            "route_id": route_plan_id,
+                            "base_temp": base_temp,
+                            "base_top_p": base_top_p,
+                            "base_max_tokens": None,
                             "build_id": sec_ctx["build_id"],
                             "image_digest": sec_ctx["image_digest"],
                             "compliance_tags": list(sec_ctx["compliance_tags"]),
-                        },
-                        "auth": auth.to_public_dict(record_principal=cfg.record_raw_principal, record_key_id=cfg.record_raw_key_id) if auth.ok else {},
-                        "peer": {
-                            "peer_hash": peer.peer_hash,
-                            "mtls_present": peer.mtls_present,
-                            "spiffe_ids": list(peer.spiffe_ids[:8]),
-                        },
-                        "request": {
-                            "request_id": request_id,
+                            "context": {},
+                            "tokens_delta": int(tokens_delta),
                             "trace_id": trace_id,
-                            "event_id": event_id,
-                            "body_digest": body_digest,
-                            "peer_ip_hash": _hash_token(peer.peer_ip, ctx="tcd:grpc:peer", n=12) if peer.peer_ip not in {"", "unknown"} else None,
-                            "subject_status": subject_result.status,
+                            "idempotency_key": idem,
                         },
+                    )()
+                    request_like = type(
+                        "RequestLike",
+                        (),
+                        {
+                            "client": type("ClientLike", (), {"host": peer.peer_ip})(),
+                            "state": type("StateLike", (), {"auth_principal": auth.principal, "auth_mode": auth.mode})(),
+                            "url": type("UrlLike", (), {"path": f"/grpc/{method}"})(),
+                        },
+                    )()
+
+                    sctx = _security_context_compat(
+                        req=req_like,
+                        request=request_like,
+                        body_digest=body_digest,
+                        request_id=request_id,
+                        trace_id=trace_id,
+                        event_id=event_id,
+                        security_signal_envelope=sig_env,
+                    )
+                    if sctx is None and http_cfg.strict_mode and http_cfg.require_security_router_when_strict:
+                        status_label = "unavailable"
+                        _set_grpc_error(
+                            context,
+                            grpc.StatusCode.UNAVAILABLE,
+                            "security router unavailable",
+                            request_id=request_id,
+                            event_id=event_id,
+                            api_version=cfg.protocol.api_version,
+                            schema_version=cfg.protocol.schema_version,
+                            cfg_fp=rt.cfg_fp,
+                        )
+                        return pb.RiskResponse(  # type: ignore[misc]
+                            verdict=False,
+                            score=0.0,
+                            threshold=budget.threshold,
+                            budget_remaining=budget.alpha_wealth,
+                            components=_bounded_json_dumps({"error": "security_router_unavailable"}, max_bytes=cfg.max_components_bytes),
+                            cause="security_router",
+                            action="reject",
+                            step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                            e_value=budget.e_value,
+                            alpha_alloc=budget.alpha_alloc,
+                            alpha_spent=budget.alpha_spent,
+                        )
+                    if sctx is not None:
+                        detector_payload = {
+                            "risk_score": score,
+                            "risk_label": risk_label,
+                            "action": "block" if (decision_fail and risk_label == "critical") else ("degrade" if decision_fail else "allow"),
+                            "trigger": bool(decision_fail),
+                            "reason": _safe_text(det_signal.get("reason_code") or verdict_pack.get("reason_code"), max_len=128) or None,
+                            "controller_mode": budget.controller_mode,
+                            "guarantee_scope": budget.statistical_guarantee_scope,
+                            "av_label": _safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                            "av_trigger": budget.triggered,
+                            "threat_tags": [threat_kind] if threat_kind else [],
+                            "decision_id": det_signal.get("decision_id"),
+                            "config_hash": det_signal.get("config_hash"),
+                            "policy_digest": det_signal.get("policy_digest"),
+                            "state_digest": det_signal.get("state_digest"),
+                            "e_state": dict(av_out.get("e_state", {})) if isinstance(av_out.get("e_state"), Mapping) else {},
+                            "security": {
+                                **(dict(av_out.get("security", {})) if isinstance(av_out.get("security"), Mapping) else {}),
+                                "request_id": request_id,
+                                "event_id": event_id,
+                                "body_digest": body_digest,
+                            },
+                        }
+                        with contextlib.suppress(Exception):
+                            with rt.detector_adapter.bind(detector_payload):
+                                security_decision = rt.security_router.route(sctx)
+
+                route_info = _extract_route_dict(route)
+                if not route_info:
+                    route_info = _build_synthetic_route_contract(
+                        req=request,
+                        request_id=request_id,
+                        event_id=event_id,
+                        score=score,
+                        decision_fail=decision_fail,
+                        av_trigger=budget.triggered,
+                        controller_mode=budget.controller_mode,
+                        guarantee_scope=budget.statistical_guarantee_scope,
+                        av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                        threat_kind=threat_kind,
+                        cfg_fp=rt.cfg_fp,
+                        bundle_version=0,
+                        strict_mode=http_cfg.strict_mode,
+                    )
+
+                allowed = True
+                required_action = _route_required_action(route_info)
+                enforcement_mode = _route_enforcement_mode(route_info)
+                cause = _safe_text(det_signal.get("reason_code") or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")), max_len=128) or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
+                policy_ref: Optional[str] = _safe_text(route_info.get("policy_ref"), max_len=128) or None
+                policyset_ref: Optional[str] = _safe_text(route_info.get("policyset_ref"), max_len=128) or None
+                config_fingerprint: Optional[str] = _safe_text(route_info.get("config_fingerprint"), max_len=128) or None
+                bundle_version: Optional[int] = _coerce_int(route_info.get("bundle_version"))
+                state_domain_id: Optional[str] = budget.state_domain_id
+                controller_mode: Optional[str] = budget.controller_mode
+                guarantee_scope: Optional[str] = budget.statistical_guarantee_scope
+                decision_id = _safe_text(route_info.get("decision_id"), max_len=128) or ""
+                route_plan_id = _safe_text(route_info.get("route_plan_id") or route_info.get("route_id"), max_len=128) or ""
+                security_block: Dict[str, Any] = {}
+                security_public: Dict[str, Any] = {}
+                evidence_identity: Dict[str, Any] = {}
+                artifacts: Dict[str, Any] = {}
+                audit_ref: Optional[str] = None
+                receipt_ref: Optional[str] = None
+                raw_receipt_payload: Dict[str, Any] = {}
+                receipt_public: Dict[str, Any] = {}
+                receipt_verification: Optional[Dict[str, Any]] = None
+
+                if security_decision is not None:
+                    security_public = _extract_security_public(security_decision)
+                    allowed = bool(getattr(security_decision, "allowed", True))
+                    required_action = _safe_text(getattr(security_decision, "required_action", required_action), max_len=32).lower() or required_action
+                    action_taken = _safe_text(getattr(security_decision, "action", ""), max_len=32).lower()
+                    if action_taken in {"allow", "degrade", "block", "deny"}:
+                        action_label = "block" if action_taken == "deny" else action_taken
+                    else:
+                        action_label = "block" if required_action == "block" else ("degrade" if required_action == "degrade" else "none")
+                    enforcement_mode = _safe_text(getattr(security_decision, "enforcement_mode", enforcement_mode), max_len=32).lower() or enforcement_mode
+                    cause = _safe_text(getattr(security_decision, "primary_reason_code", cause), max_len=128) or cause
+                    route_obj = getattr(security_decision, "route", None)
+                    route_info = _extract_route_dict(route_obj) if route_obj is not None else route_info
+                    policy_ref = _safe_text(getattr(security_decision, "policy_ref", policy_ref), max_len=128) or policy_ref
+                    policyset_ref = _safe_text(getattr(security_decision, "policyset_ref", policyset_ref), max_len=128) or policyset_ref
+                    config_fingerprint = _safe_text(getattr(security_decision, "config_fingerprint", config_fingerprint), max_len=128) or config_fingerprint
+                    bundle_version = _coerce_int(getattr(security_decision, "bundle_version", bundle_version)) or bundle_version
+                    state_domain_id = _safe_text(getattr(security_decision, "state_domain_id", state_domain_id), max_len=128) or state_domain_id
+                    controller_mode = _safe_text(getattr(security_decision, "controller_mode", controller_mode), max_len=64) or controller_mode
+                    guarantee_scope = _safe_text(getattr(security_decision, "guarantee_scope", guarantee_scope), max_len=128) or guarantee_scope
+                    decision_id = _safe_text(getattr(security_decision, "decision_id", decision_id), max_len=128) or decision_id
+                    route_plan_id = _safe_text(getattr(security_decision, "route_plan_id", route_plan_id), max_len=128) or route_plan_id
+                    audit_ref = _safe_text(getattr(security_decision, "audit_ref", None), max_len=256) or None
+                    receipt_ref = _safe_text(getattr(security_decision, "receipt_ref", None), max_len=256) or None
+                    raw_receipt_payload = _extract_receipt_like(getattr(security_decision, "receipt", None))
+                    security_block = _sanitize_json_mapping(getattr(security_decision, "security", {}), max_depth=5, max_items=64, max_str_len=512, max_total_bytes=64_000)
+                    evidence_identity = _sanitize_json_mapping(getattr(security_decision, "evidence_identity", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
+                    artifacts = _sanitize_json_mapping(getattr(security_decision, "artifacts", {}), max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000)
+                else:
+                    action_label = _manual_route_action(
+                        route,
+                        decision_fail,
+                        threat_kind=threat_kind,
+                        threat_conf=threat_conf,
+                        pq_required=bool(sec_ctx["pq_required"]),
+                        pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
+                    )
+                    if required_action == "block":
+                        action_label = "block"
+                        allowed = False
+                    elif required_action == "degrade":
+                        if action_label in {"allow", "none"}:
+                            action_label = "degrade"
+                        allowed = True
+                    else:
+                        if action_label == "allow":
+                            action_label = "none"
+                        allowed = action_label != "block"
+
+                    enforcement_mode = _safe_text(route_info.get("enforcement_mode"), max_len=32).lower() or (
+                        "fail_closed" if (required_action == "block" and http_cfg.strict_mode) else ("must_enforce" if (required_action != "allow" and http_cfg.strict_mode) else "advisory")
+                    )
+                    security_block = {
+                        "trust_zone": sec_ctx["trust_zone"],
+                        "route_profile": sec_ctx["route_profile"],
+                        "risk_label": risk_label,
+                        "threat_kind": threat_kind,
+                        "threat_confidence": threat_conf,
+                        "pq_required": sec_ctx["pq_required"],
+                        "pq_ok": route_info.get("pq_ok"),
+                        "policy_ref": policy_ref,
+                        "route_id": route_plan_id,
+                        "build_id": sec_ctx["build_id"],
+                        "image_digest": sec_ctx["image_digest"],
+                        "compliance_tags": list(sec_ctx["compliance_tags"]),
+                        "request_id": request_id,
+                        "event_id": event_id,
+                        "body_digest": body_digest,
+                        "surface_kind": "local_grpc_fallback",
+                    }
+                    artifacts = {
+                        "receipt_required": bool(http_cfg.receipts_enable_default or (http_cfg.require_receipts_on_fail and required_action == "block") or (http_cfg.require_receipts_when_pq and bool(sec_ctx["pq_required"]))),
+                        "ledger_required": bool(cfg.require_ledger),
+                        "attestation_required": bool(cfg.require_attestor or http_cfg.require_attestor_when_receipt_required),
+                        "ledger_stage": "skipped",
+                        "outbox_status": "none",
+                        "receipt_surface_kind": "local_attestation",
+                        "durability": "local_prepare_commit_with_outbox_fallback" if cfg.outbox_enabled else "ephemeral_local_only",
+                    }
+                    evidence_identity = {
+                        "request_id": request_id,
+                        "event_id": event_id,
+                        "decision_id": decision_id or None,
+                        "route_plan_id": route_plan_id or None,
+                        "config_fingerprint": config_fingerprint or rt.cfg_fp,
+                        "policy_ref": policy_ref,
+                        "policyset_ref": policyset_ref,
+                        "state_domain_id": state_domain_id,
+                        "controller_mode": controller_mode,
+                        "statistical_guarantee_scope": guarantee_scope,
+                        "receipt_ref": receipt_ref,
+                        "audit_ref": audit_ref,
+                        "produced_by": "service_grpc.local",
                     }
 
-                # Service-level evidence closure: prepare -> attest -> commit
+                if not decision_id:
+                    decision_id = f"gd1:{_hash_token(event_id + '|decision', ctx='tcd:grpc:decision', n=32)}"
+                if not route_plan_id:
+                    route_plan_id = f"gr1:{_hash_token(event_id + '|route_plan', ctx='tcd:grpc:route_plan', n=32)}"
+
+                receipt_needed = bool(
+                    http_cfg.receipts_enable_default
+                    or (http_cfg.require_receipts_on_fail and required_action == "block")
+                    or (http_cfg.require_receipts_when_pq and bool(sec_ctx["pq_required"]))
+                )
+                ledger_required = bool(cfg.require_ledger or artifacts.get("ledger_required"))
+                attestation_required = bool(cfg.require_attestor or artifacts.get("attestation_required"))
+
+                if http_cfg.strict_mode and http_cfg.require_finalized_receipt_surface_when_strict and receipt_needed and rt.security_router is None and raw_receipt_payload == {}:
+                    status_label = "unavailable"
+                    _set_grpc_error(
+                        context,
+                        grpc.StatusCode.UNAVAILABLE,
+                        "finalized receipt surface unavailable",
+                        request_id=request_id,
+                        event_id=event_id,
+                        decision_id=decision_id,
+                        route_plan_id=route_plan_id,
+                        api_version=cfg.protocol.api_version,
+                        schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
+                    )
+                    return pb.RiskResponse(  # type: ignore[misc]
+                        verdict=False,
+                        score=score,
+                        threshold=budget.threshold,
+                        budget_remaining=budget.alpha_wealth,
+                        components=_bounded_json_dumps({"error": "finalized_receipt_surface_unavailable"}, max_bytes=cfg.max_components_bytes),
+                        cause="receipt",
+                        action="reject",
+                        step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                        e_value=budget.e_value,
+                        alpha_alloc=budget.alpha_alloc,
+                        alpha_spent=budget.alpha_spent,
+                    )
+
                 ledger_stage = "skipped"
                 outbox_status = "none"
-                receipt_public = None
 
-                receipt_required = bool(route_dict.get("receipt_required")) or bool(cfg.require_attestor) or bool(response_verdict)
-                ledger_required = bool(route_dict.get("ledger_required")) or bool(cfg.require_ledger)
-                attestation_required = bool(route_dict.get("attestation_required")) or bool(cfg.require_attestor)
-
-                if _client_active(context) or receipt_required or ledger_required or attestation_required:
-                    evidence_identity = {
+                prepare_payload = {
+                    "type": "grpc.diagnose.prepare",
+                    "event_id": event_id,
+                    "request_id": request_id,
+                    "trace_id": trace_id,
+                    "method": method,
+                    "cfg_fp": rt.cfg_fp,
+                    "request_body_digest": body_digest,
+                    "event_fingerprint": event_fingerprint,
+                    "peer_hash": peer.peer_hash,
+                    "subject_hash": subject_result.subject_hash,
+                    "principal_hash": _hash_token(auth.principal, ctx="tcd:grpc:principal", n=16) if auth.principal else None,
+                    "trust_zone": sec_ctx["trust_zone"],
+                    "route_profile": sec_ctx["route_profile"],
+                    "action": action_label,
+                    "required_action": required_action,
+                    "score": score,
+                    "evidence_identity": {
+                        **evidence_identity,
                         "event_id": event_id,
                         "request_id": request_id,
-                        "trace_id": trace_id,
                         "decision_id": decision_id,
                         "route_plan_id": route_plan_id,
                         "policy_ref": policy_ref,
                         "policyset_ref": policyset_ref,
-                        "config_fingerprint": config_fp,
-                        "bundle_version": bundle_version,
-                    }
-                    prepare_payload = {
-                        "type": "grpc.diagnose.prepare",
-                        "event_id": event_id,
-                        "request_id": request_id,
-                        "trace_id": trace_id,
-                        "method": method,
-                        "cfg_fp": rt.cfg_fp,
-                        "request_body_digest": body_digest,
-                        "event_fingerprint": event_fingerprint,
-                        "peer_hash": peer.peer_hash,
-                        "subject_hash": subject_result.subject_hash,
-                        "principal_hash": _hash_token(auth.principal, ctx="tcd:grpc:principal", n=16) if auth.principal else None,
-                        "trust_zone": sec_ctx["trust_zone"],
-                        "route_profile": sec_ctx["route_profile"],
-                        "action": action_label,
-                        "required_action": required_action,
-                        "score": score_out,
-                        "evidence_identity": evidence_identity,
-                    }
-
-                    if rt.ledger is not None:
-                        try:
-                            def _ledger_prepare() -> Any:
-                                if hasattr(rt.ledger, "append_ex"):
-                                    return rt.ledger.append_ex(prepare_payload, stage="prepare")  # type: ignore[attr-defined]
-                                return rt.ledger.append(prepare_payload)  # type: ignore[attr-defined]
-
-                            remaining = _time_remaining_s(context)
-                            deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
-                            res = _dep_call_with_retry(
-                                dep="ledger",
-                                op="prepare",
-                                breaker=rt.br_ledger,
-                                executor=rt.exec_ledger,
-                                timeout_ms=cfg.ledger_timeout_ms,
-                                deadline_mono=deadline_mono,
-                                policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
-                                fn=_ledger_prepare,
-                                idempotent=True,
-                            )
-                            ledger_stage = "prepared"
-                            audit_ref = getattr(res, "head", None) or audit_ref
-                        except _DepException:
-                            ledger_stage = "prepare_failed"
-                            _GRPC_LEDGER_ERROR.labels(method, "prepare").inc()
-                            if ledger_required or cfg.strict_mode:
-                                status_label = "unavailable"
-                                _set_grpc_error(
-                                    context,
-                                    grpc.StatusCode.UNAVAILABLE,
-                                    "ledger prepare failed",
-                                    request_id=request_id,
-                                    event_id=event_id,
-                                    api_version=cfg.protocol.api_version,
-                                    schema_version=cfg.protocol.schema_version,
-                                )
-                                return pb.RiskResponse(  # type: ignore[misc]
-                                    verdict=True,
-                                    score=score_out,
-                                    threshold=float(av_out.get("threshold", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    budget_remaining=float(av_out.get("alpha_wealth", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    components=_bounded_json_dumps({"error": "ledger_prepare_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
-                                    cause="ledger",
-                                    action="reject",
-                                    step=step_out,
-                                    e_value=float(av_out.get("e_value", 1.0)) if isinstance(av_out, Mapping) else 1.0,
-                                    alpha_alloc=float(av_out.get("alpha_alloc", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    alpha_spent=float(av_out.get("alpha_spent", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                )
-                            elif rt.outbox is not None:
-                                outbox_payload = {"type": "grpc.ledger.prepare", "event_id": event_id, "payload": prepare_payload}
-                                payload_json = _canonical_json(outbox_payload)
-                                payload_digest = _blake3_hex(payload_json.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
-                                outbox_status = rt.outbox.put(kind="ledger", dedupe_key=f"{event_id}:prepare", payload_json=payload_json, payload_digest=payload_digest)
-
-                    if receipt_required and rt.attestor is not None:
-                        req_obj = {
-                            "ts_ns": time.time_ns(),
-                            "request_id": request_id,
-                            "trace_id": trace_id,
-                            "event_id": event_id,
-                            "peer_hash": peer.peer_hash,
-                            "subject_hash": subject_result.subject_hash,
-                            "subject_status": subject_result.status,
-                        }
-                        comp_obj = {
-                            "kind": "grpc_diagnose",
-                            "action": action_label,
-                            "required_action": required_action,
-                            "reason": cause,
-                            "score": score_out,
-                            "policy_ref": policy_ref,
-                            "policyset_ref": policyset_ref,
-                            "route_plan_id": route_plan_id,
-                            "decision_id": decision_id,
-                        }
-                        e_obj = {
-                            "e_state": dict(e_state) if isinstance(e_state, Mapping) else {},
-                            "controller_mode": controller_mode,
-                            "guarantee_scope": guarantee_scope,
-                        }
-                        witness_segments = [
-                            {
-                                "kind": "grpc_request",
-                                "id": event_id,
-                                "digest": body_digest,
-                                "meta": {"request_id": request_id, "trace_id": trace_id},
-                            }
-                        ]
-                        if route_plan_id:
-                            witness_segments.append(
-                                {
-                                    "kind": "route_plan",
-                                    "id": route_plan_id,
-                                    "digest": route_plan_id,
-                                    "meta": {"decision_id": decision_id, "policy_ref": policy_ref},
-                                }
-                            )
-                        att_meta = {
-                            "event_id": event_id,
-                            "request_id": request_id,
-                            "trace_id": trace_id,
-                            "cfg_fp": rt.cfg_fp,
-                            "policy_ref": policy_ref,
-                            "policyset_ref": policyset_ref,
-                            "state_domain_id": (e_state.get("controller", {}) or {}).get("state_domain_id") if isinstance(e_state, Mapping) else None,
-                            "adapter_registry_fp": (e_state.get("controller", {}) or {}).get("adapter_registry_fp") if isinstance(e_state, Mapping) else None,
-                            "route_profile": sec_ctx["route_profile"],
-                            "trust_zone": sec_ctx["trust_zone"],
-                            "audit_ref": audit_ref,
-                            "build_id": rt.build_id,
-                            "image_digest": rt.image_digest,
-                        }
-
-                        try:
-                            def _attest_issue() -> Any:
-                                return rt.attestor.issue(  # type: ignore[attr-defined]
-                                    req_obj=req_obj,
-                                    comp_obj=comp_obj,
-                                    e_obj=e_obj,
-                                    witness_segments=witness_segments,
-                                    witness_tags=["grpc", method.lower(), action_label],
-                                    meta=att_meta,
-                                )
-
-                            remaining = _time_remaining_s(context)
-                            deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
-                            att_payload = _dep_call_with_retry(
-                                dep="attestor",
-                                op="issue",
-                                breaker=rt.br_attestor,
-                                executor=rt.exec_attest,
-                                timeout_ms=cfg.attestor_timeout_ms,
-                                deadline_mono=deadline_mono,
-                                policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
-                                fn=_attest_issue,
-                                idempotent=True,
-                            )
-                            if isinstance(att_payload, Mapping):
-                                receipt_ref = att_payload.get("receipt") or att_payload.get("receipt_ref") or receipt_ref
-                                receipt_public = _receipt_public_from_mapping(att_payload)
-                        except _DepException:
-                            if attestation_required or cfg.strict_mode:
-                                status_label = "unavailable"
-                                _set_grpc_error(
-                                    context,
-                                    grpc.StatusCode.UNAVAILABLE,
-                                    "attestation failed",
-                                    request_id=request_id,
-                                    event_id=event_id,
-                                    api_version=cfg.protocol.api_version,
-                                    schema_version=cfg.protocol.schema_version,
-                                )
-                                return pb.RiskResponse(  # type: ignore[misc]
-                                    verdict=True,
-                                    score=score_out,
-                                    threshold=float(av_out.get("threshold", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    budget_remaining=float(av_out.get("alpha_wealth", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    components=_bounded_json_dumps({"error": "attestation_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
-                                    cause="attestation",
-                                    action="reject",
-                                    step=step_out,
-                                    e_value=float(av_out.get("e_value", 1.0)) if isinstance(av_out, Mapping) else 1.0,
-                                    alpha_alloc=float(av_out.get("alpha_alloc", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    alpha_spent=float(av_out.get("alpha_spent", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                )
-                            elif rt.outbox is not None:
-                                payload = {"type": "grpc.attest.issue", "event_id": event_id, "meta": att_meta}
-                                pj = _canonical_json(payload)
-                                pd = _blake3_hex(pj.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
-                                outbox_status = rt.outbox.put(kind="evidence", dedupe_key=f"{event_id}:attest", payload_json=pj, payload_digest=pd)
-
-                    if rt.ledger is not None and ledger_stage == "prepared":
-                        commit_payload = {
-                            "type": "grpc.diagnose.commit",
-                            "event_id": event_id,
-                            "request_id": request_id,
-                            "trace_id": trace_id,
-                            "cfg_fp": rt.cfg_fp,
-                            "action": action_label,
-                            "score": score_out,
-                            "route_plan_id": route_plan_id,
-                            "decision_id": decision_id,
-                            "receipt_ref": receipt_ref,
-                            "audit_ref": audit_ref,
-                        }
-                        try:
-                            def _ledger_commit() -> Any:
-                                if hasattr(rt.ledger, "append_ex"):
-                                    return rt.ledger.append_ex(commit_payload, stage="commit")  # type: ignore[attr-defined]
-                                return rt.ledger.append(commit_payload)  # type: ignore[attr-defined]
-
-                            remaining = _time_remaining_s(context)
-                            deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
-                            res2 = _dep_call_with_retry(
-                                dep="ledger",
-                                op="commit",
-                                breaker=rt.br_ledger,
-                                executor=rt.exec_ledger,
-                                timeout_ms=cfg.ledger_timeout_ms,
-                                deadline_mono=deadline_mono,
-                                policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
-                                fn=_ledger_commit,
-                                idempotent=True,
-                            )
-                            ledger_stage = "committed"
-                            audit_ref = getattr(res2, "head", None) or audit_ref
-                        except _DepException:
-                            ledger_stage = "commit_failed"
-                            _GRPC_LEDGER_ERROR.labels(method, "commit").inc()
-                            if ledger_required or cfg.strict_mode:
-                                status_label = "unavailable"
-                                _set_grpc_error(
-                                    context,
-                                    grpc.StatusCode.UNAVAILABLE,
-                                    "ledger commit failed",
-                                    request_id=request_id,
-                                    event_id=event_id,
-                                    api_version=cfg.protocol.api_version,
-                                    schema_version=cfg.protocol.schema_version,
-                                )
-                                return pb.RiskResponse(  # type: ignore[misc]
-                                    verdict=True,
-                                    score=score_out,
-                                    threshold=float(av_out.get("threshold", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    budget_remaining=float(av_out.get("alpha_wealth", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    components=_bounded_json_dumps({"error": "ledger_commit_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
-                                    cause="ledger",
-                                    action="reject",
-                                    step=step_out,
-                                    e_value=float(av_out.get("e_value", 1.0)) if isinstance(av_out, Mapping) else 1.0,
-                                    alpha_alloc=float(av_out.get("alpha_alloc", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                    alpha_spent=float(av_out.get("alpha_spent", 0.0)) if isinstance(av_out, Mapping) else 0.0,
-                                )
-                            elif rt.outbox is not None:
-                                payload = {"type": "grpc.ledger.commit", "event_id": event_id, "payload": commit_payload}
-                                pj = _canonical_json(payload)
-                                pd = _blake3_hex(pj.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
-                                outbox_status = rt.outbox.put(kind="ledger", dedupe_key=f"{event_id}:commit", payload_json=pj, payload_digest=pd)
-
-                components["decision"] = {
-                    "request_id": request_id,
-                    "trace_id": trace_id,
-                    "event_id": event_id,
-                    "policy_ref": policy_ref,
-                    "policyset_ref": policyset_ref,
-                    "config_fingerprint": config_fp,
-                    "bundle_version": bundle_version,
-                    "decision_id": decision_id,
-                    "route_plan_id": route_plan_id,
-                    "receipt_ref": receipt_ref,
-                    "audit_ref": audit_ref,
-                    "controller_mode": controller_mode,
-                    "statistical_guarantee_scope": guarantee_scope,
-                    "ledger_stage": ledger_stage,
-                    "outbox_status": outbox_status,
-                    "protocol": {
-                        "api_version": compat.api_version,
-                        "client_version": compat.client_version,
-                        "compatibility_epoch": compat.compatibility_epoch,
-                        "client_capabilities": list(compat.client_capabilities),
+                        "config_fingerprint": config_fingerprint or rt.cfg_fp,
+                        "bundle_version": bundle_version or 0,
+                        "state_domain_id": state_domain_id,
                     },
                 }
-                components.setdefault("security", {})
-                if isinstance(components["security"], dict):
-                    components["security"].update(
+
+                if rt.ledger is not None:
+                    try:
+                        def _ledger_prepare() -> Any:
+                            if hasattr(rt.ledger, "append_ex"):
+                                return rt.ledger.append_ex(prepare_payload, stage="prepare")  # type: ignore[attr-defined]
+                            return rt.ledger.append(prepare_payload)  # type: ignore[attr-defined]
+
+                        res_prep = _dep_call_with_retry(
+                            dep="ledger",
+                            op="prepare",
+                            breaker=rt.br_ledger,
+                            executor=rt.exec_ledger,
+                            timeout_ms=cfg.ledger_timeout_ms,
+                            deadline_mono=deadline_mono,
+                            policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
+                            fn=_ledger_prepare,
+                            idempotent=True,
+                        )
+                        ledger_stage = "prepared"
+                        audit_ref = getattr(res_prep, "head", None) or audit_ref
+                    except _DepException:
+                        ledger_stage = "prepare_failed"
+                        _GRPC_LEDGER_ERROR.labels(method, "prepare").inc()
+                        if ledger_required or http_cfg.strict_mode:
+                            status_label = "unavailable"
+                            _set_grpc_error(
+                                context,
+                                grpc.StatusCode.UNAVAILABLE,
+                                "ledger prepare failed",
+                                request_id=request_id,
+                                event_id=event_id,
+                                decision_id=decision_id,
+                                route_plan_id=route_plan_id,
+                                api_version=cfg.protocol.api_version,
+                                schema_version=cfg.protocol.schema_version,
+                                cfg_fp=rt.cfg_fp,
+                            )
+                            return pb.RiskResponse(  # type: ignore[misc]
+                                verdict=True,
+                                score=score,
+                                threshold=budget.threshold,
+                                budget_remaining=budget.alpha_wealth,
+                                components=_bounded_json_dumps({"error": "ledger_prepare_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
+                                cause="ledger",
+                                action="reject",
+                                step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                                e_value=budget.e_value,
+                                alpha_alloc=budget.alpha_alloc,
+                                alpha_spent=budget.alpha_spent,
+                            )
+                        elif rt.outbox is not None:
+                            outbox_payload = {"type": "grpc.ledger.prepare", "event_id": event_id, "payload": prepare_payload}
+                            payload_json = _canonical_json(outbox_payload)
+                            payload_digest = _blake3_or_sha256(payload_json.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
+                            outbox_status = rt.outbox.put(kind="ledger", dedupe_key=f"{event_id}:prepare", payload_json=payload_json, payload_digest=payload_digest)
+
+                if not raw_receipt_payload and receipt_needed and rt.receipt_mgr.attestor is not None:
+                    req_like2 = type(
+                        "ReqLike2",
+                        (),
                         {
-                            "trust_zone": sec_ctx["trust_zone"],
-                            "route_profile": sec_ctx["route_profile"],
+                            "tenant": tenant,
+                            "user": user,
+                            "session": sess,
+                            "model_id": model_id,
+                            "gpu_id": gpu_id,
+                            "task": task,
+                            "lang": lang,
+                            "risk_label": risk_label,
                             "threat_kind": threat_kind,
-                            "threat_confidence": threat_conf,
                             "pq_required": sec_ctx["pq_required"],
+                            "context": {},
+                            "tokens_delta": int(tokens_delta),
+                            "drift_score": drift_score,
+                            "base_temp": base_temp,
+                            "base_top_p": base_top_p,
                             "build_id": sec_ctx["build_id"],
                             "image_digest": sec_ctx["image_digest"],
                             "compliance_tags": list(sec_ctx["compliance_tags"]),
-                        }
+                        },
+                    )()
+
+                    def _issue_local_receipt() -> Any:
+                        return rt.receipt_mgr.issue_local_final(
+                            trace=trace_vec,
+                            spectrum=spectrum,
+                            features=features,
+                            req=req_like2,
+                            request_id=request_id,
+                            event_id=event_id,
+                            body_digest=body_digest,
+                            score=score,
+                            p_final=p_final,
+                            route_info=route_info,
+                            final_action=action_label,
+                            required_action=required_action,
+                            enforcement_mode=enforcement_mode,
+                            allowed=allowed,
+                            cause=cause,
+                            policy_ref=policy_ref,
+                            policyset_ref=policyset_ref,
+                            policy_digest=det_signal.get("policy_digest"),
+                            cfg_fp=config_fingerprint or rt.cfg_fp,
+                            decision_id=decision_id,
+                            route_plan_id=route_plan_id,
+                            audit_ref=audit_ref,
+                            state_domain_id=state_domain_id,
+                            adapter_registry_fp=budget.adapter_registry_fp,
+                            budget=budget,
+                            detector_components=det_components,
+                            mv_info=mv_info,
+                            security_block=security_block,
+                            artifacts=artifacts,
+                            evidence_identity=evidence_identity,
+                            pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
+                        )
+
+                    try:
+                        rb = _dep_call_with_retry(
+                            dep="attestor",
+                            op="issue_local_final",
+                            breaker=rt.br_attestor,
+                            executor=rt.exec_attest,
+                            timeout_ms=cfg.attestor_timeout_ms,
+                            deadline_mono=deadline_mono,
+                            policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
+                            fn=_issue_local_receipt,
+                            idempotent=True,
+                        )
+                        if rb is not None:
+                            raw_receipt_payload = dict(getattr(rb, "raw", {}) or {})
+                            receipt_public = dict(getattr(rb, "public", {}) or {})
+                            receipt_verification = dict(getattr(rb, "verification", {}) or {}) if getattr(rb, "verification", None) is not None else None
+                            receipt_ref = _safe_text(raw_receipt_payload.get("receipt_ref"), max_len=256) or receipt_ref
+                    except _DepException:
+                        if attestation_required or http_cfg.strict_mode:
+                            status_label = "unavailable"
+                            _set_grpc_error(
+                                context,
+                                grpc.StatusCode.UNAVAILABLE,
+                                "attestation failed",
+                                request_id=request_id,
+                                event_id=event_id,
+                                decision_id=decision_id,
+                                route_plan_id=route_plan_id,
+                                api_version=cfg.protocol.api_version,
+                                schema_version=cfg.protocol.schema_version,
+                                cfg_fp=rt.cfg_fp,
+                            )
+                            return pb.RiskResponse(  # type: ignore[misc]
+                                verdict=True,
+                                score=score,
+                                threshold=budget.threshold,
+                                budget_remaining=budget.alpha_wealth,
+                                components=_bounded_json_dumps({"error": "attestation_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
+                                cause="attestation",
+                                action="reject",
+                                step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                                e_value=budget.e_value,
+                                alpha_alloc=budget.alpha_alloc,
+                                alpha_spent=budget.alpha_spent,
+                            )
+                        elif rt.outbox is not None:
+                            payload = {"type": "grpc.attest.issue", "event_id": event_id, "meta": {"request_id": request_id, "decision_id": decision_id, "route_plan_id": route_plan_id}}
+                            pj = _canonical_json(payload)
+                            pd = _blake3_or_sha256(pj.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
+                            outbox_status = rt.outbox.put(kind="evidence", dedupe_key=f"{event_id}:attest", payload_json=pj, payload_digest=pd)
+
+                if http_cfg.strict_mode and http_cfg.require_attestor_when_receipt_required and receipt_needed and not raw_receipt_payload:
+                    status_label = "unavailable"
+                    _set_grpc_error(
+                        context,
+                        grpc.StatusCode.UNAVAILABLE,
+                        "receipt unavailable",
+                        request_id=request_id,
+                        event_id=event_id,
+                        decision_id=decision_id,
+                        route_plan_id=route_plan_id,
+                        api_version=cfg.protocol.api_version,
+                        schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
-                if receipt_public is not None:
-                    components["receipt_public"] = receipt_public
+                    return pb.RiskResponse(  # type: ignore[misc]
+                        verdict=False,
+                        score=score,
+                        threshold=budget.threshold,
+                        budget_remaining=budget.alpha_wealth,
+                        components=_bounded_json_dumps({"error": "receipt_unavailable"}, max_bytes=cfg.max_components_bytes),
+                        cause="receipt",
+                        action="reject",
+                        step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                        e_value=budget.e_value,
+                        alpha_alloc=budget.alpha_alloc,
+                        alpha_spent=budget.alpha_spent,
+                    )
 
-                components_json = _bounded_json_dumps(
-                    _sanitize_components(
-                        components,
-                        max_depth=6,
-                        max_items=128,
-                        max_str_len=1024,
-                        max_total_bytes=cfg.max_components_bytes,
-                    ),
-                    max_bytes=cfg.max_components_bytes,
-                )
+                if rt.ledger is not None and ledger_stage == "prepared":
+                    commit_payload = {
+                        "type": "grpc.diagnose.commit",
+                        "event_id": event_id,
+                        "request_id": request_id,
+                        "trace_id": trace_id,
+                        "cfg_fp": rt.cfg_fp,
+                        "action": action_label,
+                        "score": score,
+                        "route_plan_id": route_plan_id,
+                        "decision_id": decision_id,
+                        "receipt_ref": receipt_ref,
+                        "audit_ref": audit_ref,
+                    }
+                    try:
+                        def _ledger_commit() -> Any:
+                            if hasattr(rt.ledger, "append_ex"):
+                                return rt.ledger.append_ex(commit_payload, stage="commit")  # type: ignore[attr-defined]
+                            return rt.ledger.append(commit_payload)  # type: ignore[attr-defined]
 
-                raw_out = {
-                    "verdict": bool(response_verdict),
-                    "decision": "block" if action_label == "block" else ("degrade" if action_label == "degrade" else "allow"),
-                    "cause": _safe_text(cause, max_len=128),
-                    "action": action_label if action_label in {"block", "degrade"} else "none",
-                    "score": float(score_out),
-                    "threshold": float(av_out.get("threshold", 0.0)),
-                    "budget_remaining": float(av_out.get("alpha_wealth", 0.0)),
-                    "step": int(step_out),
-                    "e_value": float(av_out.get("e_value", 1.0)),
-                    "alpha_alloc": float(av_out.get("alpha_alloc", 0.0)),
-                    "alpha_spent": float(av_out.get("alpha_spent", 0.0)),
-                    "components": _sanitize_components(
-                        components,
-                        max_depth=6,
-                        max_items=128,
-                        max_str_len=1024,
-                        max_total_bytes=cfg.max_components_bytes,
-                    ),
-                    "e_state": e_state,
-                    "route": route_dict,
-                    "trust_zone": sec_ctx["trust_zone"],
-                    "route_profile": sec_ctx["route_profile"],
-                    "threat_kind": threat_kind,
-                    "threat_confidence": threat_conf,
-                    "pq_required": bool(sec_ctx["pq_required"]),
-                    "pq_ok": route_dict.get("pq_ok") if isinstance(route_dict, Mapping) else None,
-                    "policy_ref": policy_ref,
-                    "policyset_ref": policyset_ref,
-                    "config_fingerprint": config_fp,
-                    "bundle_version": bundle_version,
+                        res_commit = _dep_call_with_retry(
+                            dep="ledger",
+                            op="commit",
+                            breaker=rt.br_ledger,
+                            executor=rt.exec_ledger,
+                            timeout_ms=cfg.ledger_timeout_ms,
+                            deadline_mono=deadline_mono,
+                            policy=RetryPolicy(max_attempts=max(1, cfg.dep_retry_max), base_backoff_ms=cfg.dep_retry_base_ms),
+                            fn=_ledger_commit,
+                            idempotent=True,
+                        )
+                        ledger_stage = "committed"
+                        audit_ref = getattr(res_commit, "head", None) or audit_ref
+                    except _DepException:
+                        ledger_stage = "commit_failed"
+                        _GRPC_LEDGER_ERROR.labels(method, "commit").inc()
+                        if ledger_required or http_cfg.strict_mode:
+                            status_label = "unavailable"
+                            _set_grpc_error(
+                                context,
+                                grpc.StatusCode.UNAVAILABLE,
+                                "ledger commit failed",
+                                request_id=request_id,
+                                event_id=event_id,
+                                decision_id=decision_id,
+                                route_plan_id=route_plan_id,
+                                api_version=cfg.protocol.api_version,
+                                schema_version=cfg.protocol.schema_version,
+                                cfg_fp=rt.cfg_fp,
+                            )
+                            return pb.RiskResponse(  # type: ignore[misc]
+                                verdict=True,
+                                score=score,
+                                threshold=budget.threshold,
+                                budget_remaining=budget.alpha_wealth,
+                                components=_bounded_json_dumps({"error": "ledger_commit_failed", "event_id": event_id}, max_bytes=cfg.max_components_bytes),
+                                cause="ledger",
+                                action="reject",
+                                step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                                e_value=budget.e_value,
+                                alpha_alloc=budget.alpha_alloc,
+                                alpha_spent=budget.alpha_spent,
+                            )
+                        elif rt.outbox is not None:
+                            payload = {"type": "grpc.ledger.commit", "event_id": event_id, "payload": commit_payload}
+                            pj = _canonical_json(payload)
+                            pd = _blake3_or_sha256(pj.encode("utf-8", errors="strict"), ctx="tcd:grpc:outbox")
+                            outbox_status = rt.outbox.put(kind="ledger", dedupe_key=f"{event_id}:commit", payload_json=pj, payload_digest=pd)
+
+                raw_receipt_payload = {
+                    **raw_receipt_payload,
+                    "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
+                    "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
+                    "event_id": raw_receipt_payload.get("event_id") or event_id,
+                    "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
+                    "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
+                    "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
+                    "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
+                    "cfg_fp": raw_receipt_payload.get("cfg_fp") or config_fingerprint or rt.cfg_fp,
+                    "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
+                    "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+                    "build_id": raw_receipt_payload.get("build_id") or sec_ctx["build_id"],
+                    "image_digest": raw_receipt_payload.get("image_digest") or sec_ctx["image_digest"],
+                    "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else sec_ctx["pq_required"],
+                    "pq_ok": raw_receipt_payload.get("pq_ok") if raw_receipt_payload.get("pq_ok") is not None else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+                }
+
+                if raw_receipt_payload and not receipt_public:
+                    receipt_public, receipt_verification = _build_receipt_surfaces(
+                        raw_receipt_payload,
+                        expose_verification_bundle_public=http_cfg.expose_verification_bundle_public,
+                        expose_verify_key_public=http_cfg.expose_verify_key_public,
+                    )
+
+                evidence_identity = {
+                    **evidence_identity,
+                    "request_id": request_id,
+                    "event_id": event_id,
                     "decision_id": decision_id,
                     "route_plan_id": route_plan_id,
-                    "event_id": event_id,
+                    "policy_ref": policy_ref,
+                    "policyset_ref": policyset_ref,
+                    "config_fingerprint": config_fingerprint or rt.cfg_fp,
+                    "bundle_version": bundle_version or 0,
+                    "state_domain_id": state_domain_id,
                     "audit_ref": audit_ref,
-                    "receipt_ref": receipt_ref,
+                    "receipt_ref": receipt_public.get("receipt_ref") or receipt_ref,
                     "controller_mode": controller_mode,
                     "statistical_guarantee_scope": guarantee_scope,
                 }
-                _ = _normalize_out(raw_out)
+                artifacts = {
+                    **artifacts,
+                    "ledger_stage": ledger_stage,
+                    "outbox_status": outbox_status,
+                }
+
+                identity_status = "ok"
+                if subject_result.status != "ok":
+                    identity_status = subject_result.status
+
+                auth_public = auth.to_public_dict(record_principal=cfg.record_raw_principal, record_key_id=cfg.record_raw_key_id) if auth.ok else {"mode": auth.mode, "trusted": auth.trusted}
+
+                components: Dict[str, Any] = {
+                    "response_contract_version": "grpc-aligned-to-http-v5-full",
+                    "detector": _sanitize_json_mapping(
+                        {
+                            **det_components,
+                            "decision": verdict_pack.get("decision"),
+                            "action": verdict_pack.get("action"),
+                            "risk": verdict_pack.get("risk"),
+                            "p_value": verdict_pack.get("p_value"),
+                            "reason_code": verdict_pack.get("reason_code"),
+                            "error_code": verdict_pack.get("error_code"),
+                            "decision_id": verdict_pack.get("decision_id"),
+                            "config_hash": verdict_pack.get("config_hash"),
+                            "policy_digest": verdict_pack.get("policy_digest"),
+                            "state_digest": verdict_pack.get("state_digest"),
+                        },
+                        max_depth=5,
+                        max_items=64,
+                        max_str_len=512,
+                        max_total_bytes=64_000,
+                    ),
+                    "multivariate": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
+                    "e_process": _sanitize_json_mapping(av_out.get("e_state", {}), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=96_000),
+                    "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                    "security": _sanitize_json_mapping(security_block, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                    "security_router": _sanitize_json_mapping(security_public, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                    "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+                    "receipt_public": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
+                    "receipt": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
+                    "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+                    "auth": _sanitize_json_mapping(auth_public, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+                    "identity": {
+                        "status": identity_status,
+                        "tenant": tenant,
+                        "user": user,
+                        "session": sess,
+                        "model_id": model_id,
+                    },
+                    "request": {
+                        "body_digest": body_digest,
+                        "tenant": tenant,
+                        "user": user,
+                        "session": sess,
+                        "model_id": model_id,
+                        "gpu_id": gpu_id,
+                        "task": task,
+                        "lang": lang,
+                    },
+                    "decision": {
+                        "request_id": request_id,
+                        "trace_id": trace_id,
+                        "event_id": event_id,
+                        "decision_id": decision_id,
+                        "route_plan_id": route_plan_id,
+                        "policy_ref": policy_ref,
+                        "policyset_ref": policyset_ref,
+                        "config_fingerprint": config_fingerprint or rt.cfg_fp,
+                        "bundle_version": bundle_version or 0,
+                        "state_domain_id": state_domain_id,
+                        "controller_mode": controller_mode,
+                        "statistical_guarantee_scope": guarantee_scope,
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_public.get("receipt_ref") or receipt_ref,
+                    },
+                }
+                if receipt_verification is not None:
+                    components["receipt_verification"] = _sanitize_json_mapping(receipt_verification, max_depth=6, max_items=128, max_str_len=2048, max_total_bytes=rt.verify_limits.max_receipt_body_bytes)
+                    components["receipt_verification_exposed"] = True
 
                 with contextlib.suppress(Exception):
                     rt.prom.observe_latency(max(0.0, time.perf_counter() - t0))
                 with contextlib.suppress(Exception):
-                    rt.prom.push(vp, labels={"model_id": model_id, "gpu_id": gpu_id})
+                    rt.prom.push(verdict_pack, labels={"model_id": model_id, "gpu_id": gpu_id})
                 with contextlib.suppress(Exception):
                     rt.prom.push_eprocess(
                         model_id=model_id,
@@ -4245,38 +4645,88 @@ if _HAS_GRPC and _HAS_STUBS:
                         tenant=tenant,
                         user=user,
                         session=sess,
-                        e_value=float(av_out.get("e_value", 1.0)),
-                        alpha_alloc=float(av_out.get("alpha_alloc", 0.0)),
-                        alpha_wealth=float(av_out.get("alpha_wealth", 0.0)),
+                        e_value=budget.e_value,
+                        alpha_alloc=budget.alpha_alloc,
+                        alpha_wealth=budget.alpha_wealth,
                     )
                 with contextlib.suppress(Exception):
-                    rt.prom.update_budget_metrics(tenant, user, sess, remaining=float(av_out.get("alpha_wealth", 0.0)), spent=bool(av_out.get("alpha_spent", 0.0) > 0.0))
+                    rt.prom.update_budget_metrics(tenant, user, sess, remaining=budget.alpha_wealth, spent=bool(budget.alpha_spent > 0.0))
                 with contextlib.suppress(Exception):
-                    if action_label in {"degrade", "block"}:
-                        rt.prom.record_action(model_id, gpu_id, action=action_label)
+                    if required_action != "allow":
+                        rt.prom.record_action(model_id, gpu_id, action=required_action)
                 with contextlib.suppress(Exception):
                     slo_ms = float(getattr(rt.settings, "slo_latency_ms", 0.0) or 0.0)
                     lat_ms = (time.perf_counter() - t0) * 1000.0
                     if slo_ms and lat_ms > slo_ms:
                         rt.prom.slo_violation_by_model("diagnose_latency", model_id, gpu_id)
 
-                return pb.RiskResponse(  # type: ignore[misc]
-                    verdict=bool(response_verdict),
-                    score=float(score_out),
-                    threshold=float(av_out.get("threshold", 0.0)),
-                    budget_remaining=float(av_out.get("alpha_wealth", 0.0)),
-                    components=components_json,
+                response_verdict = bool(required_action != "allow")
+                decision_label = "block" if action_label == "block" else ("degrade" if action_label in {"degrade", "advisory"} or required_action == "degrade" else "allow")
+                resp = pb.RiskResponse(  # type: ignore[misc]
+                    verdict=response_verdict,
+                    score=float(score),
+                    threshold=float(budget.threshold),
+                    budget_remaining=float(budget.alpha_wealth),
+                    components=_bounded_json_dumps(
+                        _sanitize_json_mapping(
+                            components,
+                            max_depth=http_cfg.max_component_depth,
+                            max_items=http_cfg.max_component_items,
+                            max_str_len=http_cfg.max_component_str_len,
+                            max_total_bytes=http_cfg.max_json_component_bytes,
+                        ),
+                        max_bytes=cfg.max_components_bytes,
+                    ),
                     cause=_safe_text(cause, max_len=128),
-                    action=action_label if action_label in {"block", "degrade"} else "none",
-                    step=int(step_out),
-                    e_value=float(av_out.get("e_value", 1.0)),
-                    alpha_alloc=float(av_out.get("alpha_alloc", 0.0)),
-                    alpha_spent=float(av_out.get("alpha_spent", 0.0)),
+                    action="block" if decision_label == "block" else ("degrade" if decision_label == "degrade" else "none"),
+                    step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                    e_value=float(budget.e_value),
+                    alpha_alloc=float(budget.alpha_alloc),
+                    alpha_spent=float(budget.alpha_spent),
                 )
+                _safe_pb_set(resp, "allowed", bool(allowed))
+                _safe_pb_set(resp, "decision", decision_label)
+                _safe_pb_set(resp, "required_action", required_action)
+                _safe_pb_set(resp, "enforcement_mode", enforcement_mode)
+                _safe_pb_set(resp, "request_id", request_id)
+                _safe_pb_set(resp, "event_id", event_id)
+                _safe_pb_set(resp, "decision_id", decision_id)
+                _safe_pb_set(resp, "route_plan_id", route_plan_id)
+                _safe_pb_set(resp, "policy_ref", policy_ref)
+                _safe_pb_set(resp, "policyset_ref", policyset_ref)
+                _safe_pb_set(resp, "config_fingerprint", config_fingerprint or rt.cfg_fp)
+                _safe_pb_set(resp, "bundle_version", bundle_version or 0)
+                _safe_pb_set(resp, "state_domain_id", state_domain_id)
+                _safe_pb_set(resp, "controller_mode", controller_mode)
+                _safe_pb_set(resp, "statistical_guarantee_scope", guarantee_scope)
+                _safe_pb_set(resp, "audit_ref", audit_ref)
+                _safe_pb_set(resp, "receipt_ref", receipt_public.get("receipt_ref") or receipt_ref)
+                _safe_pb_set(resp, "trust_zone", sec_ctx["trust_zone"])
+                _safe_pb_set(resp, "route_profile", sec_ctx["route_profile"])
+                _safe_pb_set(resp, "threat_kind", threat_kind)
+                _safe_pb_set(resp, "pq_required", bool(sec_ctx["pq_required"]))
+                _safe_pb_set(resp, "pq_ok", _coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None)
+                _safe_pb_set(resp, "receipt_public_json", _bounded_json_dumps(receipt_public, max_bytes=32_000))
+                if receipt_verification is not None:
+                    _safe_pb_set(resp, "receipt_verification_json", _bounded_json_dumps(receipt_verification, max_bytes=min(64_000, rt.verify_limits.max_receipt_body_bytes)))
+                _safe_pb_set(resp, "evidence_identity_json", _bounded_json_dumps(evidence_identity, max_bytes=16_000))
+                _safe_pb_set(resp, "artifacts_json", _bounded_json_dumps(artifacts, max_bytes=16_000))
+
+                _set_trailing_metadata(
+                    context,
+                    request_id=request_id,
+                    event_id=event_id,
+                    decision_id=decision_id,
+                    route_plan_id=route_plan_id,
+                    api_version=cfg.protocol.api_version,
+                    schema_version=cfg.protocol.schema_version,
+                    cfg_fp=rt.cfg_fp,
+                )
+                return resp
 
             except Exception as e:
                 status_label = "error"
-                _GRPC_REQ_ERROR.labels(method, ERR_INTERNAL).inc()
+                _GRPC_REQ_ERROR.labels(method, "INTERNAL").inc()
                 if cfg.debug_errors:
                     logger.exception("grpc diagnose failed")
                 _set_grpc_error(
@@ -4285,8 +4735,11 @@ if _HAS_GRPC and _HAS_STUBS:
                     "internal error",
                     request_id=request_id or None,
                     event_id=event_id or None,
+                    decision_id=decision_id or None,
+                    route_plan_id=route_plan_id or None,
                     api_version=cfg.protocol.api_version,
                     schema_version=cfg.protocol.schema_version,
+                    cfg_fp=rt.cfg_fp,
                 )
                 return pb.RiskResponse(  # type: ignore[misc]
                     verdict=False,
@@ -4315,6 +4768,8 @@ if _HAS_GRPC and _HAS_STUBS:
                             "method": method,
                             "request_id": _safe_text(request_id, max_len=96),
                             "event_id": _safe_text(event_id, max_len=96),
+                            "decision_id": _safe_text(decision_id, max_len=96),
+                            "route_plan_id": _safe_text(route_plan_id, max_len=96),
                             "status": status_label,
                             "action": action_label,
                             "dur_ms": round(dur * 1000.0, 3),
@@ -4348,6 +4803,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "deadline exceeded",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
@@ -4361,6 +4817,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "server overloaded",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
@@ -4376,6 +4833,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         "metadata too large",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
@@ -4390,11 +4848,12 @@ if _HAS_GRPC and _HAS_STUBS:
                         "payload too large",
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
                 peer = _extract_peer_identity(context)
-                subject_legacy, request_id, trace_id, idem, principal_hint = _resolve_subject_and_request(context, request)
+                request_id, trace_id, idem, principal_hint = _resolve_request_identity(request, context)
                 compat = _resolve_protocol_compat(method, request, md, cfg.protocol)
                 if not compat.ok:
                     status_label = "bad_request"
@@ -4406,6 +4865,7 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
@@ -4414,7 +4874,7 @@ if _HAS_GRPC and _HAS_STUBS:
                     request,
                     policy=cfg.subject_policy,
                     request_id=request_id,
-                    body_digest=_blake3_hex(body_bytes, ctx="tcd:grpc:verify:body"),
+                    body_digest=_body_digest(body_bytes, alg=rt.http_cfg.hash_alg),
                     peer=peer,
                     cfg_fp=rt.cfg_fp,
                 )
@@ -4428,9 +4888,12 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
+                remaining = _time_remaining_s(context)
+                deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
                 auth = rt.auth_adapter.authenticate(
                     method_name=method,
                     metadata={k: v for k, v in md.items() if k in set(cfg.metadata_allowlist)},
@@ -4440,7 +4903,7 @@ if _HAS_GRPC and _HAS_STUBS:
                     event_id="",
                     api_version=compat.api_version,
                     compatibility_epoch=compat.compatibility_epoch,
-                    deadline_mono=(time.perf_counter() + (rem if (rem := (_time_remaining_s(context) or 0.0)) > 0 else 0.0)) if _time_remaining_s(context) is not None else None,
+                    deadline_mono=deadline_mono,
                 )
                 if not _enforce_method_authz(auth, cfg.verify_authz, peer):
                     status_label = "unauthenticated" if not auth.ok else "forbidden"
@@ -4451,11 +4914,11 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
-                subject = subject_result.subject
-                if not _consume_rate(rt, subject=subject, principal_id=auth.principal, model_id="verify", cost=1.0):
+                if not _consume_rate(rt, subject=subject_result.subject, principal_id=auth.principal or principal_hint, model_id="verify", cost=1.0):
                     status_label = "rate_limited"
                     _GRPC_REQ_REJECTED.labels(method, "rate_limited").inc()
                     _set_grpc_error(
@@ -4465,198 +4928,209 @@ if _HAS_GRPC and _HAS_STUBS:
                         request_id=request_id,
                         api_version=cfg.protocol.api_version,
                         schema_version=cfg.protocol.schema_version,
+                        cfg_fp=rt.cfg_fp,
                     )
                     return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
-                sec_ctx = _normalize_security_context(context, request, cfg)
+                pq_required = _coerce_bool(getattr(request, "pq_required", None), default=False)
+                verify_key = _safe_text(getattr(request, "verify_key", None), max_len=4096) or None
+                verify_key_hex_legacy = _safe_text(getattr(request, "verify_key_hex", None), max_len=4096) or None
+                if verify_key is None:
+                    verify_key = verify_key_hex_legacy
 
-                def _build_verify_payload() -> Dict[str, Any]:
-                    has_chain = (len(request.heads) > 0) or (len(request.bodies) > 0)
-                    if has_chain:
-                        if len(request.heads) != len(request.bodies) or len(request.heads) == 0:
-                            raise ValueError("heads/bodies must align and be non-empty")
-                        if len(request.heads) > cfg.max_verify_chain_items:
-                            raise ValueError("window too large")
-                        total_bytes = 0
-                        heads: List[str] = []
-                        bodies: List[str] = []
-                        for h, b in zip(list(request.heads), list(request.bodies)):
-                            hs = _safe_text(h, max_len=130)
-                            bs = _safe_text(b, max_len=cfg.max_verify_body_bytes * 2)
-                            total_bytes += len(hs.encode("utf-8", errors="ignore")) + len(bs.encode("utf-8", errors="ignore"))
-                            if total_bytes > cfg.max_verify_total_bytes:
-                                raise ValueError("chain too large")
-                            heads.append(hs)
-                            bodies.append(bs)
-                        return {"mode": "chain", "heads": heads, "bodies": bodies}
+                has_chain = bool(list(getattr(request, "heads", []) or [])) or bool(list(getattr(request, "bodies", []) or []))
+                if has_chain:
+                    heads = [str(x) for x in list(getattr(request, "heads", []) or [])]
+                    bodies = [str(x) for x in list(getattr(request, "bodies", []) or [])]
+                    if len(heads) != len(bodies) or not heads:
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "heads/bodies invalid", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    if len(heads) > rt.verify_limits.max_window:
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "window too large", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    total_len = sum(len(h) for h in heads) + sum(len(b) for b in bodies)
+                    if total_len > rt.verify_limits.max_chain_payload_bytes:
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "verify payload too large", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    verify_payload: Dict[str, Any] = {"mode": "chain", "heads": heads, "bodies": bodies}
+                else:
+                    receipt_head_hex = _safe_text(getattr(request, "receipt_head_hex", None), max_len=rt.verify_limits.max_head_hex_len) or None
+                    receipt_body_json = getattr(request, "receipt_body_json", None)
+                    if receipt_head_hex is None or not isinstance(receipt_body_json, str):
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "missing receipt head/body", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    if len(receipt_body_json.encode("utf-8", errors="strict")) > rt.verify_limits.max_receipt_body_bytes:
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "receipt body too large", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    if verify_key is not None and len(verify_key) > rt.verify_limits.max_verify_key_len:
+                        status_label = "bad_request"
+                        _set_grpc_error(context, grpc.StatusCode.INVALID_ARGUMENT, "verify key too large", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
-                    if not request.receipt_head_hex or not request.receipt_body_json:
-                        raise ValueError("missing receipt head/body")
+                    witness_segments: Any = None
+                    raw_segments = getattr(request, "witness_segments", None)
+                    if raw_segments:
+                        try:
+                            if isinstance(raw_segments, str):
+                                witness_segments = json.loads(raw_segments)
+                            elif isinstance(raw_segments, (list, tuple)):
+                                witness_segments = raw_segments
+                        except Exception:
+                            witness_segments = None
+                    if witness_segments is None:
+                        wt = list(getattr(request, "witness_trace", []) or [])
+                        ws = list(getattr(request, "witness_spectrum", []) or [])
+                        wf = list(getattr(request, "witness_feat", []) or [])
+                        if wt or ws or wf:
+                            witness_segments = ([int(x) for x in wt], [int(x) for x in ws], [int(x) for x in wf])
 
-                    body_json = str(request.receipt_body_json)
-                    if len(body_json.encode("utf-8", errors="ignore")) > cfg.max_verify_body_bytes:
-                        raise ValueError("receipt body too large")
-
-                    witness = None
-                    wlen = len(request.witness_trace) + len(request.witness_spectrum) + len(request.witness_feat)
-                    if wlen > (_MAX_TRACE + _MAX_SPECT + _MAX_FEATS):
-                        raise ValueError("witness too large")
-                    if wlen > 0:
-                        witness = (
-                            [int(x) for x in request.witness_trace],
-                            [int(x) for x in request.witness_spectrum],
-                            [int(x) for x in request.witness_feat],
-                        )
-
-                    def _maybe(obj: str) -> Optional[Dict[str, Any]]:
-                        if not obj:
+                    def _maybe_json_attr(name: str) -> Optional[Dict[str, Any]]:
+                        raw = getattr(request, name, None)
+                        if raw is None:
                             return None
-                        parsed = json.loads(obj)
-                        return parsed if isinstance(parsed, dict) else None
+                        if isinstance(raw, str) and raw:
+                            try:
+                                parsed = json.loads(raw)
+                                return parsed if isinstance(parsed, dict) else None
+                            except Exception:
+                                return None
+                        return raw if isinstance(raw, dict) else None
 
-                    return {
+                    verify_payload = {
                         "mode": "receipt",
-                        "receipt_head_hex": str(request.receipt_head_hex),
-                        "receipt_body_json": body_json,
-                        "verify_key_hex": str(request.verify_key_hex) if request.verify_key_hex else None,
-                        "receipt_sig_hex": str(request.receipt_sig_hex) if request.receipt_sig_hex else None,
-                        "req_obj": _maybe(request.req_json),
-                        "comp_obj": _maybe(request.comp_json),
-                        "e_obj": _maybe(request.e_json),
-                        "witness_segments": witness,
+                        "receipt_head_hex": receipt_head_hex,
+                        "receipt_body_json": receipt_body_json,
+                        "verify_key": verify_key,
+                        "receipt_sig_hex": _safe_text(getattr(request, "receipt_sig_hex", None), max_len=8192) or None,
+                        "req_obj": _maybe_json_attr("req_json") or _maybe_json_attr("req_obj"),
+                        "comp_obj": _maybe_json_attr("comp_json") or _maybe_json_attr("comp_obj"),
+                        "e_obj": _maybe_json_attr("e_json") or _maybe_json_attr("e_obj"),
+                        "witness_segments": witness_segments,
+                        "pq_required": pq_required,
+                        "require_signature": _coerce_bool(getattr(request, "require_signature", None), default=False) if getattr(request, "require_signature", None) is not None else None,
+                        "expected_policy_ref": _safe_text(getattr(request, "expected_policy_ref", None), max_len=256) or None,
+                        "expected_policyset_ref": _safe_text(getattr(request, "expected_policyset_ref", None), max_len=256) or None,
+                        "expected_policy_digest": _safe_text(getattr(request, "expected_policy_digest", None), max_len=256) or None,
+                        "expected_cfg_fp": _safe_text(getattr(request, "expected_cfg_fp", None), max_len=256) or None,
+                        "expected_build_id": _safe_text(getattr(request, "expected_build_id", None), max_len=256) or None,
+                        "expected_image_digest": _safe_text(getattr(request, "expected_image_digest", None), max_len=256) or None,
+                        "runtime_build_id": rt.build_id or None,
+                        "runtime_image_digest": rt.image_digest or None,
                     }
 
-                try:
-                    verify_payload = _build_verify_payload()
-                except ValueError as e:
-                    status_label = "bad_request"
-                    _set_grpc_error(
-                        context,
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        _safe_text(e, max_len=128),
-                        request_id=request_id,
-                        api_version=cfg.protocol.api_version,
-                        schema_version=cfg.protocol.schema_version,
-                    )
-                    return pb.VerifyResponse(ok=False)  # type: ignore[misc]
-
-                remaining = _time_remaining_s(context)
                 verify_timeout_ms = cfg.verify_timeout_ms
                 if remaining is not None:
                     verify_timeout_ms = min(verify_timeout_ms, max(1, int(remaining * 1000.0) - 25))
 
-                if cfg.verify_hard_timeout_mode == "process":
+                ok = False
+                reason = "verify_fail"
+                report_dict: Dict[str, Any] = {}
+
+                timeout_mode = _safe_text(getattr(request, "verify_timeout_mode", None), max_len=16).lower() or cfg.verify_hard_timeout_mode
+                if timeout_mode == "process":
                     timeout_s = max(0.001, verify_timeout_ms / 1000.0)
                     res = _verify_via_process(verify_payload, timeout_s=timeout_s, start_method=cfg.verify_process_start_method)
-                    if not bool(res.get("ok", False)):
-                        kind = _safe_text(res.get("kind", "verify_false"), max_len=32)
-                        if kind == "timeout":
-                            status_label = "timeout"
-                            _set_grpc_error(context, grpc.StatusCode.DEADLINE_EXCEEDED, "verification timeout", request_id=request_id)
-                            return pb.VerifyResponse(ok=False)  # type: ignore[misc]
-                        status_label = "error" if kind in {"exception", "missing_result"} else "bad_request"
-                        _set_grpc_error(
-                            context,
-                            grpc.StatusCode.INTERNAL if status_label == "error" else grpc.StatusCode.INVALID_ARGUMENT,
-                            "verification failed",
-                            request_id=request_id,
-                        )
+                    kind = _safe_text(res.get("kind", "verify_false"), max_len=32)
+                    if kind == "timeout":
+                        status_label = "timeout"
+                        _set_grpc_error(context, grpc.StatusCode.DEADLINE_EXCEEDED, "verification timeout", request_id=request_id, cfg_fp=rt.cfg_fp)
                         return pb.VerifyResponse(ok=False)  # type: ignore[misc]
-                    ok = True
+                    if kind == "permission":
+                        status_label = "forbidden"
+                        _set_grpc_error(context, grpc.StatusCode.PERMISSION_DENIED, _safe_text(res.get("error"), max_len=128) or "verification denied", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    if kind in {"exception", "missing_result", "bad_result"}:
+                        status_label = "error"
+                        _set_grpc_error(context, grpc.StatusCode.INTERNAL, "verification error", request_id=request_id, cfg_fp=rt.cfg_fp)
+                        return pb.VerifyResponse(ok=False)  # type: ignore[misc]
+                    ok = bool(res.get("ok", False))
+                    report_dict = dict(res.get("report") or {})
+                    reason = "chain" if verify_payload["mode"] == "chain" else "receipt"
                 else:
-                    deadline_mono = (time.perf_counter() + remaining) if remaining is not None else None
-
-                    def _verify_impl() -> bool:
+                    def _verify_impl() -> Tuple[bool, Dict[str, Any], str]:
                         if verify_payload["mode"] == "chain":
-                            return bool(verify_chain(verify_payload["heads"], verify_payload["bodies"]))
-                        ok_local = bool(
-                            verify_receipt(
-                                receipt_head_hex=str(verify_payload["receipt_head_hex"]),
+                            ok_local = bool(verify_chain(verify_payload["heads"], verify_payload["bodies"]))
+                            return ok_local, {}, "chain"
+                        report = verify_receipt_ex(
+                            receipt_head_hex=str(verify_payload["receipt_head_hex"]),
+                            receipt_body_json=str(verify_payload["receipt_body_json"]),
+                            verify_key_hex=(str(verify_payload["verify_key"]) if verify_payload.get("verify_key") else None),
+                            receipt_sig_hex=(str(verify_payload["receipt_sig_hex"]) if verify_payload.get("receipt_sig_hex") else None),
+                            req_obj=verify_payload.get("req_obj"),
+                            comp_obj=verify_payload.get("comp_obj"),
+                            e_obj=verify_payload.get("e_obj"),
+                            witness_segments=verify_payload.get("witness_segments"),
+                            strict=True,
+                            expected_policy_ref=verify_payload.get("expected_policy_ref"),
+                            expected_policyset_ref=verify_payload.get("expected_policyset_ref"),
+                            expected_policy_digest=verify_payload.get("expected_policy_digest"),
+                            expected_cfg_fp=verify_payload.get("expected_cfg_fp"),
+                            expected_build_id=verify_payload.get("expected_build_id"),
+                            expected_image_digest=verify_payload.get("expected_image_digest"),
+                            require_signature=verify_payload.get("require_signature"),
+                        )
+                        ok_local = bool(getattr(report, "ok", False))
+                        if ok_local:
+                            _verify_supply_chain_and_pq_from_body(
                                 receipt_body_json=str(verify_payload["receipt_body_json"]),
-                                verify_key_hex=(str(verify_payload["verify_key_hex"]) if verify_payload.get("verify_key_hex") else None),
-                                receipt_sig_hex=(str(verify_payload["receipt_sig_hex"]) if verify_payload.get("receipt_sig_hex") else None),
-                                req_obj=verify_payload.get("req_obj"),
-                                comp_obj=verify_payload.get("comp_obj"),
-                                e_obj=verify_payload.get("e_obj"),
-                                witness_segments=verify_payload.get("witness_segments"),
-                                strict=True,
+                                pq_required=bool(verify_payload.get("pq_required", False)),
+                                runtime_build_id=rt.build_id or None,
+                                runtime_image_digest=rt.image_digest or None,
                             )
-                        )
-                        if not ok_local:
-                            return False
-                        try:
-                            body_obj = json.loads(str(verify_payload["receipt_body_json"]))
-                        except Exception:
-                            body_obj = None
-
-                        sec_block: Dict[str, Any] = {}
-                        if isinstance(body_obj, dict):
-                            comps = body_obj.get("components")
-                            if isinstance(comps, dict):
-                                sec_candidate = comps.get("security")
-                                if isinstance(sec_candidate, dict):
-                                    sec_block = sec_candidate
-                            if not sec_block and isinstance(body_obj.get("security"), dict):
-                                sec_block = body_obj["security"]
-
-                        pq_required_eff = bool(
-                            (sec_block.get("pq_required") if isinstance(sec_block, dict) else False)
-                            or (body_obj.get("pq_required") if isinstance(body_obj, dict) else False)
-                            or bool(sec_ctx.get("pq_required"))
-                        )
-                        pq_ok_eff = sec_block.get("pq_ok") if isinstance(sec_block, dict) else None
-                        if pq_required_eff and (pq_ok_eff is False or pq_ok_eff is None):
-                            raise PermissionError("pq_violation")
-
-                        runtime_build_id = rt.build_id or None
-                        runtime_image_digest = rt.image_digest or None
-                        if isinstance(sec_block, dict):
-                            rec_build = sec_block.get("build_id")
-                            rec_image = sec_block.get("image_digest")
-                            if runtime_build_id and rec_build and rec_build != runtime_build_id:
-                                raise PermissionError("supply_chain_mismatch_build")
-                            if runtime_image_digest and rec_image and rec_image != runtime_image_digest:
-                                raise PermissionError("supply_chain_mismatch_image")
-                        return True
+                        return ok_local, _verify_report_to_dict(report), "receipt"
 
                     try:
-                        ok = bool(
-                            _dep_call_with_retry(
-                                dep="verify",
-                                op="receipt_or_chain",
-                                breaker=rt.br_verify,
-                                executor=rt.exec_verify,
-                                timeout_ms=verify_timeout_ms,
-                                deadline_mono=deadline_mono,
-                                policy=RetryPolicy(max_attempts=1, base_backoff_ms=cfg.dep_retry_base_ms),
-                                fn=_verify_impl,
-                                idempotent=False,
-                            )
+                        ok, report_dict, reason = _dep_call_with_retry(
+                            dep="verify",
+                            op="receipt_or_chain",
+                            breaker=rt.br_verify,
+                            executor=rt.exec_verify,
+                            timeout_ms=verify_timeout_ms,
+                            deadline_mono=deadline_mono,
+                            policy=RetryPolicy(max_attempts=1, base_backoff_ms=cfg.dep_retry_base_ms),
+                            fn=_verify_impl,
+                            idempotent=False,
                         )
                     except _DepException as exc:
                         if exc.kind == "timeout":
                             status_label = "timeout"
-                            _set_grpc_error(context, grpc.StatusCode.DEADLINE_EXCEEDED, "verification timeout", request_id=request_id)
+                            _set_grpc_error(context, grpc.StatusCode.DEADLINE_EXCEEDED, "verification timeout", request_id=request_id, cfg_fp=rt.cfg_fp)
                         elif exc.kind == "queue_full":
                             status_label = "overloaded"
-                            _set_grpc_error(context, grpc.StatusCode.RESOURCE_EXHAUSTED, "verify overloaded", request_id=request_id)
+                            _set_grpc_error(context, grpc.StatusCode.RESOURCE_EXHAUSTED, "verify overloaded", request_id=request_id, cfg_fp=rt.cfg_fp)
                         elif exc.kind == "breaker_open":
                             status_label = "unavailable"
-                            _set_grpc_error(context, grpc.StatusCode.UNAVAILABLE, "verify unavailable", request_id=request_id)
+                            _set_grpc_error(context, grpc.StatusCode.UNAVAILABLE, "verify unavailable", request_id=request_id, cfg_fp=rt.cfg_fp)
                         else:
                             status_label = "error"
-                            _set_grpc_error(context, grpc.StatusCode.INTERNAL, "verification error", request_id=request_id)
+                            _set_grpc_error(context, grpc.StatusCode.INTERNAL, "verification error", request_id=request_id, cfg_fp=rt.cfg_fp)
                         return pb.VerifyResponse(ok=False)  # type: ignore[misc]
                     except PermissionError as e:
                         status_label = "forbidden"
-                        _set_grpc_error(context, grpc.StatusCode.PERMISSION_DENIED, _safe_text(e, max_len=128), request_id=request_id)
+                        _set_grpc_error(context, grpc.StatusCode.PERMISSION_DENIED, _safe_text(e, max_len=128), request_id=request_id, cfg_fp=rt.cfg_fp)
                         return pb.VerifyResponse(ok=False)  # type: ignore[misc]
 
-                return pb.VerifyResponse(ok=bool(ok))  # type: ignore[misc]
+                resp = pb.VerifyResponse(ok=bool(ok))  # type: ignore[misc]
+                _safe_pb_set(resp, "request_id", request_id)
+                _safe_pb_set(resp, "reason", reason)
+                _safe_pb_set(resp, "report_json", _bounded_json_dumps(report_dict, max_bytes=64_000))
+                _set_trailing_metadata(
+                    context,
+                    request_id=request_id,
+                    api_version=cfg.protocol.api_version,
+                    schema_version=cfg.protocol.schema_version,
+                    cfg_fp=rt.cfg_fp,
+                )
+                return resp
 
             except Exception as e:
                 status_label = "error"
-                _GRPC_REQ_ERROR.labels(method, ERR_INTERNAL).inc()
+                _GRPC_REQ_ERROR.labels(method, "INTERNAL").inc()
                 if cfg.debug_errors:
                     logger.exception("grpc verify failed")
                 _set_grpc_error(
@@ -4666,6 +5140,7 @@ if _HAS_GRPC and _HAS_STUBS:
                     request_id=request_id or None,
                     api_version=cfg.protocol.api_version,
                     schema_version=cfg.protocol.schema_version,
+                    cfg_fp=rt.cfg_fp,
                 )
                 return pb.VerifyResponse(ok=False)  # type: ignore[misc]
             finally:
@@ -4687,18 +5162,11 @@ else:
 # ---------------------------------------------------------------------------
 
 def register_grpc_services(server: "grpc.Server", runtime: Optional[_Runtime] = None) -> bool:  # type: ignore[name-defined]
-    """
-    Attach TCD gRPC services to an existing grpc.Server.
-
-    Returns True if services were registered; False if grpcio/stubs are unavailable.
-    """
     if not grpc_supported():  # pragma: no cover
         return False
-
     global _RUNTIME
     if runtime is not None:
         with _RUNTIME_LOCK:
             _RUNTIME = runtime
-
     pb_grpc.add_TcdServiceServicer_to_server(TcdService(runtime=runtime), server)  # type: ignore[attr-defined]
     return True

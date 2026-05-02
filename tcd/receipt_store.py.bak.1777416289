@@ -1,0 +1,2263 @@
+from __future__ import annotations
+
+"""
+Receipt stores — governed persistence for verifiable, content-agnostic receipts.
+
+This module is a drop-in replacement for the older receipt_store.py.  It keeps
+existing public API compatibility while adding receipt-v2-aware validation,
+privacy hardening, richer metadata extraction, stronger SRE metrics, and safer
+JSONL / SQLite persistence.
+
+Design constraints
+------------------
+- The store is signature-scheme agnostic.  It persists head/body/signature/key
+  material and validates chain / metadata shape, but it does not interpret or
+  verify classical/PQ/hybrid signatures.
+- By default the store does NOT mutate `body_json` on append.  Receipt heads are
+  usually computed over canonical body bytes by an issuer/attestor.  Silent
+  re-canonicalization inside the store can break head/body binding, so it is an
+  explicit opt-in (`canonicalize_body_on_append=True`).
+- Receipt body metadata must stay content-agnostic.  The validator scans for
+  raw prompt/completion/request/response/header/auth/token-like fields and can
+  warn or reject depending on config.
+- Backends remain thread-safe and stdlib-only except optional prometheus_client.
+"""
+
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import threading
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, Literal
+
+try:  # pragma: no cover - platform-specific
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    from .verify import verify_chain
+except Exception:  # pragma: no cover
+    def verify_chain(*_: Any, **__: Any) -> bool:  # type: ignore[no-redef]
+        raise RuntimeError("tcd.verify.verify_chain is unavailable")
+
+try:
+    from prometheus_client import REGISTRY, Counter, Histogram, Gauge  # type: ignore
+    _HAS_PROM = True
+except Exception:  # pragma: no cover
+    _HAS_PROM = False
+
+__all__ = [
+    "ReceiptStoreConfig",
+    "ReceiptValidationResult",
+    "ReceiptRow",
+    "ReceiptSummary",
+    "ReceiptAuditReport",
+    "ReceiptStore",
+    "InMemoryReceiptStore",
+    "JsonlReceiptStore",
+    "SqliteReceiptStore",
+    "build_store_from_env",
+    "verify_recent_chain",
+    "validate_receipt_body_json",
+    "summarize_recent_receipts",
+    "audit_recent_receipts",
+    "export_tail_jsonl",
+    "append_receipt_v2_body",
+]
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+class _Nop:
+    def labels(self, *_, **__):
+        return self
+    def inc(self, *_ , **__):
+        pass
+    def set(self, *_ , **__):
+        pass
+    def observe(self, *_ , **__):
+        pass
+
+
+def _mk_counter(name: str, doc: str, labelnames: Sequence[str]) -> Any:
+    if not _HAS_PROM:
+        return _Nop()
+    try:
+        return Counter(name, doc, labelnames=list(labelnames), registry=REGISTRY)
+    except Exception:  # duplicate registration or custom registry mismatch
+        return _Nop()
+
+
+def _mk_gauge(name: str, doc: str, labelnames: Sequence[str]) -> Any:
+    if not _HAS_PROM:
+        return _Nop()
+    try:
+        return Gauge(name, doc, labelnames=list(labelnames), registry=REGISTRY)
+    except Exception:
+        return _Nop()
+
+
+def _mk_hist(name: str, doc: str, labelnames: Sequence[str], buckets: Sequence[float]) -> Any:
+    if not _HAS_PROM:
+        return _Nop()
+    try:
+        return Histogram(name, doc, labelnames=list(labelnames), buckets=tuple(buckets), registry=REGISTRY)
+    except Exception:
+        return _Nop()
+
+
+_RCPT_APPEND = _mk_counter(
+    "tcd_receipts_append_total",
+    "Receipt append operations",
+    ("backend", "status"),
+)
+_RCPT_BYTES = _mk_counter(
+    "tcd_receipts_body_bytes_total",
+    "Total appended receipt body bytes",
+    ("backend",),
+)
+_RCPT_COUNT = _mk_gauge(
+    "tcd_receipts_count",
+    "Approx number of receipts in store",
+    ("backend",),
+)
+_RCPT_APPEND_LAT = _mk_hist(
+    "tcd_receipts_append_latency_seconds",
+    "Append latency",
+    ("backend",),
+    (0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5),
+)
+_RCPT_VERIFY_LAT = _mk_hist(
+    "tcd_receipts_verify_latency_seconds",
+    "Verification latency over a window",
+    ("backend",),
+    (0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+_RCPT_VERIFY_FAIL = _mk_counter(
+    "tcd_receipts_verify_fail_total",
+    "Chain verification failures",
+    ("backend", "reason"),
+)
+_RCPT_VALIDATION = _mk_counter(
+    "tcd_receipts_validation_total",
+    "Receipt body validation outcomes",
+    ("backend", "status", "reason"),
+)
+_RCPT_SUMMARY_TRIGGERED = _mk_gauge(
+    "tcd_receipts_recent_triggered",
+    "Triggered e-process receipts in the most recent summary window",
+    ("backend",),
+)
+
+# =============================================================================
+# Constants / regex
+# =============================================================================
+
+Profile = Literal["DEV", "PROD", "FINREG", "LOCKDOWN"]
+OnValidationError = Literal["warn", "reject"]
+
+_RECEIPT_STORE_SCHEMA = "tcd.receipt.store.v3"
+_RECEIPT_META_SCHEMA_V2 = "tcd.receipt.meta.v2"
+
+_ASCII_CTRL_RE = re.compile(r"[\x00-\x1F\x7F]")
+_SAFE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-@#/+=]{0,255}$")
+_SAFE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:\-]{0,127}$")
+_HEXISH_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{8,4096}$")
+_ALG_HEX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:(?:0x)?[0-9a-fA-F]{8,4096}$")
+_SIG_MATERIAL_RE = re.compile(r"^[A-Za-z0-9+/=_.:\-,]*$")
+
+# Conservative secret detection for metadata values.
+_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+_PRIVKEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)?PRIVATE KEY-----", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._\-~=+/]+\b", re.IGNORECASE)
+_BASIC_RE = re.compile(r"\bBasic\s+[A-Za-z0-9+/=]{16,}\b", re.IGNORECASE)
+_KV_SECRET_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|apikey|token|secret|password|passwd|pwd)\s*[:=]\s*([^\s,;]{8,})"
+)
+_OPENAI_SK_RE = re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")
+_AWS_AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+_GOOGLE_AIZA_RE = re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")
+_ENTROPY_B64URL_RE = re.compile(r"\b[A-Za-z0-9_-]{60,}\b")
+
+_FORBIDDEN_META_KEY_TOKENS = frozenset(
+    {
+        "prompt", "completion", "messages", "message", "content",
+        "payload", "request", "response", "headers", "header",
+        "cookie", "cookies", "authorization", "auth", "token", "secret",
+        "password", "passwd", "pwd", "api", "apikey", "api_key",
+        "private", "privatekey",
+    }
+)
+
+# Tokens that make an otherwise suspicious key safe because they denote digest/id/ref metadata.
+_KEY_CONTEXT_EXEMPT_TOKENS = frozenset(
+    {
+        "id", "rid", "eid", "hash", "digest", "checksum", "fingerprint", "fp",
+        "ref", "receipt", "audit", "ledger", "attestation", "chain", "head",
+        "prev", "previous", "keyid", "kid", "verify", "model", "tokenizer",
+        "image", "build", "config", "cfg", "policy", "state", "route", "decision",
+    }
+)
+
+_NUMERIC_FIELDS = frozenset(
+    {
+        "e_value", "selected_e_value", "controller_e_value", "strict_e_value",
+        "selected_log_e", "controller_log_e", "strict_log_e", "p_final",
+        "p_value", "drift_score", "score", "alpha_alloc", "alpha_spent",
+        "alpha_wealth", "threshold", "threshold_log_e", "latency_ms",
+        "throughput_tok_s",
+    }
+)
+
+_BOOL_FIELDS = frozenset({"trigger", "active", "frozen", "allowed", "pq_required", "pq_ok"})
+
+# =============================================================================
+# Low-level helpers
+# =============================================================================
+
+def _has_unsafe_unicode(s: str) -> bool:
+    for ch in s:
+        if ch in ("\u2028", "\u2029"):
+            return True
+        cat = unicodedata.category(ch)
+        if cat in ("Cc", "Cf", "Cs", "Zl", "Zp"):
+            return True
+    return False
+
+
+def _strip_unsafe_text(v: Any, *, max_len: int) -> str:
+    if not isinstance(v, str):
+        return ""
+    s = unicodedata.normalize("NFC", v[:max_len])
+    if s.isascii():
+        if _ASCII_CTRL_RE.search(s):
+            s = _ASCII_CTRL_RE.sub("", s)
+        return s.strip()
+    if not _ASCII_CTRL_RE.search(s) and not _has_unsafe_unicode(s):
+        if any(0x80 <= ord(ch) <= 0x9F for ch in s):
+            pass
+        else:
+            return s.strip()
+    out: List[str] = []
+    for ch in s:
+        o = ord(ch)
+        if ch in ("\u2028", "\u2029"):
+            continue
+        if o < 0x20 or o == 0x7F:
+            continue
+        if 0x80 <= o <= 0x9F:
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("Cc", "Cf", "Cs", "Zl", "Zp"):
+            continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _scalar_text(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return ""
+        return f"{v:.12g}"
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return "<bytes>"
+    return f"<{type(v).__name__}>"
+
+
+def _safe_text(v: Any, *, max_len: int = 256, redact_mode: str = "none") -> str:
+    s = _strip_unsafe_text(_scalar_text(v), max_len=max_len)
+    if not s:
+        return ""
+    mode = (redact_mode or "none").lower()
+    if mode in {"token", "log", "strict"} and _looks_like_secret(s):
+        return "[redacted]"
+    if mode == "strict" and _looks_like_high_entropy(s):
+        # Keep digest-like strings only when key context allows it; for standalone values redact.
+        return "[redacted]"
+    return s[:max_len]
+
+
+def _safe_label(v: Any, *, default: str = "unknown") -> str:
+    s = _safe_text(v, max_len=64, redact_mode="token").lower()
+    if not s or s == "[redacted]" or not _SAFE_LABEL_RE.fullmatch(s):
+        return default
+    return s
+
+
+def _safe_id(v: Any, *, default: Optional[str] = None, max_len: int = 256) -> Optional[str]:
+    s = _safe_text(v, max_len=max_len, redact_mode="token")
+    if not s or s == "[redacted]" or not _SAFE_ID_RE.fullmatch(s):
+        return default
+    return s
+
+
+def _looks_like_secret(s: str) -> bool:
+    if not s:
+        return False
+    if _JWT_RE.search(s):
+        return True
+    if _PRIVKEY_RE.search(s):
+        return True
+    if _BEARER_RE.search(s):
+        return True
+    if _BASIC_RE.search(s):
+        return True
+    if _OPENAI_SK_RE.search(s):
+        return True
+    if _AWS_AKIA_RE.search(s):
+        return True
+    if _GOOGLE_AIZA_RE.search(s):
+        return True
+    if _KV_SECRET_RE.search(s):
+        return True
+    return False
+
+
+def _looks_like_high_entropy(s: str) -> bool:
+    return bool(s) and (_ENTROPY_B64URL_RE.search(s) is not None)
+
+
+def _coerce_float(v: Any) -> Optional[float]:
+    if type(v) is bool:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            x = float(v)
+        except Exception:
+            return None
+        return x if math.isfinite(x) else None
+    if type(v) is str:
+        s = v.strip()
+        if not s or len(s) > 128:
+            return None
+        try:
+            x = float(s)
+        except Exception:
+            return None
+        return x if math.isfinite(x) else None
+    return None
+
+
+def _coerce_int(v: Any) -> Optional[int]:
+    if type(v) is int:
+        return int(v)
+    if type(v) is str:
+        s = v.strip()
+        if not s or len(s) > 128:
+            return None
+        if s.startswith(("+", "-")):
+            sign, digits = s[0], s[1:]
+        else:
+            sign, digits = "", s
+        if not digits.isdigit():
+            return None
+        try:
+            return int(sign + digits, 10)
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_bool(v: Any) -> Optional[bool]:
+    if type(v) is bool:
+        return v
+    if type(v) is int:
+        if v == 0:
+            return False
+        if v == 1:
+            return True
+        return None
+    if type(v) is str:
+        s = v.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _clamp_int(v: Any, *, default: int, lo: int, hi: int) -> int:
+    x = _coerce_int(v)
+    if x is None:
+        return int(default)
+    return min(max(int(x), lo), hi)
+
+
+def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
+    x = _coerce_float(v)
+    if x is None:
+        return float(default)
+    return min(max(float(x), lo), hi)
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _sha256_hex(data: bytes, *, ctx: bytes = b"") -> str:
+    h = hashlib.sha256()
+    if ctx:
+        h.update(ctx)
+        h.update(b"\x00")
+    h.update(data)
+    return h.hexdigest()
+
+
+def _qps_ema(prev: float, last_ts: float, now: float, alpha: float = 0.1) -> float:
+    if last_ts <= 0.0 or now <= last_ts:
+        return (1.0 - alpha) * prev + alpha * 1.0
+    inst = 1.0 / max(1e-6, (now - last_ts))
+    return (1.0 - alpha) * prev + alpha * inst
+
+
+def _key_tokens(k: str) -> Tuple[str, ...]:
+    s = _strip_unsafe_text(k, max_len=128)
+    if not s:
+        return tuple()
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)
+    s = re.sub(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])", " ", s)
+    s = re.sub(r"[^A-Za-z0-9]+", " ", s).strip().lower()
+    if not s:
+        return tuple()
+    parts = tuple(p for p in s.split(" ") if p)
+    fused = "".join(parts)
+    return parts + ((fused,) if fused and fused not in parts else tuple())
+
+
+def _key_is_forbidden(k: str) -> bool:
+    toks = _key_tokens(k)
+    if not toks:
+        return True
+    # exact payload-bearing keys are forbidden
+    if any(tok in _FORBIDDEN_META_KEY_TOKENS for tok in toks):
+        # body_digest, request_id, auth_policy_ref, verify_key_id etc. are structural IDs/digests.
+        if any(tok in _KEY_CONTEXT_EXEMPT_TOKENS for tok in toks):
+            return False
+        return True
+    return False
+
+
+class _JsonBudget:
+    __slots__ = ("max_nodes", "max_items", "max_depth", "max_str_total", "nodes", "str_used")
+
+    def __init__(self, *, max_nodes: int, max_items: int, max_depth: int, max_str_total: int) -> None:
+        self.max_nodes = int(max_nodes)
+        self.max_items = int(max_items)
+        self.max_depth = int(max_depth)
+        self.max_str_total = int(max_str_total)
+        self.nodes = 0
+        self.str_used = 0
+
+    def take_node(self) -> bool:
+        self.nodes += 1
+        return self.nodes <= self.max_nodes
+
+    def take_str(self, n: int) -> bool:
+        self.str_used += int(max(0, n))
+        return self.str_used <= self.max_str_total
+
+
+def _json_sanitize(
+    obj: Any,
+    *,
+    budget: _JsonBudget,
+    depth: int,
+    max_str_len: int,
+    redact_secrets: bool,
+    drop_forbidden_keys: bool,
+) -> Any:
+    if not budget.take_node():
+        return "[truncated]"
+
+    t = type(obj)
+    if obj is None:
+        return None
+    if t is bool:
+        return bool(obj)
+    if t is int:
+        if obj.bit_length() > 256:
+            return "[int:oversize]"
+        return int(obj)
+    if t is float:
+        return float(obj) if math.isfinite(obj) else None
+    if t is str:
+        s = _strip_unsafe_text(obj, max_len=max_str_len)
+        if redact_secrets and _looks_like_secret(s):
+            s = "[redacted]"
+        if not budget.take_str(len(s)):
+            return "[truncated]"
+        return s
+    if t in (bytes, bytearray, memoryview):
+        return f"[bytes:{len(obj)}]"
+
+    if depth >= budget.max_depth:
+        return "[truncated-depth]"
+
+    if t is dict:
+        out: Dict[str, Any] = {}
+        n = 0
+        for k, v in obj.items():
+            if n >= budget.max_items:
+                out["_tcd_truncated"] = True
+                break
+            if type(k) is not str:
+                continue
+            kk = _safe_id(k, default=None, max_len=128)
+            if kk is None:
+                continue
+            if drop_forbidden_keys and _key_is_forbidden(kk):
+                continue
+            out[kk] = _json_sanitize(
+                v,
+                budget=budget,
+                depth=depth + 1,
+                max_str_len=max_str_len,
+                redact_secrets=redact_secrets,
+                drop_forbidden_keys=drop_forbidden_keys,
+            )
+            n += 1
+        return out
+
+    if t in (list, tuple):
+        out_list: List[Any] = []
+        for i, item in enumerate(obj):
+            if i >= budget.max_items:
+                out_list.append("[truncated]")
+                break
+            out_list.append(
+                _json_sanitize(
+                    item,
+                    budget=budget,
+                    depth=depth + 1,
+                    max_str_len=max_str_len,
+                    redact_secrets=redact_secrets,
+                    drop_forbidden_keys=drop_forbidden_keys,
+                )
+            )
+        return out_list
+
+    if t in (set, frozenset):
+        xs = list(obj)[: budget.max_items]
+        out_set = [
+            _json_sanitize(
+                x,
+                budget=budget,
+                depth=depth + 1,
+                max_str_len=max_str_len,
+                redact_secrets=redact_secrets,
+                drop_forbidden_keys=drop_forbidden_keys,
+            )
+            for x in xs
+        ]
+        try:
+            return sorted(out_set, key=lambda x: _canonical_json(x))
+        except Exception:
+            return out_set
+
+    return f"[type:{t.__name__}]"
+
+
+def _json_depth_exceeds(s: str, *, max_depth: int) -> bool:
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in "{[":
+            depth += 1
+            if depth > max_depth:
+                return True
+        elif ch in "}]":
+            depth = max(0, depth - 1)
+    return False
+
+
+def _make_parse_int_limiter(max_digits: int):
+    max_digits = max(1, int(max_digits))
+    def _parse_int(s: str) -> int:
+        ss = s[1:] if s.startswith("-") else s
+        if len(ss) > max_digits:
+            raise ValueError("integer too large")
+        return int(s, 10)
+    return _parse_int
+
+
+def _json_loads_strict(s: str, *, max_depth: int, max_int_digits: int) -> Any:
+    if _json_depth_exceeds(s, max_depth=max_depth):
+        raise ValueError("json depth limit exceeded")
+    def _bad_const(_: str) -> Any:
+        raise ValueError("non-finite JSON value")
+    return json.loads(s, parse_constant=_bad_const, parse_int=_make_parse_int_limiter(max_int_digits))
+
+
+def _tail_lines(path: Path, n: int, *, block_size: int = 64 * 1024) -> List[str]:
+    if n <= 0 or not path.exists():
+        return []
+    out: List[str] = []
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        buf = b""
+        pos = end
+        while pos > 0 and len(out) < n:
+            step = max(0, pos - block_size)
+            size = pos - step
+            f.seek(step)
+            chunk = f.read(size)
+            pos = step
+            buf = chunk + buf
+            *lines, buf = buf.split(b"\n")
+            for line in reversed(lines):
+                s = line.decode("utf-8", errors="ignore").strip()
+                if s:
+                    out.append(s)
+                if len(out) >= n:
+                    break
+        if len(out) < n and buf:
+            s = buf.decode("utf-8", errors="ignore").strip()
+            if s:
+                out.append(s)
+    out.reverse()
+    return out[-n:]
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    try:
+        c = 0
+        with path.open("rb") as fr:
+            for line in fr:
+                if line.strip():
+                    c += 1
+        return c
+    except Exception:
+        return 0
+
+# =============================================================================
+# Config / validation data
+# =============================================================================
+
+@dataclass(frozen=True)
+class ReceiptStoreConfig:
+    profile: Profile = "PROD"
+
+    # Append validation.  `warn` means invalid metadata increments metrics but is stored.
+    validate_on_append: bool = True
+    on_validation_error: OnValidationError = "warn"
+
+    # Do not mutate attested bodies by default; opt in only when issuer delegates canonicalization here.
+    canonicalize_body_on_append: bool = False
+    sanitize_body_on_canonicalize: bool = True
+    reject_forbidden_body_keys: bool = False
+    strict_body_top_level_dict: bool = False
+
+    # Budgets
+    max_body_bytes: int = 512 * 1024
+    max_head_chars: int = 4096
+    max_sig_chars: int = 64 * 1024
+    max_verify_key_chars: int = 64 * 1024
+    max_json_depth: int = 32
+    max_json_items: int = 512
+    max_json_nodes: int = 8192
+    max_json_str_total: int = 256_000
+    max_json_str_len: int = 4096
+    max_int_digits: int = 2048
+
+    # Backend behavior
+    fsync_writes: bool = True
+    fsync_dir: bool = False
+    jsonl_process_lock: bool = False
+    sqlite_synchronous: Literal["NORMAL", "FULL"] = "NORMAL"
+    sqlite_journal_mode: Literal["WAL", "DELETE"] = "WAL"
+    sqlite_busy_timeout_ms: int = 30_000
+
+    # Metrics/cardinality metadata labels are intentionally not exposed here.
+
+    def normalized(self) -> "ReceiptStoreConfig":
+        prof = _safe_text(self.profile, max_len=32).upper() or "PROD"
+        if prof not in {"DEV", "PROD", "FINREG", "LOCKDOWN"}:
+            prof = "PROD"
+
+        on_err = self.on_validation_error if self.on_validation_error in {"warn", "reject"} else "warn"
+        if prof in {"FINREG", "LOCKDOWN"} and on_err == "warn":
+            # FINREG/LOCKDOWN should fail closed on known leakage risks unless caller overrides via object construction.
+            on_err = "reject"
+
+        sync = _safe_text(self.sqlite_synchronous, max_len=16).upper() or "NORMAL"
+        if sync not in {"NORMAL", "FULL"}:
+            sync = "NORMAL"
+        journal = _safe_text(self.sqlite_journal_mode, max_len=16).upper() or "WAL"
+        if journal not in {"WAL", "DELETE"}:
+            journal = "WAL"
+
+        return ReceiptStoreConfig(
+            profile=prof,  # type: ignore[arg-type]
+            validate_on_append=bool(self.validate_on_append),
+            on_validation_error=on_err,  # type: ignore[arg-type]
+            canonicalize_body_on_append=bool(self.canonicalize_body_on_append),
+            sanitize_body_on_canonicalize=bool(self.sanitize_body_on_canonicalize),
+            reject_forbidden_body_keys=bool(self.reject_forbidden_body_keys) or (prof in {"FINREG", "LOCKDOWN"}),
+            strict_body_top_level_dict=bool(self.strict_body_top_level_dict) or (prof == "LOCKDOWN"),
+            max_body_bytes=_clamp_int(self.max_body_bytes, default=512 * 1024, lo=1024, hi=32 * 1024 * 1024),
+            max_head_chars=_clamp_int(self.max_head_chars, default=4096, lo=16, hi=65536),
+            max_sig_chars=_clamp_int(self.max_sig_chars, default=64 * 1024, lo=0, hi=2 * 1024 * 1024),
+            max_verify_key_chars=_clamp_int(self.max_verify_key_chars, default=64 * 1024, lo=0, hi=2 * 1024 * 1024),
+            max_json_depth=_clamp_int(self.max_json_depth, default=32, lo=2, hi=256),
+            max_json_items=_clamp_int(self.max_json_items, default=512, lo=8, hi=100_000),
+            max_json_nodes=_clamp_int(self.max_json_nodes, default=8192, lo=64, hi=1_000_000),
+            max_json_str_total=_clamp_int(self.max_json_str_total, default=256_000, lo=1024, hi=16 * 1024 * 1024),
+            max_json_str_len=_clamp_int(self.max_json_str_len, default=4096, lo=64, hi=1024 * 1024),
+            max_int_digits=_clamp_int(self.max_int_digits, default=2048, lo=16, hi=100_000),
+            fsync_writes=bool(self.fsync_writes),
+            fsync_dir=bool(self.fsync_dir),
+            jsonl_process_lock=bool(self.jsonl_process_lock),
+            sqlite_synchronous=sync,  # type: ignore[arg-type]
+            sqlite_journal_mode=journal,  # type: ignore[arg-type]
+            sqlite_busy_timeout_ms=_clamp_int(self.sqlite_busy_timeout_ms, default=30_000, lo=100, hi=300_000),
+        )
+
+    @classmethod
+    def from_env(cls) -> "ReceiptStoreConfig":
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+        def _env_int(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw.strip())
+            except Exception:
+                return default
+        return cls(
+            profile=(os.getenv("TCD_RECEIPT_PROFILE") or os.getenv("TCD_PROFILE") or "PROD").strip().upper(),  # type: ignore[arg-type]
+            validate_on_append=_env_bool("TCD_RECEIPT_VALIDATE_ON_APPEND", True),
+            on_validation_error=(os.getenv("TCD_RECEIPT_ON_VALIDATION_ERROR") or "warn").strip().lower(),  # type: ignore[arg-type]
+            canonicalize_body_on_append=_env_bool("TCD_RECEIPT_CANONICALIZE_ON_APPEND", False),
+            sanitize_body_on_canonicalize=_env_bool("TCD_RECEIPT_SANITIZE_ON_CANONICALIZE", True),
+            reject_forbidden_body_keys=_env_bool("TCD_RECEIPT_REJECT_FORBIDDEN_BODY_KEYS", False),
+            strict_body_top_level_dict=_env_bool("TCD_RECEIPT_STRICT_BODY_TOPLEVEL", False),
+            max_body_bytes=_env_int("TCD_RECEIPT_MAX_BODY_BYTES", 512 * 1024),
+            max_head_chars=_env_int("TCD_RECEIPT_MAX_HEAD_CHARS", 4096),
+            max_sig_chars=_env_int("TCD_RECEIPT_MAX_SIG_CHARS", 64 * 1024),
+            max_verify_key_chars=_env_int("TCD_RECEIPT_MAX_VERIFY_KEY_CHARS", 64 * 1024),
+            max_json_depth=_env_int("TCD_RECEIPT_MAX_JSON_DEPTH", 32),
+            max_json_items=_env_int("TCD_RECEIPT_MAX_JSON_ITEMS", 512),
+            max_json_nodes=_env_int("TCD_RECEIPT_MAX_JSON_NODES", 8192),
+            max_json_str_total=_env_int("TCD_RECEIPT_MAX_JSON_STR_TOTAL", 256_000),
+            max_json_str_len=_env_int("TCD_RECEIPT_MAX_JSON_STR_LEN", 4096),
+            max_int_digits=_env_int("TCD_RECEIPT_MAX_INT_DIGITS", 2048),
+            fsync_writes=_env_bool("TCD_RECEIPT_FSYNC", True),
+            fsync_dir=_env_bool("TCD_RECEIPT_FSYNC_DIR", False),
+            jsonl_process_lock=_env_bool("TCD_RECEIPT_JSONL_PROCESS_LOCK", False),
+            sqlite_synchronous=(os.getenv("TCD_RECEIPT_SQLITE_SYNCHRONOUS") or "NORMAL").strip().upper(),  # type: ignore[arg-type]
+            sqlite_journal_mode=(os.getenv("TCD_RECEIPT_SQLITE_JOURNAL_MODE") or "WAL").strip().upper(),  # type: ignore[arg-type]
+            sqlite_busy_timeout_ms=_env_int("TCD_RECEIPT_SQLITE_BUSY_TIMEOUT_MS", 30_000),
+        ).normalized()
+
+
+@dataclass(frozen=True)
+class ReceiptValidationResult:
+    ok: bool
+    body_digest: str
+    body_bytes: int
+    body_schema: Optional[str] = None
+    body_version: Optional[int] = None
+    kind: str = "unknown"
+    risk_label: str = "unknown"
+    triggered_e: bool = False
+    prev_head_hex: Optional[str] = None
+    chain_id: Optional[str] = None
+    sig_alg: Optional[str] = None
+    verify_key_id: Optional[str] = None
+    selected_source: Optional[str] = None
+    controller_mode: Optional[str] = None
+    guarantee_scope: Optional[str] = None
+    event_id: Optional[str] = None
+    request_id: Optional[str] = None
+    warnings: Tuple[str, ...] = ()
+    errors: Tuple[str, ...] = ()
+    canonical_body_json: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+# =============================================================================
+# Body metadata extraction
+# =============================================================================
+
+def _dig(obj: Any, path: Sequence[str]) -> Any:
+    cur = obj
+    for p in path:
+        if not isinstance(cur, Mapping):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
+def _first_value(obj: Mapping[str, Any], paths: Sequence[Sequence[str]]) -> Any:
+    for path in paths:
+        v = _dig(obj, path)
+        if v is not None:
+            return v
+    return None
+
+
+def _safe_digest_token(v: Any, *, max_len: int = 4096) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    s = _strip_unsafe_text(v, max_len=max_len)
+    if not s or _looks_like_secret(s):
+        return None
+    if _HEXISH_RE.fullmatch(s) or _ALG_HEX_RE.fullmatch(s):
+        return s.lower()
+    if _SAFE_ID_RE.fullmatch(s):
+        return s
+    return None
+
+
+def _extract_prev_head(body: Mapping[str, Any]) -> Optional[str]:
+    v = _first_value(
+        body,
+        (
+            ("prev",), ("prev_head",), ("prev_head_hex",), ("previous_head",),
+            ("chain", "prev"), ("chain", "prev_head"), ("chain", "prev_head_hex"),
+            ("receipt", "prev"), ("receipt", "prev_head"),
+            ("link", "prev"), ("link", "prev_head"),
+        ),
+    )
+    return _safe_digest_token(v)
+
+
+def _extract_trigger(body: Mapping[str, Any]) -> bool:
+    candidates: List[Any] = [
+        body.get("trigger"),
+        _dig(body, ("e", "trigger")),
+        _dig(body, ("e_obj", "trigger")),
+        _dig(body, ("eproc", "trigger")),
+        _dig(body, ("e_state", "process", "trigger")),
+        _dig(body, ("security", "trigger")),
+        _dig(body, ("security", "e_trigger")),
+        _dig(body, ("process", "trigger")),
+    ]
+    for v in candidates:
+        b = _coerce_bool(v)
+        if b is True:
+            return True
+    return False
+
+
+def _extract_receipt_metadata(body: Mapping[str, Any]) -> Dict[str, Any]:
+    schema = _safe_id(body.get("schema"), default=None, max_len=128)
+    version_i = _coerce_int(body.get("version")) or _coerce_int(body.get("schema_version"))
+
+    kind_raw = _first_value(
+        body,
+        (
+            ("kind",), ("receipt_kind",), ("event_type",),
+            ("security", "kind"), ("extra", "kind"),
+        ),
+    )
+    kind = _safe_label(kind_raw, default="unknown")
+
+    risk_raw = _first_value(
+        body,
+        (
+            ("risk_label",), ("risk_level",), ("risk",),
+            ("security", "risk_label"), ("security", "risk_level"),
+            ("route", "risk_label"), ("routing", "risk_label"),
+            ("extra", "risk_label"), ("extra", "risk_level"),
+        ),
+    )
+    risk = _safe_label(risk_raw, default="unknown")
+
+    chain_id = _safe_id(_first_value(body, (("chain_id",), ("chain", "id"), ("chain", "chain_id"))), default=None, max_len=256)
+    prev = _extract_prev_head(body)
+
+    sig_alg = _safe_id(_first_value(body, (("sig_alg",), ("signature", "alg"), ("sig", "alg"))), default=None, max_len=128)
+    verify_key_id = _safe_id(_first_value(body, (("verify_key_id",), ("sig_key_id",), ("key_id",), ("kid",), ("signature", "key_id"))), default=None, max_len=128)
+
+    selected_source = _safe_label(_first_value(body, (("selected_source",), ("eproc", "selected_source"), ("e_state", "process", "selected_source"))), default="") or None
+    controller_mode = _safe_label(_first_value(body, (("controller_mode",), ("eproc", "controller_mode"), ("e_state", "controller", "mode"))), default="") or None
+    guarantee_scope = _safe_label(_first_value(body, (("guarantee_scope",), ("statistical_guarantee_scope",), ("eproc", "guarantee_scope"), ("eproc", "statistical_guarantee_scope"))), default="") or None
+    event_id = _safe_id(_first_value(body, (("event_id",), ("eid",), ("eproc", "eid"), ("identity", "event_id"))), default=None, max_len=256)
+    request_id = _safe_id(_first_value(body, (("request_id",), ("rid",), ("eproc", "rid"), ("identity", "request_id"))), default=None, max_len=256)
+
+    return {
+        "body_schema": schema,
+        "body_version": version_i if version_i is not None and version_i >= 0 else None,
+        "kind": kind,
+        "risk_label": risk,
+        "triggered_e": _extract_trigger(body),
+        "prev_head_hex": prev,
+        "chain_id": chain_id,
+        "sig_alg": sig_alg,
+        "verify_key_id": verify_key_id,
+        "selected_source": selected_source,
+        "controller_mode": controller_mode,
+        "guarantee_scope": guarantee_scope,
+        "event_id": event_id,
+        "request_id": request_id,
+    }
+
+
+def _scan_for_forbidden_keys(obj: Any, *, max_hits: int = 16) -> List[str]:
+    hits: List[str] = []
+
+    def _walk(x: Any, path: Tuple[str, ...], depth: int) -> None:
+        if len(hits) >= max_hits or depth > 32:
+            return
+        if isinstance(x, Mapping):
+            for k, v in x.items():
+                if not isinstance(k, str):
+                    continue
+                kk = _strip_unsafe_text(k, max_len=128)
+                if _key_is_forbidden(kk):
+                    hits.append(".".join(path + (kk,)) or kk)
+                    if len(hits) >= max_hits:
+                        return
+                _walk(v, path + (kk,), depth + 1)
+        elif isinstance(x, list):
+            for idx, item in enumerate(x[:256]):
+                _walk(item, path + (str(idx),), depth + 1)
+                if len(hits) >= max_hits:
+                    return
+    _walk(obj, tuple(), 0)
+    return hits
+
+
+def validate_receipt_body_json(body_json: str, config: Optional[ReceiptStoreConfig] = None) -> ReceiptValidationResult:
+    cfg = (config or ReceiptStoreConfig()).normalized()
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not isinstance(body_json, str):
+        return ReceiptValidationResult(
+            ok=False,
+            body_digest="sha256:",
+            body_bytes=0,
+            errors=("body_json_not_str",),
+        )
+
+    body_bytes = len(body_json.encode("utf-8", errors="strict"))
+    body_digest = "sha256:" + _sha256_hex(body_json.encode("utf-8", errors="strict"), ctx=b"tcd:receipt:body")
+
+    if body_bytes > cfg.max_body_bytes:
+        errors.append("body_too_large")
+
+    parsed: Any = None
+    if not errors:
+        try:
+            parsed = _json_loads_strict(body_json, max_depth=cfg.max_json_depth, max_int_digits=cfg.max_int_digits)
+        except Exception as e:
+            errors.append("json_parse_error:" + _safe_label(type(e).__name__, default="exception"))
+
+    canonical_body: Optional[str] = None
+    meta: Dict[str, Any] = {
+        "body_schema": None,
+        "body_version": None,
+        "kind": "unknown",
+        "risk_label": "unknown",
+        "triggered_e": False,
+        "prev_head_hex": None,
+        "chain_id": None,
+        "sig_alg": None,
+        "verify_key_id": None,
+        "selected_source": None,
+        "controller_mode": None,
+        "guarantee_scope": None,
+        "event_id": None,
+        "request_id": None,
+    }
+
+    if parsed is not None:
+        if cfg.strict_body_top_level_dict and not isinstance(parsed, Mapping):
+            errors.append("body_top_level_not_object")
+        if isinstance(parsed, Mapping):
+            forbidden = _scan_for_forbidden_keys(parsed)
+            if forbidden:
+                msg = "forbidden_keys:" + ",".join(forbidden[:8])
+                if cfg.reject_forbidden_body_keys:
+                    errors.append(msg)
+                else:
+                    warnings.append(msg)
+            meta.update(_extract_receipt_metadata(parsed))
+        else:
+            warnings.append("body_top_level_not_object")
+
+        if cfg.canonicalize_body_on_append:
+            try:
+                canon_obj = parsed
+                if cfg.sanitize_body_on_canonicalize:
+                    budget = _JsonBudget(
+                        max_nodes=cfg.max_json_nodes,
+                        max_items=cfg.max_json_items,
+                        max_depth=cfg.max_json_depth,
+                        max_str_total=cfg.max_json_str_total,
+                    )
+                    canon_obj = _json_sanitize(
+                        parsed,
+                        budget=budget,
+                        depth=0,
+                        max_str_len=cfg.max_json_str_len,
+                        redact_secrets=True,
+                        drop_forbidden_keys=True,
+                    )
+                canonical_body = _canonical_json(canon_obj)
+            except Exception:
+                errors.append("canonicalization_error")
+
+    return ReceiptValidationResult(
+        ok=(not errors),
+        body_digest=body_digest,
+        body_bytes=body_bytes,
+        body_schema=meta.get("body_schema"),
+        body_version=meta.get("body_version"),
+        kind=str(meta.get("kind") or "unknown"),
+        risk_label=str(meta.get("risk_label") or "unknown"),
+        triggered_e=bool(meta.get("triggered_e")),
+        prev_head_hex=meta.get("prev_head_hex"),
+        chain_id=meta.get("chain_id"),
+        sig_alg=meta.get("sig_alg"),
+        verify_key_id=meta.get("verify_key_id"),
+        selected_source=meta.get("selected_source"),
+        controller_mode=meta.get("controller_mode"),
+        guarantee_scope=meta.get("guarantee_scope"),
+        event_id=meta.get("event_id"),
+        request_id=meta.get("request_id"),
+        warnings=tuple(warnings),
+        errors=tuple(errors),
+        canonical_body_json=canonical_body,
+    )
+
+
+def _validate_head(head_hex: str, cfg: ReceiptStoreConfig) -> str:
+    h = _strip_unsafe_text(head_hex, max_len=cfg.max_head_chars)
+    if not h:
+        raise ValueError("empty head_hex")
+    if len(h) > cfg.max_head_chars:
+        raise ValueError("head_hex too long")
+    # Accept raw hex, 0xhex, or alg:hex.  We intentionally avoid normalizing because body prev pointers
+    # may be text-bound to issuer canonical form.
+    if not (_HEXISH_RE.fullmatch(h) or _ALG_HEX_RE.fullmatch(h) or _SAFE_ID_RE.fullmatch(h)):
+        raise ValueError("invalid head_hex format")
+    return h
+
+
+def _validate_material(v: str, *, max_chars: int, field_name: str) -> str:
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        raise ValueError(f"{field_name}_not_str")
+    s = _strip_unsafe_text(v, max_len=max_chars)
+    if len(s) > max_chars:
+        raise ValueError(f"{field_name}_too_long")
+    if s and not _SIG_MATERIAL_RE.fullmatch(s):
+        raise ValueError(f"{field_name}_bad_chars")
+    if s and _looks_like_secret(s):
+        # Signatures and verification keys can be high entropy, but they must not be bearer/JWT/private-key text.
+        raise ValueError(f"{field_name}_looks_like_secret_text")
+    return s
+
+
+def _prepare_append_inputs(
+    *,
+    backend: str,
+    cfg: ReceiptStoreConfig,
+    head_hex: str,
+    body_json: str,
+    sig_hex: str,
+    verify_key_hex: str,
+) -> Tuple[str, str, str, str, ReceiptValidationResult]:
+    cfg = cfg.normalized()
+    h = _validate_head(head_hex, cfg)
+    sig = _validate_material(sig_hex or "", max_chars=cfg.max_sig_chars, field_name="sig_hex")
+    vk = _validate_material(verify_key_hex or "", max_chars=cfg.max_verify_key_chars, field_name="verify_key_hex")
+
+    res = validate_receipt_body_json(body_json, cfg)
+    if cfg.validate_on_append:
+        if res.ok:
+            _RCPT_VALIDATION.labels(backend, "ok", "ok").inc()
+        else:
+            reason = res.errors[0].split(":", 1)[0] if res.errors else "unknown"
+            _RCPT_VALIDATION.labels(backend, "error", reason).inc()
+            if cfg.on_validation_error == "reject":
+                raise ValueError("receipt validation failed: " + "; ".join(res.errors[:5]))
+        for w in res.warnings[:8]:
+            _RCPT_VALIDATION.labels(backend, "warning", w.split(":", 1)[0]).inc()
+
+    b = body_json
+    if cfg.canonicalize_body_on_append and res.canonical_body_json is not None:
+        b = res.canonical_body_json
+        # Recompute metadata over persisted bytes.
+        res = validate_receipt_body_json(b, dataclasses.replace(cfg, canonicalize_body_on_append=False))
+    return h, b, sig, vk, res
+
+# =============================================================================
+# Data models + interface
+# =============================================================================
+
+@dataclass(frozen=True)
+class ReceiptRow:
+    """A single persisted receipt entry."""
+
+    id: int
+    head_hex: str
+    body_json: str
+    sig_hex: str
+    verify_key_hex: str
+    ts: float
+
+    # Enriched metadata.  Defaults preserve old constructor compatibility.
+    body_digest: str = ""
+    body_schema: Optional[str] = None
+    body_version: Optional[int] = None
+    kind: str = "unknown"
+    risk_label: str = "unknown"
+    triggered_e: bool = False
+    prev_head_hex: Optional[str] = None
+    chain_id: Optional[str] = None
+    sig_alg: Optional[str] = None
+    verify_key_id: Optional[str] = None
+    selected_source: Optional[str] = None
+    controller_mode: Optional[str] = None
+    guarantee_scope: Optional[str] = None
+    event_id: Optional[str] = None
+    request_id: Optional[str] = None
+    body_bytes: int = 0
+
+    def body_obj(self) -> Optional[Any]:
+        try:
+            return json.loads(self.body_json)
+        except Exception:
+            return None
+
+    def to_jsonl_obj(self) -> Dict[str, Any]:
+        return {
+            "id": int(self.id),
+            "ts": float(self.ts),
+            "receipt": self.head_hex,
+            "receipt_body": self.body_json,
+            "receipt_sig": self.sig_hex or "",
+            "verify_key": self.verify_key_hex or "",
+            "body_digest": self.body_digest,
+            "body_schema": self.body_schema,
+            "body_version": self.body_version,
+            "kind": self.kind,
+            "risk_label": self.risk_label,
+            "triggered_e": bool(self.triggered_e),
+            "prev_head": self.prev_head_hex,
+            "chain_id": self.chain_id,
+            "sig_alg": self.sig_alg,
+            "verify_key_id": self.verify_key_id,
+            "selected_source": self.selected_source,
+            "controller_mode": self.controller_mode,
+            "guarantee_scope": self.guarantee_scope,
+            "event_id": self.event_id,
+            "request_id": self.request_id,
+            "body_bytes": int(self.body_bytes or 0),
+        }
+
+    def public_dict(self, *, include_body: bool = False, include_signature: bool = False, include_verify_key: bool = False) -> Dict[str, Any]:
+        out = {
+            "id": int(self.id),
+            "ts": float(self.ts),
+            "receipt": self.head_hex,
+            "body_digest": self.body_digest,
+            "body_schema": self.body_schema,
+            "kind": self.kind,
+            "risk_label": self.risk_label,
+            "triggered_e": bool(self.triggered_e),
+            "chain_id": self.chain_id,
+            "prev_head": self.prev_head_hex,
+            "sig_alg": self.sig_alg,
+            "verify_key_id": self.verify_key_id,
+            "selected_source": self.selected_source,
+            "controller_mode": self.controller_mode,
+            "guarantee_scope": self.guarantee_scope,
+            "event_id": self.event_id,
+            "request_id": self.request_id,
+        }
+        if include_body:
+            out["receipt_body"] = self.body_json
+        if include_signature:
+            out["receipt_sig"] = self.sig_hex
+        if include_verify_key:
+            out["verify_key"] = self.verify_key_hex
+        return out
+
+
+class ReceiptStore(Protocol):
+    """Minimal contract every store backend must satisfy (thread-safe)."""
+
+    def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        ...
+    def get(self, rid: int) -> Optional[ReceiptRow]:
+        ...
+    def tail(self, n: int) -> List[ReceiptRow]:
+        ...
+    def last_head(self) -> Optional[str]:
+        ...
+    def count(self) -> int:
+        ...
+    def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        ...
+    def stats(self) -> Dict[str, float]:
+        ...
+
+
+@dataclass(frozen=True)
+class ReceiptSummary:
+    total: int
+    triggered_e: int
+    by_kind: Dict[str, int]
+    by_risk: Dict[str, int]
+
+    malformed: int = 0
+    by_schema: Dict[str, int] = field(default_factory=dict)
+    by_controller_mode: Dict[str, int] = field(default_factory=dict)
+    by_selected_source: Dict[str, int] = field(default_factory=dict)
+    latest_ts: float = 0.0
+    max_selected_e_value: float = 0.0
+    max_controller_log_e: float = 0.0
+    direct_p_steps: int = 0
+    heuristic_p_steps: int = 0
+
+
+@dataclass(frozen=True)
+class ReceiptAuditReport:
+    ok: bool
+    checked: int
+    latency_s: float
+    verify_ok: bool
+    parse_errors: int
+    continuity_gaps: int
+    duplicate_heads: int
+    triggered_e: int
+    last_id: int
+    last_head: Optional[str]
+    failure_reasons: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+# =============================================================================
+# Shared row conversions
+# =============================================================================
+
+def _row_from_parts(
+    *,
+    rid: int,
+    ts: float,
+    head: str,
+    body: str,
+    sig: str = "",
+    vk: str = "",
+    body_digest: str = "",
+    body_schema: Optional[str] = None,
+    body_version: Optional[int] = None,
+    kind: str = "unknown",
+    risk_label: str = "unknown",
+    triggered_e: Any = False,
+    prev_head: Optional[str] = None,
+    chain_id: Optional[str] = None,
+    sig_alg: Optional[str] = None,
+    verify_key_id: Optional[str] = None,
+    selected_source: Optional[str] = None,
+    controller_mode: Optional[str] = None,
+    guarantee_scope: Optional[str] = None,
+    event_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    body_bytes: Optional[int] = None,
+) -> ReceiptRow:
+    if not body_digest:
+        try:
+            body_digest = "sha256:" + _sha256_hex(str(body).encode("utf-8", errors="strict"), ctx=b"tcd:receipt:body")
+        except Exception:
+            body_digest = ""
+    if body_bytes is None:
+        try:
+            body_bytes = len(str(body).encode("utf-8", errors="strict"))
+        except Exception:
+            body_bytes = 0
+    return ReceiptRow(
+        id=int(rid),
+        head_hex=str(head),
+        body_json=str(body),
+        sig_hex=str(sig or ""),
+        verify_key_hex=str(vk or ""),
+        ts=float(ts),
+        body_digest=str(body_digest or ""),
+        body_schema=body_schema,
+        body_version=int(body_version) if body_version is not None else None,
+        kind=str(kind or "unknown"),
+        risk_label=str(risk_label or "unknown"),
+        triggered_e=bool(triggered_e),
+        prev_head_hex=prev_head,
+        chain_id=chain_id,
+        sig_alg=sig_alg,
+        verify_key_id=verify_key_id,
+        selected_source=selected_source,
+        controller_mode=controller_mode,
+        guarantee_scope=guarantee_scope,
+        event_id=event_id,
+        request_id=request_id,
+        body_bytes=int(body_bytes or 0),
+    )
+
+
+def _row_from_jsonl_obj(obj: Mapping[str, Any]) -> ReceiptRow:
+    return _row_from_parts(
+        rid=int(obj["id"]),
+        ts=float(obj["ts"]),
+        head=str(obj["receipt"]),
+        body=str(obj["receipt_body"]),
+        sig=str(obj.get("receipt_sig", "")),
+        vk=str(obj.get("verify_key", "")),
+        body_digest=str(obj.get("body_digest", "")),
+        body_schema=obj.get("body_schema"),
+        body_version=obj.get("body_version"),
+        kind=str(obj.get("kind") or "unknown"),
+        risk_label=str(obj.get("risk_label") or "unknown"),
+        triggered_e=obj.get("triggered_e", False),
+        prev_head=obj.get("prev_head"),
+        chain_id=obj.get("chain_id"),
+        sig_alg=obj.get("sig_alg"),
+        verify_key_id=obj.get("verify_key_id"),
+        selected_source=obj.get("selected_source"),
+        controller_mode=obj.get("controller_mode"),
+        guarantee_scope=obj.get("guarantee_scope"),
+        event_id=obj.get("event_id"),
+        request_id=obj.get("request_id"),
+        body_bytes=obj.get("body_bytes"),
+    )
+
+# =============================================================================
+# In-memory backend
+# =============================================================================
+
+class InMemoryReceiptStore(ReceiptStore):
+    """Process-local in-memory store. Suitable for tests/dev and deterministic unit tests."""
+
+    def __init__(self, config: Optional[ReceiptStoreConfig] = None):
+        self._cfg = (config or ReceiptStoreConfig()).normalized()
+        self._rows: List[ReceiptRow] = []
+        self._id = 0
+        self._lk = threading.RLock()
+        self._append_ema = 0.0
+        self._last_ts = 0.0
+        self._by_head: Dict[str, int] = {}
+
+    def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
+        backend = "memory"
+        try:
+            h, b, sig, vk, meta = _prepare_append_inputs(
+                backend=backend, cfg=self._cfg, head_hex=head_hex, body_json=body_json, sig_hex=sig_hex, verify_key_hex=verify_key_hex
+            )
+            ts = time.time()
+            with self._lk:
+                self._id += 1
+                rid = self._id
+                row = _row_from_parts(
+                    rid=rid,
+                    ts=ts,
+                    head=h,
+                    body=b,
+                    sig=sig,
+                    vk=vk,
+                    body_digest=meta.body_digest,
+                    body_schema=meta.body_schema,
+                    body_version=meta.body_version,
+                    kind=meta.kind,
+                    risk_label=meta.risk_label,
+                    triggered_e=meta.triggered_e,
+                    prev_head=meta.prev_head_hex,
+                    chain_id=meta.chain_id,
+                    sig_alg=meta.sig_alg,
+                    verify_key_id=meta.verify_key_id,
+                    selected_source=meta.selected_source,
+                    controller_mode=meta.controller_mode,
+                    guarantee_scope=meta.guarantee_scope,
+                    event_id=meta.event_id,
+                    request_id=meta.request_id,
+                    body_bytes=meta.body_bytes,
+                )
+                self._rows.append(row)
+                self._by_head.setdefault(h, rid)
+                self._append_ema = _qps_ema(self._append_ema, self._last_ts, ts)
+                self._last_ts = ts
+                _RCPT_COUNT.labels(backend).set(len(self._rows))
+            _RCPT_APPEND.labels(backend, "ok").inc()
+            _RCPT_BYTES.labels(backend).inc(meta.body_bytes)
+            return rid
+        except Exception:
+            _RCPT_APPEND.labels(backend, "error").inc()
+            raise
+        finally:
+            _RCPT_APPEND_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def get(self, rid: int) -> Optional[ReceiptRow]:
+        with self._lk:
+            idx = int(rid) - 1
+            if 0 <= idx < len(self._rows):
+                return self._rows[idx]
+            return None
+
+    def find_by_head(self, head_hex: str) -> Optional[ReceiptRow]:
+        with self._lk:
+            rid = self._by_head.get(head_hex)
+            if rid is None:
+                return None
+            return self.get(rid)
+
+    def tail(self, n: int) -> List[ReceiptRow]:
+        with self._lk:
+            return list(self._rows[-max(0, int(n)):])
+
+    def page(self, cursor: Optional[int] = None, limit: int = 100) -> Tuple[List[ReceiptRow], Optional[int]]:
+        start = max(0, int(cursor or 0))
+        lim = max(1, min(10_000, int(limit)))
+        with self._lk:
+            rows = list(self._rows[start:start + lim])
+            next_cursor = start + len(rows) if (start + len(rows)) < len(self._rows) else None
+        return rows, next_cursor
+
+    def last_head(self) -> Optional[str]:
+        with self._lk:
+            return self._rows[-1].head_hex if self._rows else None
+
+    def count(self) -> int:
+        with self._lk:
+            return len(self._rows)
+
+    def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
+        backend = "memory"
+        try:
+            with self._lk:
+                rows = self._rows[-max(0, int(window)):]
+                if not rows:
+                    return True
+                heads = [r.head_hex for r in rows]
+                bodies = [r.body_json for r in rows]
+            ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+            if not ok:
+                _RCPT_VERIFY_FAIL.labels(backend, "verify_false").inc()
+            return ok
+        except Exception:
+            _RCPT_VERIFY_FAIL.labels(backend, "exception").inc()
+            return False
+        finally:
+            _RCPT_VERIFY_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def stats(self) -> Dict[str, float]:
+        with self._lk:
+            last_ts = self._rows[-1].ts if self._rows else 0.0
+            triggered = sum(1 for r in self._rows if r.triggered_e)
+            return {
+                "count": float(len(self._rows)),
+                "size_bytes": 0.0,
+                "last_ts": float(last_ts),
+                "append_qps_ema": float(self._append_ema),
+                "triggered_total": float(triggered),
+            }
+
+# =============================================================================
+# JSONL backend
+# =============================================================================
+
+class JsonlReceiptStore(ReceiptStore):
+    """
+    Append-only JSONL store with validation, optional fsync, and optional process lock.
+
+    File format remains backward-compatible:
+      {"id": int, "ts": float, "receipt": "...", "receipt_body": "...",
+       "receipt_sig": "...", "verify_key": "...", ...enriched metadata...}
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        create_dirs: bool = True,
+        fsync_writes: Optional[bool] = None,
+        fsync_dir: Optional[bool] = None,
+        process_lock: Optional[bool] = None,
+        config: Optional[ReceiptStoreConfig] = None,
+    ):
+        self._cfg = (config or ReceiptStoreConfig()).normalized()
+        if fsync_writes is not None:
+            self._cfg = dataclasses.replace(self._cfg, fsync_writes=bool(fsync_writes))
+        if fsync_dir is not None:
+            self._cfg = dataclasses.replace(self._cfg, fsync_dir=bool(fsync_dir))
+        if process_lock is not None:
+            self._cfg = dataclasses.replace(self._cfg, jsonl_process_lock=bool(process_lock))
+
+        self._path = Path(path)
+        if create_dirs:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lk = threading.RLock()
+        self._next_id = 1
+        self._last_head: Optional[str] = None
+        self._append_ema = 0.0
+        self._last_ts = 0.0
+        self._count_cache = 0
+
+        if self._path.exists():
+            self._count_cache = _count_jsonl_lines(self._path)
+            try:
+                for line in reversed(_tail_lines(self._path, 64)):
+                    try:
+                        obj = json.loads(line)
+                        rid = int(obj.get("id", 0))
+                        if rid > 0:
+                            self._next_id = rid + 1
+                            self._last_head = str(obj.get("receipt") or "") or None
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                self._next_id = max(1, self._count_cache + 1)
+                self._last_head = None
+
+    def _atomic_append(self, text_line: str) -> None:
+        with self._path.open("a", encoding="utf-8") as fw:
+            locked = False
+            if self._cfg.jsonl_process_lock and fcntl is not None:
+                try:
+                    fcntl.flock(fw.fileno(), fcntl.LOCK_EX)
+                    locked = True
+                except Exception:
+                    locked = False
+            try:
+                fw.write(text_line)
+                fw.flush()
+                if self._cfg.fsync_writes:
+                    os.fsync(fw.fileno())
+            finally:
+                if locked and fcntl is not None:
+                    try:
+                        fcntl.flock(fw.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+        if self._cfg.fsync_dir:
+            try:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    flags |= getattr(os, "O_DIRECTORY")
+                dir_fd = os.open(str(self._path.parent), flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
+
+    def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
+        backend = "jsonl"
+        try:
+            h, b, sig, vk, meta = _prepare_append_inputs(
+                backend=backend, cfg=self._cfg, head_hex=head_hex, body_json=body_json, sig_hex=sig_hex, verify_key_hex=verify_key_hex
+            )
+            ts = time.time()
+            with self._lk:
+                rid = self._next_id
+                self._next_id += 1
+                row = _row_from_parts(
+                    rid=rid,
+                    ts=ts,
+                    head=h,
+                    body=b,
+                    sig=sig,
+                    vk=vk,
+                    body_digest=meta.body_digest,
+                    body_schema=meta.body_schema,
+                    body_version=meta.body_version,
+                    kind=meta.kind,
+                    risk_label=meta.risk_label,
+                    triggered_e=meta.triggered_e,
+                    prev_head=meta.prev_head_hex,
+                    chain_id=meta.chain_id,
+                    sig_alg=meta.sig_alg,
+                    verify_key_id=meta.verify_key_id,
+                    selected_source=meta.selected_source,
+                    controller_mode=meta.controller_mode,
+                    guarantee_scope=meta.guarantee_scope,
+                    event_id=meta.event_id,
+                    request_id=meta.request_id,
+                    body_bytes=meta.body_bytes,
+                )
+                data = json.dumps(row.to_jsonl_obj(), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+                self._atomic_append(data)
+                self._last_head = h
+                self._append_ema = _qps_ema(self._append_ema, self._last_ts, ts)
+                self._last_ts = ts
+                self._count_cache += 1
+                _RCPT_COUNT.labels(backend).set(float(self._count_cache))
+            _RCPT_APPEND.labels(backend, "ok").inc()
+            _RCPT_BYTES.labels(backend).inc(meta.body_bytes)
+            return rid
+        except Exception:
+            _RCPT_APPEND.labels(backend, "error").inc()
+            raise
+        finally:
+            _RCPT_APPEND_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def _iter_tail(self, n: int) -> List[ReceiptRow]:
+        lines = _tail_lines(self._path, n)
+        out: List[ReceiptRow] = []
+        for s in lines:
+            try:
+                obj = json.loads(s)
+                out.append(_row_from_jsonl_obj(obj))
+            except Exception:
+                continue
+        return out
+
+    def get(self, rid: int) -> Optional[ReceiptRow]:
+        if rid <= 0:
+            return None
+        try:
+            with self._path.open("r", encoding="utf-8") as fr:
+                for line in fr:
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if int(obj.get("id", -1)) == int(rid):
+                        return _row_from_jsonl_obj(obj)
+        except Exception:
+            return None
+        return None
+
+    def find_by_head(self, head_hex: str) -> Optional[ReceiptRow]:
+        try:
+            with self._path.open("r", encoding="utf-8") as fr:
+                for line in fr:
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(obj.get("receipt") or "") == head_hex:
+                        return _row_from_jsonl_obj(obj)
+        except Exception:
+            return None
+        return None
+
+    def tail(self, n: int) -> List[ReceiptRow]:
+        with self._lk:
+            return self._iter_tail(max(0, int(n)))
+
+    def page(self, cursor: Optional[int] = None, limit: int = 100) -> Tuple[List[ReceiptRow], Optional[int]]:
+        start_after = max(0, int(cursor or 0))
+        lim = max(1, min(10_000, int(limit)))
+        out: List[ReceiptRow] = []
+        try:
+            with self._path.open("r", encoding="utf-8") as fr:
+                for line in fr:
+                    if len(out) >= lim:
+                        break
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        rid = int(obj.get("id", -1))
+                        if rid <= start_after:
+                            continue
+                        out.append(_row_from_jsonl_obj(obj))
+                    except Exception:
+                        continue
+        except Exception:
+            return [], None
+        next_cursor = out[-1].id if len(out) == lim else None
+        return out, next_cursor
+
+    def last_head(self) -> Optional[str]:
+        with self._lk:
+            return self._last_head
+
+    def count(self) -> int:
+        with self._lk:
+            if self._count_cache <= 0 and self._path.exists():
+                self._count_cache = _count_jsonl_lines(self._path)
+            return int(self._count_cache)
+
+    def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
+        backend = "jsonl"
+        try:
+            rows = self.tail(window)
+            if not rows:
+                return True
+            heads = [r.head_hex for r in rows]
+            bodies = [r.body_json for r in rows]
+            ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+            if not ok:
+                _RCPT_VERIFY_FAIL.labels(backend, "verify_false").inc()
+            return ok
+        except Exception:
+            _RCPT_VERIFY_FAIL.labels(backend, "exception").inc()
+            return False
+        finally:
+            _RCPT_VERIFY_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def stats(self) -> Dict[str, float]:
+        size = 0.0
+        last_ts = 0.0
+        try:
+            st = self._path.stat()
+            size = float(st.st_size)
+        except Exception:
+            pass
+        tail1 = self.tail(1)
+        if tail1:
+            last_ts = float(tail1[-1].ts)
+        return {
+            "count": float(self.count()),
+            "size_bytes": size,
+            "last_ts": last_ts,
+            "append_qps_ema": float(self._append_ema),
+        }
+
+# =============================================================================
+# SQLite backend
+# =============================================================================
+
+_SQL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS receipts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    head           TEXT NOT NULL,
+    body           TEXT NOT NULL,
+    sig            TEXT,
+    vk             TEXT,
+    body_digest    TEXT,
+    body_schema    TEXT,
+    body_version   INTEGER,
+    kind           TEXT,
+    risk_label     TEXT,
+    triggered_e    INTEGER,
+    prev_head      TEXT,
+    chain_id       TEXT,
+    sig_alg        TEXT,
+    verify_key_id  TEXT,
+    selected_source TEXT,
+    controller_mode TEXT,
+    guarantee_scope TEXT,
+    event_id       TEXT,
+    request_id     TEXT,
+    body_bytes     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_ts ON receipts(ts);
+CREATE INDEX IF NOT EXISTS idx_receipts_head ON receipts(head);
+CREATE INDEX IF NOT EXISTS idx_receipts_body_digest ON receipts(body_digest);
+CREATE INDEX IF NOT EXISTS idx_receipts_kind ON receipts(kind);
+CREATE INDEX IF NOT EXISTS idx_receipts_chain ON receipts(chain_id, id);
+CREATE INDEX IF NOT EXISTS idx_receipts_event ON receipts(event_id);
+"""
+
+_SQL_EXTRA_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("body_digest", "TEXT"), ("body_schema", "TEXT"), ("body_version", "INTEGER"),
+    ("kind", "TEXT"), ("risk_label", "TEXT"), ("triggered_e", "INTEGER"),
+    ("prev_head", "TEXT"), ("chain_id", "TEXT"), ("sig_alg", "TEXT"),
+    ("verify_key_id", "TEXT"), ("selected_source", "TEXT"), ("controller_mode", "TEXT"),
+    ("guarantee_scope", "TEXT"), ("event_id", "TEXT"), ("request_id", "TEXT"),
+    ("body_bytes", "INTEGER"),
+)
+
+class SqliteReceiptStore(ReceiptStore):
+    """
+    SQLite-backed receipt store.  Uses WAL by default and migrates older receipt
+    tables in place by adding metadata columns.
+    """
+
+    def __init__(self, path: str, *, config: Optional[ReceiptStoreConfig] = None):
+        self._cfg = (config or ReceiptStoreConfig()).normalized()
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lk = threading.RLock()
+        self._append_ema = 0.0
+        self._last_ts = 0.0
+        self._conn = sqlite3.connect(
+            str(self._path),
+            timeout=float(self._cfg.sqlite_busy_timeout_ms) / 1000.0,
+            isolation_level=None,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            check_same_thread=False,
+        )
+        with self._conn:
+            self._conn.execute(f"PRAGMA journal_mode={self._cfg.sqlite_journal_mode};")
+            self._conn.execute(f"PRAGMA synchronous={self._cfg.sqlite_synchronous};")
+            self._conn.execute(f"PRAGMA busy_timeout={int(self._cfg.sqlite_busy_timeout_ms)};")
+            self._conn.executescript(_SQL_SCHEMA)
+            self._migrate_columns_locked()
+
+    def _migrate_columns_locked(self) -> None:
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(receipts)").fetchall()}
+        for name, typ in _SQL_EXTRA_COLUMNS:
+            if name not in existing:
+                try:
+                    self._conn.execute(f"ALTER TABLE receipts ADD COLUMN {name} {typ}")
+                except Exception:
+                    pass
+
+    def append(self, head_hex: str, body_json: str, sig_hex: str = "", verify_key_hex: str = "") -> int:
+        t0 = time.perf_counter()
+        backend = "sqlite"
+        try:
+            h, b, sig, vk, meta = _prepare_append_inputs(
+                backend=backend, cfg=self._cfg, head_hex=head_hex, body_json=body_json, sig_hex=sig_hex, verify_key_hex=verify_key_hex
+            )
+            ts = time.time()
+            with self._lk, self._conn:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO receipts (
+                        ts, head, body, sig, vk, body_digest, body_schema, body_version,
+                        kind, risk_label, triggered_e, prev_head, chain_id, sig_alg,
+                        verify_key_id, selected_source, controller_mode, guarantee_scope,
+                        event_id, request_id, body_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts, h, b, sig, vk, meta.body_digest, meta.body_schema, meta.body_version,
+                        meta.kind, meta.risk_label, 1 if meta.triggered_e else 0,
+                        meta.prev_head_hex, meta.chain_id, meta.sig_alg, meta.verify_key_id,
+                        meta.selected_source, meta.controller_mode, meta.guarantee_scope,
+                        meta.event_id, meta.request_id, meta.body_bytes,
+                    ),
+                )
+                rid = int(cur.lastrowid)
+                self._append_ema = _qps_ema(self._append_ema, self._last_ts, ts)
+                self._last_ts = ts
+                _RCPT_COUNT.labels(backend).set(float(self.count()))
+            _RCPT_APPEND.labels(backend, "ok").inc()
+            _RCPT_BYTES.labels(backend).inc(meta.body_bytes)
+            return rid
+        except Exception:
+            _RCPT_APPEND.labels(backend, "error").inc()
+            raise
+        finally:
+            _RCPT_APPEND_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def _row_from_sql(self, row: sqlite3.Row | Tuple[Any, ...]) -> ReceiptRow:
+        (
+            rid, ts, head, body, sig, vk, body_digest, body_schema, body_version, kind,
+            risk_label, triggered_e, prev_head, chain_id, sig_alg, verify_key_id,
+            selected_source, controller_mode, guarantee_scope, event_id, request_id, body_bytes,
+        ) = row
+        return _row_from_parts(
+            rid=rid, ts=ts, head=head, body=body, sig=sig or "", vk=vk or "",
+            body_digest=body_digest or "", body_schema=body_schema, body_version=body_version,
+            kind=kind or "unknown", risk_label=risk_label or "unknown", triggered_e=bool(triggered_e),
+            prev_head=prev_head, chain_id=chain_id, sig_alg=sig_alg, verify_key_id=verify_key_id,
+            selected_source=selected_source, controller_mode=controller_mode, guarantee_scope=guarantee_scope,
+            event_id=event_id, request_id=request_id, body_bytes=body_bytes,
+        )
+
+    @staticmethod
+    def _select_cols() -> str:
+        return (
+            "id, ts, head, body, sig, vk, body_digest, body_schema, body_version, kind, "
+            "risk_label, triggered_e, prev_head, chain_id, sig_alg, verify_key_id, "
+            "selected_source, controller_mode, guarantee_scope, event_id, request_id, body_bytes"
+        )
+
+    def get(self, rid: int) -> Optional[ReceiptRow]:
+        with self._lk:
+            cur = self._conn.execute(f"SELECT {self._select_cols()} FROM receipts WHERE id=?", (int(rid),))
+            row = cur.fetchone()
+        return self._row_from_sql(row) if row else None
+
+    def find_by_head(self, head_hex: str) -> Optional[ReceiptRow]:
+        with self._lk:
+            cur = self._conn.execute(f"SELECT {self._select_cols()} FROM receipts WHERE head=? ORDER BY id ASC LIMIT 1", (str(head_hex),))
+            row = cur.fetchone()
+        return self._row_from_sql(row) if row else None
+
+    def tail(self, n: int) -> List[ReceiptRow]:
+        with self._lk:
+            rows = self._conn.execute(
+                f"SELECT {self._select_cols()} FROM receipts ORDER BY id DESC LIMIT ?",
+                (int(max(0, n)),),
+            ).fetchall()
+        return [self._row_from_sql(r) for r in reversed(rows)]
+
+    def page(self, cursor: Optional[int] = None, limit: int = 100) -> Tuple[List[ReceiptRow], Optional[int]]:
+        start_after = max(0, int(cursor or 0))
+        lim = max(1, min(10_000, int(limit)))
+        with self._lk:
+            rows = self._conn.execute(
+                f"SELECT {self._select_cols()} FROM receipts WHERE id>? ORDER BY id ASC LIMIT ?",
+                (start_after, lim),
+            ).fetchall()
+        out = [self._row_from_sql(r) for r in rows]
+        next_cursor = out[-1].id if len(out) == lim else None
+        return out, next_cursor
+
+    def last_head(self) -> Optional[str]:
+        with self._lk:
+            row = self._conn.execute("SELECT head FROM receipts ORDER BY id DESC LIMIT 1").fetchone()
+        return str(row[0]) if row else None
+
+    def count(self) -> int:
+        with self._lk:
+            (c,) = self._conn.execute("SELECT COUNT(*) FROM receipts").fetchone()
+        return int(c)
+
+    def verify_chain_window(self, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+        t0 = time.perf_counter()
+        backend = "sqlite"
+        try:
+            rows = self.tail(window)
+            if not rows:
+                return True
+            heads = [r.head_hex for r in rows]
+            bodies = [r.body_json for r in rows]
+            ok = bool(verify_chain(heads, bodies, label_salt_hex=label_salt_hex))
+            if not ok:
+                _RCPT_VERIFY_FAIL.labels(backend, "verify_false").inc()
+            return ok
+        except Exception:
+            _RCPT_VERIFY_FAIL.labels(backend, "exception").inc()
+            return False
+        finally:
+            _RCPT_VERIFY_LAT.labels(backend).observe(max(0.0, time.perf_counter() - t0))
+
+    def stats(self) -> Dict[str, float]:
+        last_ts = 0.0
+        tail1 = self.tail(1)
+        if tail1:
+            last_ts = float(tail1[-1].ts)
+        size_bytes = 0.0
+        try:
+            size_bytes = float(self._path.stat().st_size)
+        except Exception:
+            pass
+        triggered = 0
+        try:
+            with self._lk:
+                (triggered,) = self._conn.execute("SELECT COUNT(*) FROM receipts WHERE triggered_e=1").fetchone()
+        except Exception:
+            triggered = 0
+        return {
+            "count": float(self.count()),
+            "size_bytes": size_bytes,
+            "last_ts": last_ts,
+            "append_qps_ema": float(self._append_ema),
+            "triggered_total": float(triggered),
+        }
+
+    def close(self) -> None:
+        with self._lk:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+# =============================================================================
+# Factory & helpers
+# =============================================================================
+
+def build_store_from_env() -> ReceiptStore:
+    """
+    Construct a store backend using environment knobs:
+
+      TCD_RECEIPT_STORE = "jsonl" | "sqlite" | "memory"   (default: "jsonl")
+      TCD_RECEIPT_PATH  = path to file. default: "./data/receipts.jsonl"
+
+    Additional hardening knobs are parsed by ReceiptStoreConfig.from_env():
+      TCD_RECEIPT_PROFILE, TCD_RECEIPT_VALIDATE_ON_APPEND,
+      TCD_RECEIPT_ON_VALIDATION_ERROR, TCD_RECEIPT_REJECT_FORBIDDEN_BODY_KEYS,
+      TCD_RECEIPT_CANONICALIZE_ON_APPEND, TCD_RECEIPT_MAX_BODY_BYTES,
+      TCD_RECEIPT_FSYNC, TCD_RECEIPT_FSYNC_DIR, TCD_RECEIPT_JSONL_PROCESS_LOCK,
+      TCD_RECEIPT_SQLITE_SYNCHRONOUS, TCD_RECEIPT_SQLITE_JOURNAL_MODE.
+    """
+    backend = (os.environ.get("TCD_RECEIPT_STORE") or "jsonl").strip().lower()
+    path = os.environ.get("TCD_RECEIPT_PATH") or "./data/receipts.jsonl"
+    cfg = ReceiptStoreConfig.from_env()
+
+    if backend == "memory":
+        return InMemoryReceiptStore(config=cfg)
+
+    if backend == "sqlite":
+        p = Path(path)
+        if p.suffix.lower() != ".db":
+            path = str(p.with_suffix(".db"))
+        return SqliteReceiptStore(path=path, config=cfg)
+
+    return JsonlReceiptStore(path=path, config=cfg)
+
+
+def verify_recent_chain(store: ReceiptStore, window: int, *, label_salt_hex: Optional[str] = None) -> bool:
+    try:
+        return store.verify_chain_window(window, label_salt_hex=label_salt_hex)
+    except Exception:
+        return False
+
+
+def _count_inc(d: Dict[str, int], key: Optional[str]) -> None:
+    k = str(key or "unknown")
+    d[k] = d.get(k, 0) + 1
+
+
+def _extract_e_stats_from_body(body: Mapping[str, Any]) -> Tuple[float, float, int, int]:
+    # returns max_selected_e_value, max_controller_log_e, direct_p_steps, heuristic_p_steps
+    selected_e = 0.0
+    controller_log_e = 0.0
+    direct_steps = 0
+    heur_steps = 0
+
+    candidates = [
+        body.get("e"), body.get("e_obj"), body.get("eproc"),
+        _dig(body, ("e_state", "process")),
+        _dig(body, ("e_state", "stats")),
+        body.get("process"), body.get("stats"),
+    ]
+    for obj in candidates:
+        if not isinstance(obj, Mapping):
+            continue
+        for key in ("selected_e_value", "e_value", "controller_e_value", "strict_e_value"):
+            x = _coerce_float(obj.get(key))
+            if x is not None:
+                selected_e = max(selected_e, float(x))
+        x2 = _coerce_float(obj.get("controller_log_e"))
+        if x2 is not None:
+            controller_log_e = max(controller_log_e, float(x2))
+        di = _coerce_int(obj.get("direct_p_steps"))
+        if di is not None:
+            direct_steps += max(0, int(di))
+        hi = _coerce_int(obj.get("heuristic_p_steps"))
+        if hi is not None:
+            heur_steps += max(0, int(hi))
+    return selected_e, controller_log_e, direct_steps, heur_steps
+
+
+def summarize_recent_receipts(store: ReceiptStore, window: int) -> ReceiptSummary:
+    rows = store.tail(max(0, int(window)))
+    total = len(rows)
+    triggered_e = 0
+    malformed = 0
+    by_kind: Dict[str, int] = {}
+    by_risk: Dict[str, int] = {}
+    by_schema: Dict[str, int] = {}
+    by_controller_mode: Dict[str, int] = {}
+    by_selected_source: Dict[str, int] = {}
+    latest_ts = 0.0
+    max_selected_e = 0.0
+    max_controller_log_e = 0.0
+    direct_p_steps = 0
+    heuristic_p_steps = 0
+
+    for r in rows:
+        latest_ts = max(latest_ts, float(r.ts))
+        kind = r.kind or "unknown"
+        risk = r.risk_label or "unknown"
+        schema = r.body_schema or "unknown"
+        triggered = bool(r.triggered_e)
+        controller_mode = r.controller_mode
+        selected_source = r.selected_source
+        body: Any = None
+        try:
+            body = json.loads(r.body_json)
+        except Exception:
+            malformed += 1
+
+        if isinstance(body, Mapping):
+            meta = _extract_receipt_metadata(body)
+            kind = meta.get("kind") or kind
+            risk = meta.get("risk_label") or risk
+            schema = meta.get("body_schema") or schema
+            triggered = bool(meta.get("triggered_e")) or triggered
+            controller_mode = meta.get("controller_mode") or controller_mode
+            selected_source = meta.get("selected_source") or selected_source
+            se, cle, ds, hs = _extract_e_stats_from_body(body)
+            max_selected_e = max(max_selected_e, se)
+            max_controller_log_e = max(max_controller_log_e, cle)
+            direct_p_steps += ds
+            heuristic_p_steps += hs
+
+        if triggered:
+            triggered_e += 1
+        _count_inc(by_kind, kind)
+        _count_inc(by_risk, risk)
+        _count_inc(by_schema, schema)
+        if controller_mode:
+            _count_inc(by_controller_mode, controller_mode)
+        if selected_source:
+            _count_inc(by_selected_source, selected_source)
+
+    # best-effort backend label for summary gauge
+    _RCPT_SUMMARY_TRIGGERED.labels(type(store).__name__.replace("ReceiptStore", "").lower() or "unknown").set(float(triggered_e))
+
+    return ReceiptSummary(
+        total=total,
+        triggered_e=triggered_e,
+        by_kind=by_kind,
+        by_risk=by_risk,
+        malformed=malformed,
+        by_schema=by_schema,
+        by_controller_mode=by_controller_mode,
+        by_selected_source=by_selected_source,
+        latest_ts=latest_ts,
+        max_selected_e_value=max_selected_e,
+        max_controller_log_e=max_controller_log_e,
+        direct_p_steps=direct_p_steps,
+        heuristic_p_steps=heuristic_p_steps,
+    )
+
+
+def _continuity_gaps(rows: Sequence[ReceiptRow]) -> int:
+    if len(rows) <= 1:
+        return 0
+    gaps = 0
+    for prev, cur in zip(rows[:-1], rows[1:]):
+        if cur.prev_head_hex and cur.prev_head_hex != prev.head_hex:
+            gaps += 1
+    return gaps
+
+
+def audit_recent_receipts(
+    store: ReceiptStore,
+    window: int,
+    *,
+    label_salt_hex: Optional[str] = None,
+    verify: bool = True,
+) -> ReceiptAuditReport:
+    t0 = time.perf_counter()
+    reasons: List[str] = []
+    rows: List[ReceiptRow] = []
+    verify_ok = True
+    try:
+        rows = store.tail(max(0, int(window)))
+    except Exception:
+        rows = []
+        reasons.append("store_tail_failed")
+
+    parse_errors = 0
+    triggered = 0
+    seen: Dict[str, int] = {}
+    duplicates = 0
+    for r in rows:
+        if r.head_hex in seen:
+            duplicates += 1
+        seen[r.head_hex] = seen.get(r.head_hex, 0) + 1
+        if r.triggered_e:
+            triggered += 1
+        try:
+            json.loads(r.body_json)
+        except Exception:
+            parse_errors += 1
+
+    gaps = _continuity_gaps(rows)
+    if parse_errors:
+        reasons.append("parse_errors")
+    if duplicates:
+        reasons.append("duplicate_heads")
+    if gaps:
+        reasons.append("continuity_gaps")
+
+    if verify and rows:
+        try:
+            verify_ok = bool(store.verify_chain_window(len(rows), label_salt_hex=label_salt_hex))
+            if not verify_ok:
+                reasons.append("verify_chain_failed")
+        except Exception:
+            verify_ok = False
+            reasons.append("verify_chain_exception")
+
+    ok = bool((not reasons) and verify_ok)
+    return ReceiptAuditReport(
+        ok=ok,
+        checked=len(rows),
+        latency_s=max(0.0, time.perf_counter() - t0),
+        verify_ok=bool(verify_ok),
+        parse_errors=parse_errors,
+        continuity_gaps=gaps,
+        duplicate_heads=duplicates,
+        triggered_e=triggered,
+        last_id=rows[-1].id if rows else 0,
+        last_head=rows[-1].head_hex if rows else None,
+        failure_reasons=tuple(reasons),
+    )
+
+
+def export_tail_jsonl(store: ReceiptStore, window: int, *, include_body: bool = True) -> str:
+    lines: List[str] = []
+    for r in store.tail(max(0, int(window))):
+        obj = r.to_jsonl_obj() if include_body else r.public_dict(include_body=False)
+        lines.append(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def append_receipt_v2_body(
+    store: ReceiptStore,
+    *,
+    head_hex: str,
+    body: Mapping[str, Any],
+    sig_hex: str = "",
+    verify_key_hex: str = "",
+) -> int:
+    """
+    Convenience helper for callers that already built a receipt-v2 metadata body.
+    The body is canonicalized here because the caller is explicitly passing an object,
+    not pre-attested canonical bytes.
+    """
+    if not isinstance(body, Mapping):
+        raise TypeError("body must be a mapping")
+    # Do a bounded sanitize pass aligned with receipt_v2's content-agnostic contract.
+    cfg = ReceiptStoreConfig().normalized()
+    budget = _JsonBudget(
+        max_nodes=cfg.max_json_nodes,
+        max_items=cfg.max_json_items,
+        max_depth=cfg.max_json_depth,
+        max_str_total=cfg.max_json_str_total,
+    )
+    safe = _json_sanitize(
+        dict(body),
+        budget=budget,
+        depth=0,
+        max_str_len=cfg.max_json_str_len,
+        redact_secrets=True,
+        drop_forbidden_keys=True,
+    )
+    body_json = _canonical_json(safe)
+    return store.append(head_hex=head_hex, body_json=body_json, sig_hex=sig_hex, verify_key_hex=verify_key_hex)

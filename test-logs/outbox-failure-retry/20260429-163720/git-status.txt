@@ -1,0 +1,99 @@
+ M tcd/agent.py
+ M tcd/attest.py
+ M tcd/audit.py
+ M tcd/auditor.py
+ M tcd/auth.py
+ M tcd/calibration.py
+ M tcd/config.py
+ M tcd/crypto.py
+ M tcd/decision_engine.py
+ M tcd/detector.py
+ M tcd/exporter.py
+ M tcd/kv.py
+ M tcd/ledger.py
+ M tcd/logging.py
+ M tcd/middleware.py
+ M tcd/middleware_request.py
+ M tcd/middleware_security.py
+ M tcd/multivariate.py
+ M tcd/otel_exporter.py
+ M tcd/patch_runtime.py
+ M tcd/policies.py
+ M tcd/ratelimit.py
+ M tcd/receipt_store.py
+ M tcd/receipt_v2.py
+ M tcd/rewrite_engine.py
+ M tcd/risk_av.py
+ M tcd/routing.py
+ M tcd/schemas.py
+ M tcd/security_router.py
+ M tcd/service_grpc.py
+ M tcd/service_http.py
+ M tcd/signals.py
+ M tcd/storage.py
+ M tcd/telemetry_gpu.py
+ M tcd/utils.py
+ M tcd/verify.py
+?? policies.json
+?? policies.json.bak_20260426_194151
+?? tcd/agent.py.bak_agent_replay
+?? tcd/agent.py.bak_replay_lookup_port
+?? tcd/attest.py.bak.20260427_161255
+?? tcd/attest.py.bak_attest_receipt_timeout_20260426_204904
+?? tcd/attest.py.bak_import_os_20260426_205402
+?? tcd/auditor.py.bak_auditor_patch
+?? tcd/auditor.py.bak_auditor_shadow_fix
+?? tcd/auth.py.bak_auth_redigest_fix
+?? tcd/auth.py.bak_auth_strict_fix
+?? tcd/calibration.py.bak_calibration_strict_fix
+?? tcd/decision_engine.py.bak_decision_engine_repair_1777394728
+?? tcd/decision_engine.py.bak_decision_engine_service_http_fix
+?? tcd/detector.py.bak_budget_ceiling_20260427_075956
+?? tcd/detector.py.bak_detector_budget_20260427_020442
+?? tcd/detector.py.bak_hybrid_budget_20260427_080824
+?? tcd/exporter.py.bak_exporter_compat_1777397655
+?? tcd/kv.py.bak_kv_compat_1777399962
+?? tcd/ledger.py.bak.20260427_161255
+?? tcd/ledger.py.bak_durable_sqlite_v2_20260427_140328
+?? tcd/ledger.py.bak_sqlite_rowid_migration_20260427_132315
+?? tcd/logging.py.bak_logging_compat_1777400825
+?? tcd/middleware_request.py.bak_mwreq_compat_1777401538
+?? tcd/policies.py.bak_20260426_194151
+?? tcd/ratelimit.py.bak.1777415000
+?? tcd/receipt_store.py.bak.1777416289
+?? tcd/routing.py.bak.routing_patch
+?? tcd/schemas.py.bak.20260427_212753
+?? tcd/schemas.py.bak_receipt_schema_20260426_223956
+?? tcd/schemas.py.bak_receipt_schema_v2_20260426_231257
+?? tcd/security_router.py.bak_durable_final_20260427_141101
+?? tcd/security_router.py.bak_durable_receipt_20260427_131633
+?? tcd/security_router.py.bak_durable_receipt_20260427_140414
+?? tcd/security_router.py.bak_security_receipt_timeout_20260426_203152
+?? tcd/service_http.py.bak.1777433694
+?? tcd/service_http.py.bak.20260427150441
+?? tcd/service_http.py.bak.20260427153749
+?? tcd/service_http.py.bak.20260427_154736
+?? tcd/service_http.py.bak.20260427_155959
+?? tcd/service_http.py.bak.20260428222813
+?? tcd/service_http.py.bak.20260428_185705
+?? tcd/service_http.py.bak_20260426_194151
+?? tcd/service_http.py.bak_detector_block
+?? tcd/service_http.py.bak_exporter_compat_1777397655
+?? tcd/service_http.py.bak_kv_compat_1777399962
+?? tcd/service_http.py.bak_logging_compat_1777400825
+?? tcd/service_http.py.bak_mwreq_auth_compat_1777402448
+?? tcd/service_http.py.bak_policy_router_20260426_183001
+?? tcd/service_http.py.bak_receipt_ref_lookup
+?? tcd/service_http.py.bak_receipt_surface_20260426_220558
+?? tcd/service_http.py.bak_receipt_timeout_20260426_201822
+?? tcd/service_http.py.bak_service_http_receipt_c_20260426_232727
+?? tcd/service_http.py.bak_verify_contract_20260427_001954
+?? tcd/signals.py.bak.20260427_231933
+?? tcd/storage.py.bak.20260427_204650
+?? tcd/verify.py.bak.1777337615
+?? tcd/verify.py.bak.1777337666
+?? tcd/verify.py.bak_verify_contract_20260427_001954
+?? tcd_outbox.sqlite3
+?? test-logs/
+?? tests/test_service_http_detector_targeted_integration.py
+?? tests/test_verify_forbidden_key_semantics.py

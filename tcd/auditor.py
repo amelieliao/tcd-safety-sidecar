@@ -812,20 +812,20 @@ class _MetricsScope:
 
     def inc_audit_error(self, kind: str) -> None:
         try:
-            self._audit_error_total.labels(*self._lv, kind=_safe_text(kind, max_len=32)).inc()
+            self._audit_error_total.labels(self._lv[0], self._lv[1], self._lv[2], _safe_text(kind, max_len=32)).inc()
         except Exception:
             pass
 
     def inc_verify_error(self, kind: str) -> None:
         try:
-            self._verify_error_total.labels(*self._lv, kind=_safe_text(kind, max_len=32)).inc()
+            self._verify_error_total.labels(self._lv[0], self._lv[1], self._lv[2], _safe_text(kind, max_len=32)).inc()
         except Exception:
             pass
 
     def set_verify_mode(self, mode: str) -> None:
         # gauge with label mode; set 1.0 for current mode, leave others untouched (low cardinality)
         try:
-            self._verify_mode_info.labels(*self._lv, mode=_safe_text(mode, max_len=16)).set(1.0)
+            self._verify_mode_info.labels(self._lv[0], self._lv[1], self._lv[2], _safe_text(mode, max_len=16)).set(1.0)
         except Exception:
             pass
 
@@ -1157,8 +1157,15 @@ def _safe_parse_body_meta(
     if not _bracket_depth_guard(body, max_depth=int(max_json_depth), max_scan_chars=int(max_json_depth_scan_chars)):
         return True, None, None, None, utf8_valid
 
+    def _bad_constant(_: str) -> Any:
+        raise ValueError("non-finite json constant")
+
     try:
-        obj = json.loads(body, parse_int=_make_parse_int_limiter(int(max_int_digits)))
+        obj = json.loads(
+            body,
+            parse_int=_make_parse_int_limiter(int(max_int_digits)),
+            parse_constant=_bad_constant,
+        )
     except Exception:
         return True, None, None, None, utf8_valid
 
@@ -1168,7 +1175,7 @@ def _safe_parse_body_meta(
     pv = obj.get("prev")
     prev_str = pv if isinstance(pv, str) else None
     tv = obj.get("ts_ns")
-    ts_ns = int(tv) if isinstance(tv, int) else None
+    ts_ns = int(tv) if type(tv) is int else None
     return False, obj, prev_str, ts_ns, utf8_valid
 
 
@@ -1999,7 +2006,20 @@ def audit(
         ms.audit_latency.observe(rep.latency_s)
         return rep
 
-    policy_digest = cfg.policy_digest()
+    try:
+        policy_digest = cfg.policy_digest()
+    except Exception as e:
+        rep.error_kind = ERR_CONFIG
+        rep.error_msg = _safe_text(e, max_len=200)
+        rep.failure_reasons = [ERR_CONFIG]
+        rep.audit_policy_digest = "unknown"
+        ms.chain_ok.set(0.0)
+        ms.chain_fail.inc()
+        ms.inc_audit_error(ERR_CONFIG)
+        rep.latency_s = float(time.perf_counter() - t0_all)
+        ms.audit_latency.observe(rep.latency_s)
+        return rep
+
     rep.audit_policy_digest = policy_digest
     ms.set_policy_info(policy_digest, rep.verify_impl_digest)
 
@@ -2088,7 +2108,7 @@ def audit(
 
         # stats best-effort
         try:
-            st = store.stats()
+            store_stats = store.stats()
         except Exception as e:
             ms.store_stats_fail.inc()
             ms.inc_audit_error(ERR_STORE_STATS)
@@ -2096,10 +2116,10 @@ def audit(
                 logger.exception("store.stats failed: %s", _safe_text(e, max_len=200))
             else:
                 logger.warning("store.stats failed: %s", _safe_text(e, max_len=200))
-            st = {}
-        ms.store_count.set(float(st.get("count", 0.0) or 0.0))
-        ms.store_size.set(float(st.get("size_bytes", 0.0) or 0.0))
-        ms.store_last_ts.set(float(st.get("last_ts", 0.0) or 0.0))
+            store_stats = {}
+        ms.store_count.set(float(store_stats.get("count", 0.0) or 0.0))
+        ms.store_size.set(float(store_stats.get("size_bytes", 0.0) or 0.0))
+        ms.store_last_ts.set(float(store_stats.get("last_ts", 0.0) or 0.0))
 
         rep.latency_s = float(time.perf_counter() - t0_all)
         ms.audit_latency.observe(rep.latency_s)
@@ -2300,6 +2320,10 @@ def audit(
     ms.selected_bytes.set(float(sel_bytes))
     ms.chain_gap_window.set(0.0)  # chain selection is contiguous by construction
 
+    selected_budget_exceeded = bool(
+        cfg.max_window_bytes is not None and int(sel_bytes) > int(cfg.max_window_bytes)
+    )
+
     rep.ordering_latency_s = float(time.perf_counter() - t0_order)
     ms.ordering_latency.observe(rep.ordering_latency_s)
 
@@ -2338,6 +2362,12 @@ def audit(
 
     # Local checks: parse errors, duplicates/cycles/forks policy, ts, schema
     local_ok = True
+
+    if selected_budget_exceeded:
+        if R_INSUFFICIENT_BUDGET not in rep.failure_reasons:
+            rep.failure_reasons.append(R_INSUFFICIENT_BUDGET)
+        ms.insufficient_budget_total.inc()
+        local_ok = False
 
     # parse errors anywhere in considered set count toward policy
     if (parse_errors + parse_skipped) > 0:
@@ -2468,7 +2498,7 @@ def audit(
                 local_ok = False
                 continue
             v = obj.get("v")
-            if not isinstance(v, int):
+            if type(v) is not int:
                 local_ok = False
 
             pv = obj.get("prev")
@@ -2476,7 +2506,7 @@ def audit(
                 local_ok = False
 
             tv = obj.get("ts_ns")
-            if not isinstance(tv, int):
+            if type(tv) is not int:
                 local_ok = False
 
         # enforce_body_head_match strict semantics (missing/non-string/uncanon => mismatch)
@@ -2565,12 +2595,23 @@ def audit(
         bodies_sel.append(rr.body_raw)
 
     # If selection got emptied by strict filters, treat as verify input error.
-    if not heads_sel:
+    if selected_budget_exceeded or not heads_sel:
         verify_ok = False
         verify_err = VERIFY_ERR_INPUT
+        verify_busy = False
+        verify_to = False
+        verify_lat = 0.0
+        mode_used = (cfg.verify_timeout_mode or "thread").lower().strip()
         ms.verify_exception_total.inc()
         ms.inc_verify_error(VERIFY_ERR_INPUT)
-        rep.failure_reasons.append(R_VERIFY_EXCEPTION)
+        rep.verify_ok = False
+        rep.verify_error_kind = verify_err
+        rep.verify_busy = False
+        rep.verify_timed_out = False
+        rep.verify_latency_s = 0.0
+        rep.verify_mode_used = mode_used
+        if R_VERIFY_EXCEPTION not in rep.failure_reasons:
+            rep.failure_reasons.append(R_VERIFY_EXCEPTION)
     else:
         # Verify signature hook for policy blob (optional, best-effort)
         if cfg.policy_sig_verify_func is not None and cfg.policy_sig_b64:
@@ -2584,6 +2625,8 @@ def audit(
             except Exception:
                 local_ok = False
                 rep.failure_reasons.append("POLICY_SIGNATURE_INVALID")
+
+        rep.local_ok = bool(local_ok)
 
         # Execute verify via per-instance executor
         key = (name, version, store_lbl)
@@ -2626,7 +2669,7 @@ def audit(
 
     # Store stats best-effort (observability, not correctness)
     try:
-        st = store.stats()
+        store_stats = store.stats()
     except Exception as e:
         ms.store_stats_fail.inc()
         ms.inc_audit_error(ERR_STORE_STATS)
@@ -2634,17 +2677,17 @@ def audit(
             logger.exception("store.stats failed: %s", _safe_text(e, max_len=200))
         else:
             logger.warning("store.stats failed: %s", _safe_text(e, max_len=200))
-        st = {}
+        store_stats = {}
 
-    ms.store_count.set(float(st.get("count", 0.0) or 0.0))
-    ms.store_size.set(float(st.get("size_bytes", 0.0) or 0.0))
-    ms.store_last_ts.set(float(st.get("last_ts", 0.0) or 0.0))
+    ms.store_count.set(float(store_stats.get("count", 0.0) or 0.0))
+    ms.store_size.set(float(store_stats.get("size_bytes", 0.0) or 0.0))
+    ms.store_last_ts.set(float(store_stats.get("last_ts", 0.0) or 0.0))
 
     # Metrics finalization
     ms.chain_ok.set(1.0 if rep.ok else 0.0)
     if not rep.ok:
         ms.chain_fail.inc()
-    if st.missing_prev and cfg.treat_gaps_as_fail:
+    if rep.missing_prev and cfg.treat_gaps_as_fail:
         # This is the closest "gap" semantics under chain mode
         ms.chain_gap_total.inc(1.0)
 

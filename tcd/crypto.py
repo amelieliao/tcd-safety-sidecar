@@ -3080,13 +3080,124 @@ def verify_envelope(
 class Blake3Hash:
     """
     Backwards-compatible facade name.
-    Hash/MAC semantics are governed by profile+suite+engine_version.
+
+    Compatibility behavior:
+
+    1) Legacy raw ctx-based hashing:
+       - hex(...)
+       - hexdigest(...)
+
+       These do NOT initialize CryptoContext and accept arbitrary ctx strings.
+
+    2) Preferred digest APIs:
+       - digest(...)
+       - digest_hex(...)
+       - digest_bytes(...)
+
+       If label is one of the standard HashLabel values, these use the real
+       CryptoContext / HashEngine path.
+
+       If label is an arbitrary legacy string, they fall back to the lightweight
+       legacy raw-hash path so older call-sites do not break.
+
+    3) Context-bound methods:
+       - mac(...)
+       - mac_bytes(...)
+       - verify_mac(...)
+       - hmac(...)
+
+       These still use CryptoContext.
+
+    4) chain(...)
+
+       Uses a lightweight local chaining path and does NOT initialize
+       CryptoContext.
     """
 
     @staticmethod
-    def digest(data: bytes, *, label: HashLabel = "generic") -> str:
-        ctx = get_default_context()
-        return ctx.hash_engine.digest_hex(data, label=label)
+    def _coerce_bytes(data: Any, *, field: str) -> bytes:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise CryptoError(f"Blake3Hash.{field} data must be bytes-like")
+        return bytes(data)
+
+    @staticmethod
+    def _normalize_domain(value: Any, *, default: str) -> str:
+        s = _safe_text(value, max_len=_MAX_STR_MED)
+        return s or default
+
+    @staticmethod
+    def _legacy_hash_bytes(data: bytes, *, domain: str) -> bytes:
+        payload = domain.encode("utf-8", errors="strict") + b"\x1f" + data
+
+        if blake3 is not None:
+            try:
+                h = blake3.blake3()
+                h.update(payload)
+                try:
+                    out = h.digest(length=32)
+                except TypeError:
+                    out = h.digest()
+                return bytes(out[:32])
+            except Exception:
+                pass
+
+        return hashlib.blake2b(payload, digest_size=32).digest()
+
+    @staticmethod
+    def _is_standard_label(label: Any) -> bool:
+        if not isinstance(label, str):
+            return False
+        return label in _ALLOWED_HASH_LABELS
+
+    @staticmethod
+    def digest(data: bytes, *, label: Union[HashLabel, str] = "generic") -> str:
+        data_b = Blake3Hash._coerce_bytes(data, field="digest")
+
+        if Blake3Hash._is_standard_label(label):
+            ctx = get_default_context()
+            return ctx.hash_engine.digest_hex(data_b, label=cast(HashLabel, label))
+
+        domain = Blake3Hash._normalize_domain(label, default="generic")
+        return _bytes_to_hex(Blake3Hash._legacy_hash_bytes(data_b, domain=domain))
+
+    @staticmethod
+    def digest_hex(data: bytes, *, label: Union[HashLabel, str] = "generic") -> str:
+        data_b = Blake3Hash._coerce_bytes(data, field="digest_hex")
+
+        if Blake3Hash._is_standard_label(label):
+            ctx = get_default_context()
+            return ctx.hash_engine.digest_hex(data_b, label=cast(HashLabel, label))
+
+        domain = Blake3Hash._normalize_domain(label, default="generic")
+        return _bytes_to_hex(Blake3Hash._legacy_hash_bytes(data_b, domain=domain))
+
+    @staticmethod
+    def digest_bytes(data: bytes, *, label: Union[HashLabel, str] = "generic") -> bytes:
+        data_b = Blake3Hash._coerce_bytes(data, field="digest_bytes")
+
+        if Blake3Hash._is_standard_label(label):
+            ctx = get_default_context()
+            return ctx.hash_engine.digest_bytes(data_b, label=cast(HashLabel, label))
+
+        domain = Blake3Hash._normalize_domain(label, default="generic")
+        return Blake3Hash._legacy_hash_bytes(data_b, domain=domain)
+
+    @staticmethod
+    def hex(data: bytes, ctx: str = "tcd:blake3_raw") -> str:
+        """
+        Legacy compatibility API for old call-sites like:
+            Blake3Hash().hex(payload, ctx="tcd:blake3_raw")
+
+        This performs a direct domain-separated raw digest over:
+            ctx_bytes + b"\\x1f" + data
+        """
+        domain = Blake3Hash._normalize_domain(ctx, default="tcd:blake3_raw")
+        data_b = Blake3Hash._coerce_bytes(data, field="hex")
+        return _bytes_to_hex(Blake3Hash._legacy_hash_bytes(data_b, domain=domain))
+
+    @staticmethod
+    def hexdigest(data: bytes, ctx: str = "tcd:blake3_raw") -> str:
+        return Blake3Hash.hex(data, ctx=ctx)
 
     @staticmethod
     def mac(key: bytes, data: bytes, *, label: HashLabel = "hmac") -> str:
@@ -3094,17 +3205,64 @@ class Blake3Hash:
         return ctx.hash_engine.mac_hex(key, data, label=label)
 
     @staticmethod
-    def verify_mac(key: bytes, data: bytes, mac: Union[str, bytes], *, label: HashLabel = "hmac") -> bool:
+    def mac_bytes(key: bytes, data: bytes, *, label: HashLabel = "hmac") -> bytes:
+        ctx = get_default_context()
+        return ctx.hash_engine.mac_bytes(key, data, label=label)
+
+    @staticmethod
+    def verify_mac(
+        key: bytes,
+        data: bytes,
+        mac: Union[str, bytes],
+        *,
+        label: HashLabel = "hmac",
+    ) -> bool:
         ctx = get_default_context()
         return ctx.hash_engine.verify_mac(key, data, mac, label=label)
 
     @staticmethod
     def hmac(key: bytes, data: bytes, *, label: HashLabel = "hmac") -> str:
-        # compatibility alias; may be disallowed in strict profiles unless break-glass
         ctx = get_default_context()
         return ctx.hash_engine.hmac(key, data, label=label)
 
     @staticmethod
-    def chain(prev_hex: Optional[str], chunk: bytes, *, label: HashLabel = "chain") -> str:
-        ctx = get_default_context()
-        return ctx.hash_engine.chain_hex(prev_hex, chunk, label=label)
+    def chain(
+        prev_hex: Optional[str],
+        chunk: bytes,
+        *,
+        label: Union[HashLabel, str] = "chain",
+    ) -> str:
+        """
+        Lightweight local chaining path.
+        Does NOT initialize CryptoContext.
+        """
+        domain = Blake3Hash._normalize_domain(label, default="chain")
+        chunk_b = Blake3Hash._coerce_bytes(chunk, field="chain")
+
+        if len(chunk_b) > _HARD_MAX_CHAIN_CHUNK_BYTES:
+            raise CryptoError("chain chunk too large")
+
+        prev_b = b""
+        if prev_hex:
+            prev_b = _hex_to_bytes(prev_hex, allow_odd_len=False)
+
+        payload = (
+            b"TCD-BLAKE3HASH-CHAIN-v1"
+            + _pack_blob(domain.encode("utf-8", errors="strict"))
+            + _pack_blob(prev_b)
+            + _pack_blob(chunk_b)
+        )
+
+        if blake3 is not None:
+            try:
+                h = blake3.blake3()
+                h.update(payload)
+                try:
+                    out = h.digest(length=32)
+                except TypeError:
+                    out = h.digest()
+                return _bytes_to_hex(bytes(out[:32]))
+            except Exception:
+                pass
+
+        return hashlib.blake2b(payload, digest_size=32).hexdigest()

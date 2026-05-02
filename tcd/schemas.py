@@ -53,7 +53,7 @@ _SAFE_REASON_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 
 _DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{16,256}$")
 _DIGEST_HEX_0X_RE = re.compile(r"^0x[0-9a-f]{16,256}$")
-_DIGEST_ALG_HEX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:[0-9a-f]{16,256}$")
+_DIGEST_ALG_HEX_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.:\-]{0,31}:){1,3}[0-9a-f]{16,256}$")
 _CFG_FP_RE = re.compile(
     r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256}|[A-Za-z0-9][A-Za-z0-9_.-]{1,15}:[0-9a-f]{16,256})$"
 )
@@ -81,16 +81,45 @@ _ALLOWED_TRUST_ZONES = frozenset(
     {"internet", "internal", "partner", "admin", "ops", "unknown", "__config_error__"}
 )
 _ALLOWED_ROUTE_PROFILES = frozenset(
-    {"inference", "batch", "admin", "control", "metrics", "health", "unknown"}
+    {"inference", "batch", "admin", "control", "metrics", "health", "restricted", "unknown"}
 )
 _ALLOWED_RISK_LABELS = frozenset({"low", "normal", "elevated", "high", "critical", "unknown"})
 _ALLOWED_BODY_KINDS = frozenset({"canonical_json", "blob_ref", "compact_receipt", "opaque"})
 _ALLOWED_ROUTE_ID_KINDS = frozenset({"plan"})
-_ALLOWED_LEDGER_STAGE = frozenset({"prepared", "committed", "outboxed", "skipped", "failed"})
-_ALLOWED_OUTBOX_STATUS = frozenset({"queued", "flushed", "dropped", "disabled", "none"})
+_ALLOWED_LATENCY_HINTS = frozenset(
+    {
+        "normal",
+        "low_latency",
+        "high_safety",
+        "background",
+        "batch",
+        "realtime",
+        "interactive",
+        "unknown",
+    }
+)
+
+_ALLOWED_LEDGER_STAGE = frozenset(
+    {
+        "prepared",
+        "committed",
+        "outboxed",
+        "skipped",
+        "failed",
+        "prepare_failed",
+        "commit_failed",
+        "outbox_failed",
+        "none",
+        "unknown",
+    }
+)
+_ALLOWED_OUTBOX_STATUS = frozenset(
+    {"queued", "flushed", "dropped", "disabled", "none", "pending", "failed", "unknown"}
+)
 
 _ALLOWED_REASON_CODES = frozenset(
     {
+        # schemas / route baseline
         "ROUTER_DISABLED",
         "ROUTER_LAST_KNOWN_GOOD",
         "ROUTER_FAIL_CLOSED",
@@ -130,6 +159,68 @@ _ALLOWED_REASON_CODES = frozenset(
         "ROUTE_STRICT",
         "CRITICAL_BASIS_BLOCK",
         "BALANCED_ROUTE",
+
+        # security_router v4
+        "DEFAULT_ALLOW",
+        "POLICY_BIND_ERROR",
+        "POLICY_DENY",
+        "POLICY_BLOCK",
+        "POLICY_DEGRADE",
+        "AUTHZ_DENY",
+        "AUTH_CONTEXT_MISSING",
+        "AUTH_CONTEXT_UNTRUSTED",
+        "RATE_IP_DENY",
+        "RATE_TENANT_DENY",
+        "RATE_USER_MODEL_DENY",
+        "RATE_POLICY_DENY",
+        "RATE_DEPENDENCY_ERROR",
+        "DETECTOR_HIGH",
+        "DETECTOR_CRITICAL",
+        "DETECTOR_TRIGGER",
+        "DETECTOR_ACTION_BLOCK",
+        "DETECTOR_ACTION_DEGRADE",
+        "DETECTOR_ERROR",
+        "DETECTOR_PREVIEW_ONLY",
+        "DETECTOR_SIGNAL_UNTRUSTED",
+        "DETECTOR_SIGNAL_UNSIGNED",
+        "DETECTOR_SIGNAL_STALE",
+        "ROUTE_BLOCK",
+        "ROUTE_DEGRADE",
+        "ROUTE_UNAVAILABLE",
+        "ROUTE_REQUIRED_MISSING",
+        "ATTESTOR_REQUIRED_UNAVAILABLE",
+        "ATTESTATION_FAILED",
+        "RECEIPT_ISSUED",
+        "RECEIPT_SKIPPED",
+        "RECEIPT_LOCAL_ONLY",
+        "RECEIPT_DURABILITY_PENDING",
+        "RECEIPT_DURABLE_OUTBOX",
+        "RECEIPT_DURABLE_COMMITTED",
+        "AUDIT_EMIT_FAIL",
+        "AUDIT_OUTBOX_QUEUED",
+        "LEDGER_PREPARED",
+        "LEDGER_COMMITTED",
+        "LEDGER_PREPARE_FAILED",
+        "LEDGER_COMMIT_FAILED",
+        "OUTBOX_QUEUED",
+        "OUTBOX_QUEUE_FAILED",
+        "INTEGRITY_ERROR",
+
+        # service_http local fallback / detector compatibility
+        "LOCAL_ROUTE_FALLBACK",
+        "DETECTOR_BLOCK",
+        "RISK_LOW",
+        "RISK_HIGH",
+        "RISK_CRITICAL",
+        "FORMAL_DETECTOR_UNAVAILABLE",
+        "FORMAL_DETECTOR_REQUEST_BUILD_FAILED",
+        "FORMAL_DETECTOR_EXECUTION_FAILED",
+        "HEAD_SECRETS_PII_HARD_MATCH",
+        "HEAD_PROMPT_INJECTION_HARD_MATCH",
+        "HEAD_CYBER_ABUSE_HARD_MATCH",
+        "HEAD_FRAUD_COMPLIANCE_HARD_MATCH",
+        "HEAD_VIOLENCE_SELF_HARM_HARD_MATCH",
+        "HEAD_HATE_ABUSE_NSFW_HARD_MATCH",
     }
 )
 
@@ -279,7 +370,7 @@ def _safe_reason_code(v: Any, *, default: Optional[str] = None) -> Optional[str]
 
 
 def _looks_like_digestish(s: str) -> bool:
-    if not s:
+    if not isinstance(s, str) or not s:
         return False
     if _DIGEST_HEX_RE.fullmatch(s):
         return True
@@ -289,32 +380,53 @@ def _looks_like_digestish(s: str) -> bool:
         return True
     if _CFG_FP_RE.fullmatch(s):
         return True
+    # Compatibility with security_router/service_http refs:
+    #   sp2:sha256:<hex>
+    #   ssg2:sha256:<hex>
+    #   scx2:sha256:<hex>
+    #   body:blake3:<hex>
+    #   cfg1:<hex>
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}:[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}:[0-9a-fA-F]{8,256}", s):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}:[0-9a-fA-F]{8,256}", s):
+        return True
     return False
 
 
 def _normalize_digest_token(v: Any, *, kind: str) -> Optional[str]:
-    s = _safe_blob_string(v, max_len=1024)
+    """
+    Compatibility-safe digest/fingerprint normalization for public views.
+
+    This function is intentionally permissive for view models:
+    - it preserves known digest/fingerprint tokens;
+    - it accepts multi-segment tokens used by security_router/service_http;
+    - it falls back to a bounded safe string instead of raising, so schema
+      projection cannot hang or fail a request after the actual decision was made.
+    """
+    s = _safe_blob_string(v, max_len=4096 if kind in {"receipt_body", "body"} else 1024)
     if s is None:
         return None
-    if kind == "cfg_fp":
-        if _CFG_FP_RE.fullmatch(s):
-            return s
-        raise ValueError("invalid config fingerprint")
-    if kind == "receipt_head":
-        if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) or _DIGEST_ALG_HEX_RE.fullmatch(s):
-            return s.lower() if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) else s
-        raise ValueError("invalid receipt head")
-    if kind == "policy_digest":
-        if _DIGEST_HEX_0X_RE.fullmatch(s) or _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_ALG_HEX_RE.fullmatch(s):
-            return s.lower() if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s) else s
-        raise ValueError("invalid policy digest")
+
     if kind == "integrity":
         if _RECEIPT_INTEGRITY_RE.fullmatch(s):
             return s
-        raise ValueError("invalid receipt_integrity")
+        return _safe_blob_string(s, max_len=256)
+
+    if kind == "cfg_fp":
+        if _CFG_FP_RE.fullmatch(s) or _looks_like_digestish(s):
+            return s
+        return _safe_blob_string(s, max_len=256)
+
+    if kind in {"receipt_head", "policy_digest", "digest", "body_digest"}:
+        if _DIGEST_HEX_RE.fullmatch(s) or _DIGEST_HEX_0X_RE.fullmatch(s):
+            return s.lower()
+        if _looks_like_digestish(s):
+            return s
+        return _safe_blob_string(s, max_len=1024)
+
     if _looks_like_digestish(s):
         return s
-    raise ValueError("invalid digest token")
+    return _safe_blob_string(s, max_len=1024)
 
 
 def _coerce_float(v: Any) -> Optional[float]:
@@ -641,6 +753,35 @@ def _safe_json_any(v: Any) -> Any:
     return _json_sanitize(v, budget=budget, depth=0)
 
 
+
+def _coerce_receipt_body_string(v: Any, *, max_bytes: int) -> Optional[str]:
+    """
+    Receipt body is canonical verification material. Do not sanitize, normalize,
+    strip, or rewrite strings. Only enforce type/UTF-8/size. For dict/list input,
+    canonicalize once because callers explicitly passed structured JSON.
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            raw = v.encode("utf-8", errors="strict")
+        except Exception:
+            return None
+        if len(raw) > max_bytes:
+            return None
+        return v
+    if type(v) in (dict, list, tuple):
+        safe = _safe_json_any(v)
+        try:
+            s = _bounded_json_dumps(safe)
+        except Exception:
+            return None
+        if len(s.encode("utf-8", errors="strict")) > max_bytes:
+            return None
+        return s
+    return None
+
+
 def _coerce_canonical_json_string(v: Any, *, max_bytes: int) -> Optional[str]:
     """
     Strict boundary rule:
@@ -739,8 +880,8 @@ class _IngressModel(BaseModel):
         extra="forbid",
         from_attributes=True,
         populate_by_name=True,
-        validate_assignment=True,
-        str_strip_whitespace=True,
+        validate_assignment=False,
+        str_strip_whitespace=False,
     )
 
 
@@ -749,8 +890,8 @@ class _CompatViewModel(BaseModel):
         extra="ignore",
         from_attributes=True,
         populate_by_name=True,
-        validate_assignment=True,
-        str_strip_whitespace=True,
+        validate_assignment=False,
+        str_strip_whitespace=False,
     )
 
     compat_unknown_fields_count: int = 0
@@ -832,28 +973,67 @@ class ArtifactRefsView(_CompatViewModel):
     receipt_ref: Optional[str] = None
     ledger_ref: Optional[str] = None
     attestation_ref: Optional[str] = None
+
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_dedupe_key: Optional[str] = None
+    delivery_attempts: Optional[int] = None
+
     event_digest: Optional[str] = None
     body_digest: Optional[str] = None
+    payload_digest: Optional[str] = None
+    chain_id: Optional[str] = None
+    chain_head: Optional[str] = None
+
     ledger_stage: Optional[str] = None
     outbox_status: Optional[str] = None
+
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+    governance_terminal: Optional[bool] = None
+    receipt_governance_ready: Optional[bool] = None
+
     produced_by: List[str] = Field(default_factory=list)
     provenance_path_digest: Optional[str] = None
 
     @field_validator(
-        "audit_ref", "receipt_ref", "ledger_ref", "attestation_ref", "provenance_path_digest", mode="before"
+        "audit_ref",
+        "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
+        "outbox_dedupe_key",
+        "chain_id",
+        "receipt_surface_kind",
+        "receipt_delivery_state",
+        "provenance_path_digest",
+        mode="before",
     )
     @classmethod
     def _v_ids(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
-        return _safe_blob_string(v, max_len=256)
+        return _safe_blob_string(v, max_len=512)
 
-    @field_validator("event_digest", "body_digest", mode="before")
+    @field_validator("event_digest", "body_digest", "payload_digest", "chain_head", mode="before")
     @classmethod
     def _v_digests(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         return _normalize_digest_token(v, kind="policy_digest")
+
+    @field_validator("delivery_attempts", mode="before")
+    @classmethod
+    def _v_delivery_attempts(cls, v: Any) -> Optional[int]:
+        x = _finite_int(v, default=None)
+        if x is None:
+            return None
+        return max(0, x)
 
     @field_validator("ledger_stage", mode="before")
     @classmethod
@@ -871,6 +1051,19 @@ class ArtifactRefsView(_CompatViewModel):
         s = _safe_label(v, default="")
         return s if s in _ALLOWED_OUTBOX_STATUS else (s or None)
 
+    @field_validator(
+        "evidence_durable",
+        "evidence_storage_ready",
+        "governance_terminal",
+        "receipt_governance_ready",
+        mode="before",
+    )
+    @classmethod
+    def _v_boolish(cls, v: Any) -> Optional[bool]:
+        if v is None:
+            return None
+        return _coerce_bool(v)
+
     @field_validator("produced_by", mode="before")
     @classmethod
     def _v_produced_by(cls, v: Any) -> List[str]:
@@ -878,6 +1071,9 @@ class ArtifactRefsView(_CompatViewModel):
 
 
 class EvidenceIdentityView(_CompatViewModel):
+    request_id: Optional[str] = None
+    trace_id: Optional[str] = None
+
     event_id: Optional[str] = None
     event_id_kind: Optional[str] = None
     decision_id: Optional[str] = None
@@ -891,6 +1087,10 @@ class EvidenceIdentityView(_CompatViewModel):
     policy_ref: Optional[str] = None
     policyset_ref: Optional[str] = None
     state_domain_id: Optional[str] = None
+    adapter_registry_fp: Optional[str] = None
+    selected_source: Optional[str] = None
+    controller_mode: Optional[str] = None
+    statistical_guarantee_scope: Optional[str] = None
 
     activation_id: Optional[str] = None
     patch_id: Optional[str] = None
@@ -898,8 +1098,17 @@ class EvidenceIdentityView(_CompatViewModel):
 
     audit_ref: Optional[str] = None
     receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_status: Optional[str] = None
+    ledger_stage: Optional[str] = None
 
     @field_validator(
+        "request_id",
+        "trace_id",
         "event_id",
         "decision_id",
         "route_plan_id",
@@ -907,16 +1116,25 @@ class EvidenceIdentityView(_CompatViewModel):
         "policy_ref",
         "policyset_ref",
         "state_domain_id",
+        "adapter_registry_fp",
+        "selected_source",
+        "controller_mode",
+        "statistical_guarantee_scope",
         "activation_id",
         "patch_id",
         "change_ticket_id",
         "audit_ref",
         "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
         mode="before",
     )
     @classmethod
     def _v_ids(cls, v: Any) -> Optional[str]:
-        return _safe_blob_string(v, max_len=256)
+        return _safe_blob_string(v, max_len=512)
 
     @field_validator("config_fingerprint", mode="before")
     @classmethod
@@ -945,6 +1163,22 @@ class EvidenceIdentityView(_CompatViewModel):
     @classmethod
     def _v_kind(cls, v: Any) -> Optional[str]:
         return _safe_label(v, default="") or None
+
+    @field_validator("ledger_stage", mode="before")
+    @classmethod
+    def _v_ledger_stage(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_LEDGER_STAGE else (s or None)
+
+    @field_validator("outbox_status", mode="before")
+    @classmethod
+    def _v_outbox_status(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_OUTBOX_STATUS else (s or None)
 
 
 class RouteContractView(_CompatViewModel):
@@ -1092,6 +1326,7 @@ class ReceiptPublicView(_CompatViewModel):
     head: Optional[str] = None
     receipt_ref: Optional[str] = None
     audit_ref: Optional[str] = None
+    request_id: Optional[str] = None
     event_id: Optional[str] = None
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
@@ -1101,8 +1336,20 @@ class ReceiptPublicView(_CompatViewModel):
     verify_key_id: Optional[str] = None
     verify_key_fp: Optional[str] = None
     receipt_integrity: Optional[str] = None
+    pq_required: Optional[bool] = None
+    pq_ok: Optional[bool] = None
     pq_signature_required: Optional[bool] = None
     pq_signature_ok: Optional[bool] = None
+
+    ledger_stage: Optional[str] = None
+    outbox_status: Optional[str] = None
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+    governance_terminal: Optional[bool] = None
+    receipt_governance_ready: Optional[bool] = None
+
     integrity_ok: bool = True
     integrity_errors: List[str] = Field(default_factory=list)
 
@@ -1114,6 +1361,9 @@ class ReceiptAuditView(_CompatViewModel):
     body_digest: Optional[str] = None
     receipt_ref: Optional[str] = None
     audit_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    request_id: Optional[str] = None
     event_id: Optional[str] = None
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
@@ -1126,14 +1376,37 @@ class ReceiptAuditView(_CompatViewModel):
     verify_key_id: Optional[str] = None
     verify_key_fp: Optional[str] = None
     receipt_integrity: Optional[str] = None
+
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_status: Optional[str] = None
+    outbox_dedupe_key: Optional[str] = None
+    delivery_attempts: Optional[int] = None
+    ledger_stage: Optional[str] = None
+    payload_digest: Optional[str] = None
+    event_digest: Optional[str] = None
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+    governance_terminal: Optional[bool] = None
+    receipt_governance_ready: Optional[bool] = None
+
     integrity_ok: bool = True
     integrity_errors: List[str] = Field(default_factory=list)
     meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("meta", mode="before")
+    @classmethod
+    def _v_meta(cls, v: Any) -> Dict[str, Any]:
+        return _safe_json_mapping(v)
 
 
 class ReceiptVerificationView(_CompatViewModel):
     surface_version: str = _VERIFICATION_SURFACE_VERSION
     schema: Optional[str] = None
+    request_id: Optional[str] = None
     head: Optional[str] = None
     body: Optional[str] = None
     sig: Optional[str] = None
@@ -1150,18 +1423,32 @@ class ReceiptVerificationView(_CompatViewModel):
     verify_key_allowed: Optional[bool] = None
     policy_binding_verified: Optional[bool] = None
     cfg_binding_verified: Optional[bool] = None
+
+    ledger_stage: Optional[str] = None
+    outbox_status: Optional[str] = None
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+
     integrity_ok: bool = True
     integrity_errors: List[str] = Field(default_factory=list)
+
+    @field_validator("body", mode="before")
+    @classmethod
+    def _v_body(cls, v: Any) -> Optional[str]:
+        return _coerce_receipt_body_string(v, max_bytes=_MAX_BODY_BYTES)
 
 
 class ReceiptView(_CompatViewModel):
     """
     Receipt / attestation view.
 
-    Strong field split:
-      - digest fields are strong-typed
-      - text fields stay bounded
-      - public / audit / verification surfaces are exposed explicitly
+    Root fixes:
+      - no assignment-validation recursion;
+      - exact receipt_body preservation;
+      - permissive digest/fingerprint compatibility;
+      - governance fields retained and projected into public/audit/verification surfaces.
     """
 
     schema: Optional[str] = None
@@ -1174,7 +1461,7 @@ class ReceiptView(_CompatViewModel):
     receipt_kind: Optional[str] = None
     event_type: Optional[str] = None
 
-    head: Optional[str] = Field(default=None, validation_alias=AliasChoices("head", "receipt", "receipt_head"))
+    head: Optional[str] = Field(default=None, validation_alias=AliasChoices("head", "receipt", "receipt_head", "receiptHead"))
     body: Optional[str] = Field(default=None, validation_alias=AliasChoices("body", "receipt_body", "receiptBody"))
     sig: Optional[str] = Field(default=None, validation_alias=AliasChoices("sig", "receipt_sig", "receiptSig"))
     verify_key: Optional[str] = Field(default=None, validation_alias=AliasChoices("verify_key", "verifyKey"))
@@ -1222,12 +1509,32 @@ class ReceiptView(_CompatViewModel):
     state_domain_id: Optional[str] = None
     adapter_registry_fp: Optional[str] = None
 
+    request_id: Optional[str] = None
     event_id: Optional[str] = None
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
     route_id: Optional[str] = None
     audit_ref: Optional[str] = None
     receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_status: Optional[str] = None
+    outbox_dedupe_key: Optional[str] = None
+    delivery_attempts: Optional[int] = None
+    ledger_stage: Optional[str] = None
+    payload_digest: Optional[str] = None
+    event_digest: Optional[str] = None
+
+    receipt_surface_kind: Optional[str] = None
+    receipt_delivery_state: Optional[str] = None
+    evidence_durable: Optional[bool] = None
+    evidence_storage_ready: Optional[bool] = None
+    governance_terminal: Optional[bool] = None
+    receipt_governance_ready: Optional[bool] = None
 
     chain_namespace: Optional[str] = None
     chain_id: Optional[str] = None
@@ -1239,6 +1546,7 @@ class ReceiptView(_CompatViewModel):
     selected_source: Optional[str] = None
     statistical_guarantee_scope: Optional[str] = None
     trigger: Optional[bool] = None
+    allowed: Optional[bool] = None
 
     produced_by: List[str] = Field(default_factory=list)
     provenance_path_digest: Optional[str] = None
@@ -1272,12 +1580,19 @@ class ReceiptView(_CompatViewModel):
         "policyset_ref",
         "state_domain_id",
         "adapter_registry_fp",
+        "request_id",
         "event_id",
         "decision_id",
         "route_plan_id",
         "route_id",
         "audit_ref",
         "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
+        "outbox_dedupe_key",
         "chain_namespace",
         "chain_id",
         "selected_source",
@@ -1288,16 +1603,18 @@ class ReceiptView(_CompatViewModel):
         "attestation_id",
         "env_fingerprint",
         "provenance_path_digest",
+        "receipt_surface_kind",
+        "receipt_delivery_state",
         mode="before",
     )
     @classmethod
     def _v_idish(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
-        s = _safe_id(v, default=None, max_len=256)
+        s = _safe_id(v, default=None, max_len=512)
         if s is not None:
             return s
-        return _safe_blob_string(v, max_len=512)
+        return _safe_blob_string(v, max_len=1024)
 
     @field_validator(
         "head",
@@ -1307,6 +1624,8 @@ class ReceiptView(_CompatViewModel):
         "config_hash",
         "prev_head_hex",
         "body_digest",
+        "payload_digest",
+        "event_digest",
         mode="before",
     )
     @classmethod
@@ -1318,6 +1637,8 @@ class ReceiptView(_CompatViewModel):
             return _normalize_digest_token(v, kind="cfg_fp")
         if name in {"head", "receipt_secondary", "prev_head_hex"}:
             return _normalize_digest_token(v, kind="receipt_head")
+        if name == "body_digest":
+            return _normalize_digest_token(v, kind="body_digest")
         return _normalize_digest_token(v, kind="policy_digest")
 
     @field_validator("receipt_integrity", mode="before")
@@ -1330,17 +1651,12 @@ class ReceiptView(_CompatViewModel):
     @field_validator("body", mode="before")
     @classmethod
     def _v_body(cls, v: Any) -> Optional[str]:
-        return _coerce_canonical_json_string(v, max_bytes=_MAX_BODY_BYTES)
+        return _coerce_receipt_body_string(v, max_bytes=_MAX_BODY_BYTES)
 
     @field_validator("sig", "receipt_sig_secondary", mode="before")
     @classmethod
     def _v_sig(cls, v: Any) -> Optional[str]:
-        s = _safe_blob_string(v, max_len=_MAX_SIG_BYTES)
-        if s is None:
-            return None
-        if not _BASE64ISH_RE.fullmatch(s):
-            return s
-        return s
+        return _safe_blob_string(v, max_len=_MAX_SIG_BYTES)
 
     @field_validator("verify_key", mode="before")
     @classmethod
@@ -1353,7 +1669,7 @@ class ReceiptView(_CompatViewModel):
         if v is None:
             return None
         s = _safe_label(v, default="")
-        return s or _safe_reason_code(v, default=None)
+        return s or _safe_reason_code(v, default=None) or _safe_blob_string(v, max_len=64)
 
     @field_validator("reason", mode="before")
     @classmethod
@@ -1366,18 +1682,52 @@ class ReceiptView(_CompatViewModel):
         if v is None:
             return None
         s = _safe_label(v, default="")
-        if s not in _ALLOWED_BODY_KINDS:
-            raise ValueError("invalid body_kind")
-        return s
+        return s if s in _ALLOWED_BODY_KINDS else (s or None)
 
-    @field_validator("pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", "trigger", "body_canonicalized", "head_verified", "body_canonical_verified", "integrity_hash_verified", "signature_verified", "verify_key_allowed", "policy_binding_verified", "cfg_binding_verified", mode="before")
+    @field_validator("ledger_stage", mode="before")
+    @classmethod
+    def _v_ledger_stage(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_LEDGER_STAGE else (s or None)
+
+    @field_validator("outbox_status", mode="before")
+    @classmethod
+    def _v_outbox_status(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = _safe_label(v, default="")
+        return s if s in _ALLOWED_OUTBOX_STATUS else (s or None)
+
+    @field_validator(
+        "pq_required",
+        "pq_ok",
+        "pq_signature_required",
+        "pq_signature_ok",
+        "trigger",
+        "allowed",
+        "body_canonicalized",
+        "head_verified",
+        "body_canonical_verified",
+        "integrity_hash_verified",
+        "signature_verified",
+        "verify_key_allowed",
+        "policy_binding_verified",
+        "cfg_binding_verified",
+        "evidence_durable",
+        "evidence_storage_ready",
+        "governance_terminal",
+        "receipt_governance_ready",
+        mode="before",
+    )
     @classmethod
     def _v_boolish(cls, v: Any) -> Optional[bool]:
         if v is None:
             return None
         return _coerce_bool(v)
 
-    @field_validator("schema_version", "store_id", "chain_seq", "ts_ns", "ts_unix_ns", mode="before")
+    @field_validator("schema_version", "store_id", "chain_seq", "ts_ns", "ts_unix_ns", "delivery_attempts", mode="before")
     @classmethod
     def _v_intish(cls, v: Any) -> Optional[int]:
         x = _finite_int(v, default=None)
@@ -1408,34 +1758,60 @@ class ReceiptView(_CompatViewModel):
         errs: List[str] = list(self.integrity_errors)
 
         if self.ts is None and self.ts_unix_ns is not None:
-            self.ts = float(self.ts_unix_ns) / 1_000_000_000.0
+            object.__setattr__(self, "ts", float(self.ts_unix_ns) / 1_000_000_000.0)
         if self.ts_unix_ns is None and self.ts is not None:
-            self.ts_unix_ns = int(self.ts * 1_000_000_000.0)
+            object.__setattr__(self, "ts_unix_ns", int(self.ts * 1_000_000_000.0))
+        if self.ts_ns is None and self.ts_unix_ns is not None:
+            object.__setattr__(self, "ts_ns", self.ts_unix_ns)
 
         if self.route_id is None and self.route_plan_id is not None:
-            self.route_id = self.route_plan_id
+            object.__setattr__(self, "route_id", self.route_plan_id)
+
+        if self.receipt_ref is None and self.head is not None:
+            object.__setattr__(self, "receipt_ref", self.head)
+        if self.attestation_id is None and self.head is not None:
+            object.__setattr__(self, "attestation_id", self.head)
+        if self.attestation_ref is None:
+            object.__setattr__(self, "attestation_ref", self.receipt_ref or self.head)
+
+        if self.verify_key_id is None:
+            object.__setattr__(self, "verify_key_id", self.sig_key_id or self.verify_key)
 
         if self.pq_signature_required is None and self.pq_required is not None:
-            self.pq_signature_required = self.pq_required
+            object.__setattr__(self, "pq_signature_required", self.pq_required)
         if self.pq_signature_ok is None and self.pq_ok is not None:
-            self.pq_signature_ok = self.pq_ok
+            object.__setattr__(self, "pq_signature_ok", self.pq_ok)
 
         if self.body is not None:
             try:
                 obj = _json_loads_strict(self.body)
                 if isinstance(obj, dict):
-                    self.body_kind = self.body_kind or "canonical_json"
-                    self.body_canonicalized = True if self.body_canonicalized is None else self.body_canonicalized
-                    if self.body_digest is None:
-                        self.body_digest = "sha256:" + _sha256_hex(self.body.encode("utf-8", errors="strict"))
+                    object.__setattr__(self, "body_kind", self.body_kind or "canonical_json")
+                    object.__setattr__(self, "body_canonicalized", True if self.body_canonicalized is None else self.body_canonicalized)
                 else:
-                    self.body_kind = self.body_kind or "opaque"
+                    object.__setattr__(self, "body_kind", self.body_kind or "opaque")
+                if self.body_digest is None:
+                    object.__setattr__(self, "body_digest", "sha256:" + _sha256_hex(self.body.encode("utf-8", errors="strict")))
             except Exception:
-                self.body_kind = self.body_kind or "opaque"
-                self.body_canonicalized = False if self.body_canonicalized is None else self.body_canonicalized
+                object.__setattr__(self, "body_kind", self.body_kind or "opaque")
+                object.__setattr__(self, "body_canonicalized", False if self.body_canonicalized is None else self.body_canonicalized)
 
-        self.integrity_errors = errs
-        self.integrity_ok = not errs
+        object.__setattr__(self, "receipt_surface_kind", self.receipt_surface_kind or "ephemeral_attestation")
+        object.__setattr__(self, "receipt_delivery_state", self.receipt_delivery_state or "issued_only")
+        object.__setattr__(self, "ledger_stage", self.ledger_stage or "skipped")
+        object.__setattr__(self, "outbox_status", self.outbox_status or "none")
+        object.__setattr__(self, "evidence_durable", bool(self.evidence_durable) if self.evidence_durable is not None else False)
+        object.__setattr__(self, "evidence_storage_ready", bool(self.evidence_storage_ready) if self.evidence_storage_ready is not None else False)
+
+        if self.receipt_governance_ready is None:
+            object.__setattr__(
+                self,
+                "receipt_governance_ready",
+                bool(self.evidence_durable or self.evidence_storage_ready or self.governance_terminal),
+            )
+
+        object.__setattr__(self, "integrity_errors", errs)
+        object.__setattr__(self, "integrity_ok", not errs)
         return self
 
     def assert_integrity(self) -> None:
@@ -1450,6 +1826,7 @@ class ReceiptView(_CompatViewModel):
             head=self.head,
             receipt_ref=self.receipt_ref,
             audit_ref=self.audit_ref,
+            request_id=self.request_id,
             event_id=self.event_id,
             decision_id=self.decision_id,
             route_plan_id=self.route_plan_id,
@@ -1459,8 +1836,18 @@ class ReceiptView(_CompatViewModel):
             verify_key_id=self.verify_key_id or self.sig_key_id,
             verify_key_fp=self.verify_key_fp,
             receipt_integrity=self.receipt_integrity,
+            pq_required=self.pq_required,
+            pq_ok=self.pq_ok,
             pq_signature_required=self.pq_signature_required,
             pq_signature_ok=self.pq_signature_ok,
+            ledger_stage=self.ledger_stage,
+            outbox_status=self.outbox_status,
+            receipt_surface_kind=self.receipt_surface_kind,
+            receipt_delivery_state=self.receipt_delivery_state,
+            evidence_durable=self.evidence_durable,
+            evidence_storage_ready=self.evidence_storage_ready,
+            governance_terminal=self.governance_terminal,
+            receipt_governance_ready=self.receipt_governance_ready,
             integrity_ok=self.integrity_ok,
             integrity_errors=list(self.integrity_errors),
         )
@@ -1474,6 +1861,9 @@ class ReceiptView(_CompatViewModel):
             body_digest=self.body_digest,
             receipt_ref=self.receipt_ref,
             audit_ref=self.audit_ref,
+            ledger_ref=self.ledger_ref,
+            attestation_ref=self.attestation_ref,
+            request_id=self.request_id,
             event_id=self.event_id,
             decision_id=self.decision_id,
             route_plan_id=self.route_plan_id,
@@ -1486,6 +1876,21 @@ class ReceiptView(_CompatViewModel):
             verify_key_id=self.verify_key_id or self.sig_key_id,
             verify_key_fp=self.verify_key_fp,
             receipt_integrity=self.receipt_integrity,
+            prepare_ref=self.prepare_ref,
+            commit_ref=self.commit_ref,
+            outbox_ref=self.outbox_ref,
+            outbox_status=self.outbox_status,
+            outbox_dedupe_key=self.outbox_dedupe_key,
+            delivery_attempts=self.delivery_attempts,
+            ledger_stage=self.ledger_stage,
+            payload_digest=self.payload_digest,
+            event_digest=self.event_digest,
+            receipt_surface_kind=self.receipt_surface_kind,
+            receipt_delivery_state=self.receipt_delivery_state,
+            evidence_durable=self.evidence_durable,
+            evidence_storage_ready=self.evidence_storage_ready,
+            governance_terminal=self.governance_terminal,
+            receipt_governance_ready=self.receipt_governance_ready,
             integrity_ok=self.integrity_ok,
             integrity_errors=list(self.integrity_errors),
             meta=dict(self.meta),
@@ -1496,6 +1901,7 @@ class ReceiptView(_CompatViewModel):
             self.assert_integrity()
         return ReceiptVerificationView(
             schema=self.schema,
+            request_id=self.request_id,
             head=self.head,
             body=self.body,
             sig=self.sig,
@@ -1512,6 +1918,12 @@ class ReceiptView(_CompatViewModel):
             verify_key_allowed=self.verify_key_allowed,
             policy_binding_verified=self.policy_binding_verified,
             cfg_binding_verified=self.cfg_binding_verified,
+            ledger_stage=self.ledger_stage,
+            outbox_status=self.outbox_status,
+            receipt_surface_kind=self.receipt_surface_kind,
+            receipt_delivery_state=self.receipt_delivery_state,
+            evidence_durable=self.evidence_durable,
+            evidence_storage_ready=self.evidence_storage_ready,
             integrity_ok=self.integrity_ok,
             integrity_errors=list(self.integrity_errors),
         )
@@ -2535,6 +2947,9 @@ class DiagnoseOut(_CompatViewModel):
     decision: str = "allow"
     cause: str = ""
     action: str = "none"
+    allowed: Optional[bool] = None
+    required_action: Optional[str] = None
+    enforcement_mode: Optional[str] = None
 
     score: float = 0.0
     threshold: float = 0.0
@@ -2546,6 +2961,9 @@ class DiagnoseOut(_CompatViewModel):
     alpha_spent: float = 0.0
 
     components: Dict[str, Any] = Field(default_factory=dict)
+
+    receipt_public: Dict[str, Any] = Field(default_factory=dict)
+    receipt_verification: Optional[Dict[str, Any]] = None
 
     e_state: Optional[EProcessStateView] = None
     route: Optional[RouteView] = None
@@ -2579,6 +2997,7 @@ class DiagnoseOut(_CompatViewModel):
     decision_id: Optional[str] = None
     route_plan_id: Optional[str] = None
     event_id: Optional[str] = None
+    request_id: Optional[str] = None
     activation_id: Optional[str] = None
     patch_id: Optional[str] = None
     change_ticket_id: Optional[str] = None
@@ -2589,9 +3008,20 @@ class DiagnoseOut(_CompatViewModel):
     attestation_ref: Optional[str] = None
     controller_mode: Optional[str] = None
     statistical_guarantee_scope: Optional[str] = None
+    adapter_registry_fp: Optional[str] = None
+    selected_source: Optional[str] = None
+
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    outbox_dedupe_key: Optional[str] = None
+    delivery_attempts: Optional[int] = None
 
     body_digest: Optional[str] = None
+    payload_digest: Optional[str] = None
     event_digest: Optional[str] = None
+    chain_id: Optional[str] = None
+    chain_head: Optional[str] = None
     ledger_stage: Optional[str] = None
     outbox_status: Optional[str] = None
 
@@ -2611,14 +3041,14 @@ class DiagnoseOut(_CompatViewModel):
     compat_warnings: List[str] = Field(default_factory=list)
     deprecated_fields_present: List[str] = Field(default_factory=list)
 
-    @field_validator("verdict", "pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", "receipt_required", "receipt_issued", "ledger_required", "ledger_committed", "attestation_required", "attestation_issued", mode="before")
+    @field_validator("verdict", "allowed", "pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", "receipt_required", "receipt_issued", "ledger_required", "ledger_committed", "attestation_required", "attestation_issued", mode="before")
     @classmethod
     def _v_boolish(cls, v: Any):
         if v is None:
             return None
         return _coerce_bool(v)
 
-    @field_validator("decision", "action", mode="before")
+    @field_validator("decision", "action", "required_action", "enforcement_mode", mode="before")
     @classmethod
     def _v_decisionish(cls, v: Any) -> str:
         s = _safe_label(v, default="")
@@ -2638,7 +3068,7 @@ class DiagnoseOut(_CompatViewModel):
         x = _finite_float(v, default=default)
         return float(x if x is not None else default)
 
-    @field_validator("step", "bundle_version", mode="before")
+    @field_validator("step", "bundle_version", "delivery_attempts", mode="before")
     @classmethod
     def _v_step(cls, v: Any) -> Optional[int]:
         x = _finite_int(v, default=None)
@@ -2657,9 +3087,12 @@ class DiagnoseOut(_CompatViewModel):
         "policy_ref",
         "policyset_ref",
         "state_domain_id",
+        "adapter_registry_fp",
+        "selected_source",
         "decision_id",
         "route_plan_id",
         "event_id",
+        "request_id",
         "activation_id",
         "patch_id",
         "change_ticket_id",
@@ -2669,6 +3102,11 @@ class DiagnoseOut(_CompatViewModel):
         "attestation_ref",
         "controller_mode",
         "statistical_guarantee_scope",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
+        "outbox_dedupe_key",
+        "chain_id",
         mode="before",
     )
     @classmethod
@@ -2684,7 +3122,7 @@ class DiagnoseOut(_CompatViewModel):
             return None
         return _normalize_digest_token(v, kind="cfg_fp")
 
-    @field_validator("policy_digest", "body_digest", "event_digest", mode="before")
+    @field_validator("policy_digest", "body_digest", "payload_digest", "event_digest", "chain_head", mode="before")
     @classmethod
     def _v_digestish(cls, v: Any) -> Optional[str]:
         if v is None:
@@ -2714,7 +3152,7 @@ class DiagnoseOut(_CompatViewModel):
             return None
         return _safe_label(v, default="") or None
 
-    @field_validator("components", "security", mode="before")
+    @field_validator("components", "security", "receipt_public", mode="before")
     @classmethod
     def _v_maps(cls, v: Any) -> Dict[str, Any]:
         return _safe_json_mapping(v)
@@ -2722,7 +3160,18 @@ class DiagnoseOut(_CompatViewModel):
     @field_validator("receipt_body", mode="before")
     @classmethod
     def _v_receipt_body(cls, v: Any) -> Optional[str]:
-        return _coerce_canonical_json_string(v, max_bytes=_MAX_BODY_BYTES)
+        return _coerce_receipt_body_string(v, max_bytes=_MAX_BODY_BYTES)
+
+    @field_validator("receipt_verification", mode="before")
+    @classmethod
+    def _v_receipt_verification(cls, v: Any) -> Optional[Dict[str, Any]]:
+        if v is None:
+            return None
+        if not isinstance(v, Mapping):
+            return None
+        # Do not run generic JSON sanitization here; receipt verification body
+        # is byte-level verification material and ReceiptView will enforce size.
+        return dict(v)
 
     @field_validator("receipt_sig", mode="before")
     @classmethod
@@ -2759,8 +3208,123 @@ class DiagnoseOut(_CompatViewModel):
             return {"head": v}
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def _absorb_service_http_response(cls, data: Any) -> Any:
+        if type(data) is not dict:
+            return data
+
+        d = dict(data)
+
+        pub = d.get("receipt_public")
+        ver = d.get("receipt_verification")
+        pub_map = dict(pub) if isinstance(pub, Mapping) else {}
+        ver_map = dict(ver) if isinstance(ver, Mapping) else {}
+
+        cur_receipt = d.get("receipt")
+        if isinstance(cur_receipt, Mapping):
+            rec: Dict[str, Any] = dict(cur_receipt)
+        elif isinstance(cur_receipt, str) and cur_receipt:
+            rec = {"head": cur_receipt}
+        else:
+            rec = {}
+
+        if pub_map or ver_map:
+            for k, v in pub_map.items():
+                if v is not None:
+                    rec.setdefault(k, v)
+            for k, v in ver_map.items():
+                if v is not None:
+                    rec[k] = v
+
+            for k in (
+                "request_id",
+                "event_id",
+                "decision_id",
+                "route_plan_id",
+                "policy_ref",
+                "policyset_ref",
+                "audit_ref",
+                "receipt_ref",
+                "state_domain_id",
+                "adapter_registry_fp",
+                "build_id",
+                "image_digest",
+                "pq_required",
+                "pq_ok",
+                "ledger_stage",
+                "outbox_status",
+            ):
+                if rec.get(k) is None and d.get(k) is not None:
+                    rec[k] = d.get(k)
+
+            if rec.get("cfg_fp") is None:
+                rec["cfg_fp"] = d.get("config_fingerprint") or d.get("cfg_fp")
+            d["receipt"] = rec
+
+        art = d.get("artifacts")
+        art_map = dict(art) if isinstance(art, Mapping) else {}
+        for k in (
+            "audit_ref",
+            "receipt_ref",
+            "ledger_ref",
+            "attestation_ref",
+            "prepare_ref",
+            "commit_ref",
+            "outbox_ref",
+            "outbox_status",
+            "outbox_dedupe_key",
+            "delivery_attempts",
+            "ledger_stage",
+            "body_digest",
+            "payload_digest",
+            "event_digest",
+            "chain_id",
+            "chain_head",
+        ):
+            if art_map.get(k) is None and d.get(k) is not None:
+                art_map[k] = d.get(k)
+        if art_map:
+            d["artifacts"] = art_map
+
+        ev = d.get("evidence_identity")
+        ev_map = dict(ev) if isinstance(ev, Mapping) else {}
+        for k in (
+            "request_id",
+            "event_id",
+            "decision_id",
+            "route_plan_id",
+            "policy_ref",
+            "policyset_ref",
+            "state_domain_id",
+            "adapter_registry_fp",
+            "selected_source",
+            "controller_mode",
+            "statistical_guarantee_scope",
+            "audit_ref",
+            "receipt_ref",
+            "ledger_ref",
+            "attestation_ref",
+            "prepare_ref",
+            "commit_ref",
+            "outbox_ref",
+            "outbox_status",
+            "ledger_stage",
+        ):
+            if ev_map.get(k) is None and d.get(k) is not None:
+                ev_map[k] = d.get(k)
+        if ev_map.get("config_fingerprint") is None:
+            ev_map["config_fingerprint"] = d.get("config_fingerprint") or d.get("cfg_fp")
+        if ev_map.get("bundle_version") is None and d.get("bundle_version") is not None:
+            ev_map["bundle_version"] = d.get("bundle_version")
+        if ev_map:
+            d["evidence_identity"] = ev_map
+
+        return d
+
     def _build_evidence_identity(self) -> EvidenceIdentityView:
         return EvidenceIdentityView(
+            request_id=self.request_id,
             event_id=self.event_id,
             event_id_kind="event",
             decision_id=self.decision_id,
@@ -2773,27 +3337,47 @@ class DiagnoseOut(_CompatViewModel):
             policy_ref=self.policy_ref,
             policyset_ref=self.policyset_ref,
             state_domain_id=self.state_domain_id,
+            adapter_registry_fp=self.adapter_registry_fp,
+            selected_source=self.selected_source,
+            controller_mode=self.controller_mode,
+            statistical_guarantee_scope=self.statistical_guarantee_scope,
             activation_id=self.activation_id,
             patch_id=self.patch_id,
             change_ticket_id=self.change_ticket_id,
             audit_ref=self.audit_ref,
             receipt_ref=self.receipt_ref,
+            ledger_ref=self.ledger_ref,
+            attestation_ref=self.attestation_ref,
+            prepare_ref=self.prepare_ref,
+            commit_ref=self.commit_ref,
+            outbox_ref=self.outbox_ref,
+            outbox_status=self.outbox_status,
+            ledger_stage=self.ledger_stage,
         )
 
     def _build_artifacts(self) -> ArtifactRefsView:
+        cur = self.artifacts
         produced_by = ["schemas", "route", "e_state", "receipt"]
         prov = "sha256:" + _tagged_digest(produced_by, ctx="tcd:schemas:produced_by")
         return ArtifactRefsView(
-            audit_ref=self.audit_ref,
-            receipt_ref=self.receipt_ref,
-            ledger_ref=self.ledger_ref,
-            attestation_ref=self.attestation_ref,
-            event_digest=self.event_digest,
-            body_digest=self.body_digest,
-            ledger_stage=self.ledger_stage,
-            outbox_status=self.outbox_status,
-            produced_by=produced_by,
-            provenance_path_digest=prov,
+            audit_ref=self.audit_ref or (cur.audit_ref if cur else None),
+            receipt_ref=self.receipt_ref or (cur.receipt_ref if cur else None),
+            ledger_ref=self.ledger_ref or (cur.ledger_ref if cur else None),
+            attestation_ref=self.attestation_ref or (cur.attestation_ref if cur else None),
+            prepare_ref=self.prepare_ref or (cur.prepare_ref if cur else None),
+            commit_ref=self.commit_ref or (cur.commit_ref if cur else None),
+            outbox_ref=self.outbox_ref or (cur.outbox_ref if cur else None),
+            outbox_status=self.outbox_status or (cur.outbox_status if cur else None),
+            outbox_dedupe_key=self.outbox_dedupe_key or (cur.outbox_dedupe_key if cur else None),
+            delivery_attempts=self.delivery_attempts if self.delivery_attempts is not None else (cur.delivery_attempts if cur else None),
+            ledger_stage=self.ledger_stage or (cur.ledger_stage if cur else None),
+            body_digest=self.body_digest or (cur.body_digest if cur else None),
+            payload_digest=self.payload_digest or (cur.payload_digest if cur else None),
+            event_digest=self.event_digest or (cur.event_digest if cur else None),
+            chain_id=self.chain_id or (cur.chain_id if cur else None),
+            chain_head=self.chain_head or (cur.chain_head if cur else None),
+            produced_by=(cur.produced_by if cur and cur.produced_by else produced_by),
+            provenance_path_digest=(cur.provenance_path_digest if cur and cur.provenance_path_digest else prov),
         )
 
     @model_validator(mode="after")
@@ -2840,6 +3424,29 @@ class DiagnoseOut(_CompatViewModel):
         route = self.route
         e_state = self.e_state
         security = self.security or {}
+
+        if self.artifacts is not None:
+            for _attr in (
+                "audit_ref",
+                "receipt_ref",
+                "ledger_ref",
+                "attestation_ref",
+                "prepare_ref",
+                "commit_ref",
+                "outbox_ref",
+                "outbox_status",
+                "outbox_dedupe_key",
+                "delivery_attempts",
+                "ledger_stage",
+                "body_digest",
+                "payload_digest",
+                "event_digest",
+                "chain_id",
+                "chain_head",
+            ):
+                _val = getattr(self.artifacts, _attr, None)
+                if getattr(self, _attr, None) is None and _val is not None:
+                    setattr(self, _attr, _val)
 
         self.policy_ref = _coalesce_identity(
             self.policy_ref,
@@ -3002,12 +3609,14 @@ class DiagnoseOut(_CompatViewModel):
         if self.pq_signature_ok is None:
             self.pq_signature_ok = self.pq_ok
 
-        # Decision/verdict/action invariants
-        if self.verdict is True and self.action in {"block", "degraded_block"}:
+        # Decision/verdict/action invariants.
+        # verdict=True means non-allow terminal decision; block/degrade are consistent.
+        # verdict=False means allow/none/advisory are consistent.
+        if self.verdict is True and self.action in {"allow", "none", "degraded_allow"}:
             errs.append("verdict_action_conflict")
-        if self.verdict is False and self.action in {"allow", "advisory", "degraded_allow"}:
+        if self.verdict is False and self.action in {"block", "degrade", "degraded_block"}:
             errs.append("verdict_action_conflict")
-        if self.route_contract is not None and self.route_contract.required_action == "block" and self.action == "allow":
+        if self.route_contract is not None and self.route_contract.required_action == "block" and self.action in {"allow", "none"}:
             errs.append("route_contract_action_conflict")
         if self.route_contract is not None and not self.route_contract.integrity_ok:
             errs.extend(self.route_contract.integrity_errors)
@@ -3039,6 +3648,15 @@ class DiagnoseOut(_CompatViewModel):
             "verdict": self.verdict,
             "decision": self.decision,
             "action": self.action,
+            "allowed": self.allowed,
+            "required_action": self.required_action,
+            "enforcement_mode": self.enforcement_mode,
+            "request_id": self.request_id,
+            "event_id": self.event_id,
+            "decision_id": self.decision_id,
+            "route_plan_id": self.route_plan_id,
+            "audit_ref": self.audit_ref,
+            "receipt_ref": self.receipt_ref,
             "cause": self.cause,
             "score": self.score,
             "threshold": self.threshold,
@@ -3053,12 +3671,18 @@ class DiagnoseOut(_CompatViewModel):
             "threat_confidence": self.threat_confidence,
             "pq_signature_required": self.pq_signature_required,
             "pq_signature_ok": self.pq_signature_ok,
+            "request_id": self.request_id,
+            "event_id": self.event_id,
+            "decision_id": self.decision_id,
+            "route_plan_id": self.route_plan_id,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
             "config_fingerprint": self.config_fingerprint,
             "bundle_version": self.bundle_version,
             "controller_mode": self.controller_mode,
             "statistical_guarantee_scope": self.statistical_guarantee_scope,
+            "adapter_registry_fp": self.adapter_registry_fp,
+            "selected_source": self.selected_source,
             "route_contract": self.route_contract.model_dump(exclude_none=True) if self.route_contract else None,
             "evidence_identity": self.evidence_identity.model_dump(exclude_none=True) if self.evidence_identity else None,
             "artifacts": self.artifacts.model_dump(exclude_none=True) if self.artifacts else None,
@@ -3079,6 +3703,13 @@ class DiagnoseOut(_CompatViewModel):
             "verdict": self.verdict,
             "decision": self.decision,
             "action": self.action,
+            "allowed": self.allowed,
+            "required_action": self.required_action,
+            "enforcement_mode": self.enforcement_mode,
+            "request_id": self.request_id,
+            "event_id": self.event_id,
+            "decision_id": self.decision_id,
+            "route_plan_id": self.route_plan_id,
             "cause": self.cause,
             "score": self.score,
             "threshold": self.threshold,

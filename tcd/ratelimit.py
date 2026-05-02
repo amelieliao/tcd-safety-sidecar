@@ -805,7 +805,7 @@ class RateLimiter:
         return tuple(out)
 
     def peek_decision(self, key: Any, cost: float = 1.0, zone: Optional[str] = None) -> RateDecision:
-        return self._consume_decision_impl(key=key, cost=cost, zone=zone, consume=False, now=None)
+        return self._peek_decision_impl(key=key, cost=cost, zone=zone)
 
     def refund(self, key: Any, cost: float = 1.0, zone: Optional[str] = None) -> bool:
         bundle = self._bundle
@@ -837,6 +837,8 @@ class RateLimiter:
     def reset_key(self, key: Any, zone: Optional[str] = None) -> bool:
         bundle = self._bundle
         zone_res = self._resolve_zone(bundle, zone)
+        if zone_res.resolution_state == "denied":
+            return False
         key_id = self._key_id(bundle, key)
         if key_id is None:
             return False
@@ -1551,6 +1553,172 @@ class RateLimiter:
             algorithm_id=d.algorithm_id,
             state_scope=d.state_scope,
         )
+
+
+    def _finalize_decision(self, d: RateDecision, *, bundle: _CompiledBundle) -> RateDecision:
+        with self._lock:
+            self._decision_seq += 1
+            return self._with_seq(d, seq=self._decision_seq, bundle_version=bundle.version)
+
+    def _peek_decision_impl(self, *, key: Any, cost: float, zone: Optional[str]) -> RateDecision:
+        bundle = self._bundle
+        now_mono_ns = self._mono_ns()
+        now_unix_ns = self._wall_ns()
+        cost_q = self._cost_to_q(bundle, cost)
+
+        if bundle.errors:
+            if bundle.on_config_error == "raise":
+                raise RuntimeError("rate limiter config invalid")
+            if bundle.on_config_error == "fail_closed":
+                d = self._make_decision(
+                    bundle=bundle,
+                    allowed=False,
+                    resolved_zone=bundle.default_zone,
+                    reason="config_error",
+                    remaining_tokens_q=0,
+                    blocked_until_mono_ns=None,
+                    retry_after_s=None,
+                    cost_q=cost_q,
+                    key_id=None,
+                    zone_resolution="config_error",
+                    requested_zone_hash=self._requested_zone_hash(bundle, zone),
+                    now_mono_ns=now_mono_ns,
+                    now_unix_ns=now_unix_ns,
+                )
+                return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+        zone_res = self._resolve_zone(bundle, zone)
+        if zone_res.resolution_state == "denied":
+            d = self._make_decision(
+                bundle=bundle,
+                allowed=False,
+                resolved_zone=zone_res.resolved_zone,
+                reason=zone_res.reason,
+                remaining_tokens_q=0,
+                blocked_until_mono_ns=None,
+                retry_after_s=None,
+                cost_q=cost_q,
+                key_id=None,
+                zone_resolution=zone_res.resolution_state,
+                requested_zone_hash=zone_res.requested_zone_hash,
+                now_mono_ns=now_mono_ns,
+                now_unix_ns=now_unix_ns,
+            )
+            return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+        zone_name = zone_res.resolved_zone
+        zone_cfg = zone_res.zone_cfg
+        key_id = self._key_id(bundle, key)
+        if key_id is None:
+            allowed = bundle.key_error_mode == "allow"
+            d = self._make_decision(
+                bundle=bundle,
+                allowed=allowed,
+                resolved_zone=zone_name,
+                reason="key_error_allow" if allowed else "key_error_deny",
+                remaining_tokens_q=0,
+                blocked_until_mono_ns=None,
+                retry_after_s=None,
+                cost_q=cost_q,
+                key_id=None,
+                zone_resolution=zone_res.resolution_state,
+                requested_zone_hash=zone_res.requested_zone_hash,
+                now_mono_ns=now_mono_ns,
+                now_unix_ns=now_unix_ns,
+            )
+            return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+        with self._lock:
+            blocked_until_ns = self._get_block_until((zone_name, key_id))
+            if blocked_until_ns is not None and blocked_until_ns > now_mono_ns:
+                d = self._make_decision(
+                    bundle=bundle,
+                    allowed=False,
+                    resolved_zone=zone_name,
+                    reason="temp_block",
+                    remaining_tokens_q=0,
+                    blocked_until_mono_ns=blocked_until_ns,
+                    retry_after_s=max(0.0, (blocked_until_ns - now_mono_ns) / 1_000_000_000.0),
+                    cost_q=cost_q,
+                    key_id=key_id,
+                    zone_resolution=zone_res.resolution_state,
+                    requested_zone_hash=zone_res.requested_zone_hash,
+                    now_mono_ns=now_mono_ns,
+                    now_unix_ns=now_unix_ns,
+                )
+                return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+            zs = self._zones.get(zone_name)
+            st = zs.buckets.get(key_id) if zs is not None else None
+            if st is None:
+                tokens_q = zone_cfg.capacity_q
+            else:
+                elapsed_ns = max(0, now_mono_ns - st.ts_ns)
+                tokens_q = st.tokens_q
+                if zone_cfg.refill_q_per_s > 0 and zone_cfg.capacity_q > 0:
+                    add_q = (elapsed_ns * zone_cfg.refill_q_per_s) // 1_000_000_000
+                    tokens_q = min(zone_cfg.capacity_q, tokens_q + max(0, add_q))
+                else:
+                    tokens_q = min(max(0, tokens_q), zone_cfg.capacity_q)
+
+        if cost_q > zone_cfg.capacity_q:
+            d = self._make_decision(
+                bundle=bundle,
+                allowed=False,
+                resolved_zone=zone_name,
+                reason="cost_over_capacity",
+                remaining_tokens_q=max(0, tokens_q),
+                blocked_until_mono_ns=None,
+                retry_after_s=None,
+                cost_q=cost_q,
+                key_id=key_id,
+                zone_resolution=zone_res.resolution_state,
+                requested_zone_hash=zone_res.requested_zone_hash,
+                now_mono_ns=now_mono_ns,
+                now_unix_ns=now_unix_ns,
+            )
+            return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+        if tokens_q >= cost_q:
+            d = self._make_decision(
+                bundle=bundle,
+                allowed=True,
+                resolved_zone=zone_name,
+                reason="ok",
+                remaining_tokens_q=max(0, tokens_q),
+                blocked_until_mono_ns=None,
+                retry_after_s=None,
+                cost_q=cost_q,
+                key_id=key_id,
+                zone_resolution=zone_res.resolution_state,
+                requested_zone_hash=zone_res.requested_zone_hash,
+                now_mono_ns=now_mono_ns,
+                now_unix_ns=now_unix_ns,
+            )
+            return self._with_seq(d, seq=0, bundle_version=bundle.version)
+
+        retry_after_s = None
+        if zone_cfg.refill_q_per_s > 0:
+            deficit_q = max(0, cost_q - tokens_q)
+            retry_ns = (deficit_q * 1_000_000_000 + zone_cfg.refill_q_per_s - 1) // zone_cfg.refill_q_per_s
+            retry_after_s = retry_ns / 1_000_000_000.0
+
+        d = self._make_decision(
+            bundle=bundle,
+            allowed=False,
+            resolved_zone=zone_name,
+            reason="exhausted",
+            remaining_tokens_q=max(0, tokens_q),
+            blocked_until_mono_ns=None,
+            retry_after_s=retry_after_s,
+            cost_q=cost_q,
+            key_id=key_id,
+            zone_resolution=zone_res.resolution_state,
+            requested_zone_hash=zone_res.requested_zone_hash,
+            now_mono_ns=now_mono_ns,
+            now_unix_ns=now_unix_ns,
+        )
+        return self._with_seq(d, seq=0, bundle_version=bundle.version)
 
     def _make_decision(
         self,

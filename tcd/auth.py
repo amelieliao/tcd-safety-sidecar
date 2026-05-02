@@ -454,11 +454,13 @@ async def _read_body_limited(
         if cl:
             try:
                 n = int(cl.strip())
-                if n > lim:
-                    raise ValueError(R_BODY_TOO_LARGE)
-            except ValueError:
+            except Exception:
                 # invalid content-length -> fail closed (prevents weird proxy behavior)
                 raise ValueError(R_BODY_READ_ERROR)
+            if n < 0:
+                raise ValueError(R_BODY_READ_ERROR)
+            if n > lim:
+                raise ValueError(R_BODY_TOO_LARGE)
 
     total = 0
     chunks: List[bytes] = []
@@ -1100,13 +1102,14 @@ class _JWKSCache:
                 if host.lower() not in ah:
                     raise ValueError("JWKS URL host not in allowlist")
             # Basic SSRF guard: if host is an IP literal, forbid private/loopback by default
+            ip_lit = None
             try:
-                ip = ipaddress.ip_address(host)
-                if ip.is_private or ip.is_loopback or ip.is_link_local:
-                    raise ValueError("JWKS URL must not use private/loopback IP literal")
+                ip_lit = ipaddress.ip_address(host)
             except ValueError:
-                # not an IP literal or other parse issue: allow (DNS-level SSRF should be handled by allowlist/policy).
-                pass
+                # not an IP literal; DNS-level SSRF should be handled by allowlist/policy.
+                ip_lit = None
+            if ip_lit is not None and (ip_lit.is_private or ip_lit.is_loopback or ip_lit.is_link_local):
+                raise ValueError("JWKS URL must not use private/loopback IP literal")
 
         if raw_url and not _HAS_URL and fetcher is None:
             raise ValueError("JWKS URL configured but urllib not available and no fetcher provided")
@@ -1358,11 +1361,20 @@ class _JWKSCache:
                     await asyncio.sleep(0.01)
                     with self._lock:
                         got = self._kid_map.get(kid_s)
-                        if got is not None and float(self._now()) < self._stale_at:
+                        now2 = float(self._now())
+                        if got is not None and ((not self._url) or now2 < self._exp_at or self._stale_allowed_locked(now2)):
                             return got
 
         with self._lock:
-            return self._kid_map.get(kid_s)
+            got = self._kid_map.get(kid_s)
+            now3 = float(self._now())
+            if got is None:
+                return None
+            if not self._url:
+                return got
+            if now3 < self._exp_at or self._stale_allowed_locked(now3):
+                return got
+            return None
 
     async def aget_single_jwk_if_unambiguous(self) -> Optional[Tuple[str, dict]]:
         with self._lock:
@@ -1680,10 +1692,13 @@ class Authenticator:
             p.strip() for p in (mtls_spiffe_prefixes or []) if isinstance(p, str) and p.strip()
         })
 
-        # JWKS cache (constructed always, used in jwt mode)
+        # JWKS cache is used only in jwt mode. Ignore irrelevant JWKS env/config
+        # for bearer/hmac/mtls/disabled so unused JWT config cannot disable auth.
+        jwks_url_effective = jwks_url if self.mode == "jwt" else None
+        jwks_json_effective = jwks_json if self.mode == "jwt" else None
         self._jwks = _JWKSCache(
-            url=jwks_url,
-            inline_json=jwks_json,
+            url=jwks_url_effective,
+            inline_json=jwks_json_effective,
             ttl_s=jwks_cache_ttl_s,
             timeout_s=jwks_timeout_s,
             max_jwks_bytes=jwks_max_bytes,
@@ -1821,7 +1836,44 @@ class Authenticator:
             "mtls_max_spiffe_chars": self.mtls_max_spiffe_chars,
         }
 
-        return canonical_kv_hash(payload, ctx="tcd:auth_policy", label="auth_policy")
+        # Auth policy digest v2:
+        # This policy payload naturally contains auth/header/key/body/nonce/JWKS field names.
+        # Do not route it through canonical_kv_hash, whose guard may reject such keys as
+        # content/secret-bearing names. Use a local, strict, deterministic JSON+SHA256
+        # encoder for this auth-policy-only fingerprint.
+        def _policy_jsonable(obj: Any) -> Any:
+            if obj is None or isinstance(obj, (bool, int, str)):
+                return obj
+            if isinstance(obj, float):
+                return f"{obj:.12g}" if math.isfinite(obj) else "nonfinite"
+            if isinstance(obj, bytes):
+                return {"bytes_sha256": hashlib.sha256(obj).hexdigest(), "len": len(obj)}
+            if isinstance(obj, Mapping):
+                out: Dict[str, Any] = {}
+                for kk in sorted(obj.keys(), key=lambda x: str(x)):
+                    ktxt = _safe_text(kk, max_len=160)
+                    if not ktxt:
+                        ktxt = "empty_key"
+                    out[ktxt] = _policy_jsonable(obj[kk])
+                return out
+            if isinstance(obj, (list, tuple)):
+                return [_policy_jsonable(x) for x in obj]
+            if isinstance(obj, (set, frozenset)):
+                xs = [_policy_jsonable(x) for x in obj]
+                return sorted(xs, key=lambda x: json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+            return _safe_text(type(obj).__name__, max_len=64)
+
+        raw = json.dumps(
+            _policy_jsonable(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8", errors="strict")
+        h = hashlib.sha256()
+        h.update(b"tcd:auth_policy\x00auth_policy\x00v2\x00")
+        h.update(raw)
+        return h.hexdigest()
 
     @property
     def policy_digest_hex(self) -> str:
@@ -2225,15 +2277,8 @@ class Authenticator:
             self._ms.fail(R_NONCE_REQUIRED)
             return AuthResult(False, None, R_NONCE_REQUIRED)
 
-        if nonce:
-            # replay check via store
-            key = f"hmac:{kid}:{ts}:{nonce}"
-            fresh = self._replay.check_and_store(key, ttl_s=self.nonce_ttl_s)
-            if not fresh:
-                self._ms.replay()
-                self._ms.fail(R_REPLAY)
-                self._emit_event("replay", {"kind": "hmac_nonce", "kid": kid})
-                return AuthResult(False, None, R_REPLAY)
+        # Replay store is intentionally updated only after signature verification.
+        # Otherwise a bad signature can poison a valid nonce.
 
         # Read body with hard limit, no unsafe fallback
         try:
@@ -2296,6 +2341,15 @@ class Authenticator:
         if not ok_any:
             self._ms.fail(R_SIG_MISMATCH)
             return AuthResult(False, None, R_SIG_MISMATCH)
+
+        if nonce:
+            key = f"hmac:{kid}:{ts}:{nonce}"
+            fresh = self._replay.check_and_store(key, ttl_s=self.nonce_ttl_s)
+            if not fresh:
+                self._ms.replay()
+                self._ms.fail(R_REPLAY)
+                self._emit_event("replay", {"kind": "hmac_nonce", "kid": kid})
+                return AuthResult(False, None, R_REPLAY)
 
         ctx = AuthContext(
             mode="hmac",
@@ -2475,12 +2529,10 @@ class Authenticator:
             aud = claims.get("aud")
             ok_aud = False
             if isinstance(aud, list):
-                if len(aud) > self.jwt_max_aud_items:
-                    ok_aud = False
-                else:
-                    ok_aud = any(str(x) in self.jwt_aud_allow for x in aud)
-            elif aud is not None:
-                ok_aud = (str(aud) in self.jwt_aud_allow)
+                if len(aud) <= self.jwt_max_aud_items and all(isinstance(x, str) for x in aud):
+                    ok_aud = any(x in self.jwt_aud_allow for x in aud)
+            elif isinstance(aud, str):
+                ok_aud = aud in self.jwt_aud_allow
             if not ok_aud:
                 self._ms.jwt_claim_fail(CF_AUD)
                 self._ms.fail(R_BAD_AUD)
@@ -3263,7 +3315,22 @@ class AuthMiddleware:
         except Exception:
             pass
 
-        await self.app(scope, receive, send)
+        downstream_receive = receive
+        cached_body = getattr(request, "_body", None)
+        if isinstance(cached_body, (bytes, bytearray)):
+            body_bytes = bytes(cached_body)
+            sent_cached_body = False
+
+            async def _replay_cached_receive():
+                nonlocal sent_cached_body
+                if not sent_cached_body:
+                    sent_cached_body = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            downstream_receive = _replay_cached_receive
+
+        await self.app(scope, downstream_receive, send)
 
     async def _send_json(self, send, status: int, obj: dict) -> None:
         body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

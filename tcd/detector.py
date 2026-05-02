@@ -21,7 +21,8 @@ L6/L7 hardening guarantees
     - decision_id: derived from (engine_version, config_hash, state_digest, evidence_hash, decision, error_code)
 
 Environment knobs (safe-parsed, bounded)
-- TCD_DETECTOR_TIME_BUDGET_MS            default: 3.0  clamp [0.5, 50.0]
+- TCD_DETECTOR_TIME_BUDGET_MS            default: 250.0 clamp [1.0, TCD_DETECTOR_TIME_BUDGET_MAX_MS]
+- TCD_DETECTOR_TIME_BUDGET_MAX_MS        default: 5000.0 clamp [50.0, 60000.0]
 - TCD_DETECTOR_MAX_TOKENS                default: 2048 clamp [64, 8192]
 - TCD_DETECTOR_MAX_BYTES                 default: 100_000 clamp [1024, 2_000_000]
 
@@ -87,19 +88,19 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Set, 
 logger = logging.getLogger("tcd.detector")
 
 __all__ = [
-    # Schemas / configs
     "DetectRequest",
     "DetectOut",
     "DetectorConfig",
     "CalibratorConfig",
     "IsotonicKnots",
     "ConformalBuffer",
-    # Interfaces
+    "EvidencePolicy",
+    "HardBlockPolicy",
+    "HeadScore",
     "ScoreModel",
     "Detector",
     "build_default_detector",
     "HeuristicKeywordModel",
-    # Legacy shims
     "TCDConfig",
     "TraceCollapseDetector",
 ]
@@ -216,7 +217,32 @@ def _clamp01(x: float) -> float:
 _THRESH_LOW_DEFAULT = _env_float("TCD_DETECTOR_THRESH_LOW", 0.20, min_v=0.0, max_v=1.0)
 _THRESH_HIGH_DEFAULT = _env_float("TCD_DETECTOR_THRESH_HIGH", 0.80, min_v=0.0, max_v=1.0)
 
-_TIME_BUDGET_MS_DEFAULT = _env_float("TCD_DETECTOR_TIME_BUDGET_MS", 3.0, min_v=0.5, max_v=50.0)
+_TIME_BUDGET_MAX_MS = _env_float("TCD_DETECTOR_TIME_BUDGET_MAX_MS", 5000.0, min_v=50.0, max_v=60000.0)
+_TIME_BUDGET_MS_DEFAULT = _env_float(
+    "TCD_DETECTOR_TIME_BUDGET_MS",
+    250.0,
+    min_v=1.0,
+    max_v=_TIME_BUDGET_MAX_MS,
+)
+_TIME_BUDGET_CLOCK_DEFAULT = str(os.getenv("TCD_DETECTOR_BUDGET_CLOCK", "hybrid")).strip().lower()
+if _TIME_BUDGET_CLOCK_DEFAULT in {"cpu", "thread"}:
+    _TIME_BUDGET_CLOCK_DEFAULT = "thread_cpu"
+if _TIME_BUDGET_CLOCK_DEFAULT not in {"hybrid", "thread_cpu", "wall"}:
+    _TIME_BUDGET_CLOCK_DEFAULT = "hybrid"
+
+_TIME_BUDGET_WALL_FACTOR_DEFAULT = _env_float(
+    "TCD_DETECTOR_WALL_BUDGET_FACTOR",
+    20.0,
+    min_v=1.0,
+    max_v=200.0,
+)
+_TIME_BUDGET_WALL_MAX_MS_DEFAULT = _env_float(
+    "TCD_DETECTOR_WALL_BUDGET_MAX_MS",
+    10000.0,
+    min_v=50.0,
+    max_v=60000.0,
+)
+
 _MAX_TOKENS_DEFAULT = _env_int("TCD_DETECTOR_MAX_TOKENS", 2048, min_v=64, max_v=8192)
 _MAX_BYTES_DEFAULT = _env_int("TCD_DETECTOR_MAX_BYTES", 100_000, min_v=1024, max_v=2_000_000)
 
@@ -250,6 +276,65 @@ _ALLOW_RAW_TENANT_DEFAULT = _env_bool("TCD_DETECTOR_ALLOW_RAW_TENANT", False)
 
 _MAX_EVIDENCE_KEYS_DEFAULT = _env_int("TCD_DETECTOR_MAX_EVIDENCE_KEYS", 64, min_v=16, max_v=256)
 _MAX_EVIDENCE_STRING_DEFAULT = _env_int("TCD_DETECTOR_MAX_EVIDENCE_STRING", 512, min_v=128, max_v=2048)
+
+# ---------------------------------------------------------------------------
+# Multi-head / hard-block defaults
+# ---------------------------------------------------------------------------
+
+_HEAD_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,47}$")
+_THREAT_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,31}$")
+
+_HARD_BLOCK_RISK_DEFAULT = _env_float("TCD_DETECTOR_HARD_BLOCK_RISK", 0.93, min_v=0.0, max_v=1.0)
+_HARD_BLOCK_MIN_COVERAGE_DEFAULT = _env_float("TCD_DETECTOR_HARD_BLOCK_MIN_COVERAGE", 0.60, min_v=0.0, max_v=1.0)
+_HARD_BLOCK_MIN_CONFIDENCE_DEFAULT = _env_float("TCD_DETECTOR_HARD_BLOCK_MIN_CONFIDENCE", 0.55, min_v=0.0, max_v=1.0)
+_LOW_COVERAGE_FLOOR_DEFAULT = _env_float("TCD_DETECTOR_LOW_COVERAGE_FLOOR", 0.35, min_v=0.0, max_v=1.0)
+_LOW_COVERAGE_BLOCK_RISK_DEFAULT = _env_float("TCD_DETECTOR_LOW_COVERAGE_BLOCK_RISK", 0.70, min_v=0.0, max_v=1.0)
+
+
+def _load_head_weights_from_env() -> Tuple[Tuple[str, float], ...]:
+    raw = os.getenv("TCD_DETECTOR_HEAD_WEIGHTS_JSON")
+    if not raw:
+        return tuple()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            items = obj.items()
+        elif isinstance(obj, list):
+            items = obj
+        else:
+            return tuple()
+
+        out: List[Tuple[str, float]] = []
+        for item in items:
+            if isinstance(item, (tuple, list)):
+                if len(item) != 2:
+                    continue
+                k, v = item
+            else:
+                k, v = item  # type: ignore[misc]
+
+            name = str(k).strip().lower()
+            name = re.sub(r"[^a-z0-9_:-]+", "_", name).strip("_")
+            if not name or not _HEAD_NAME_RE.fullmatch(name):
+                continue
+
+            try:
+                wf = float(v)
+            except Exception:
+                continue
+            if not math.isfinite(wf) or wf <= 0.0:
+                continue
+
+            out.append((name, max(0.05, min(10.0, wf))))
+
+        out.sort(key=lambda x: x[0])
+        return tuple(out)
+    except Exception:
+        return tuple()
+
+
+_HEAD_WEIGHTS_DEFAULT = _load_head_weights_from_env()
+
 
 # PII hash key + id
 _PII_HMAC_KEY_HEX = os.getenv("TCD_DETECTOR_PII_HMAC_KEY_HEX")
@@ -300,17 +385,106 @@ def _validate_risk_thresholds(low: float, high: float) -> Tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 class _TimeBudget:
-    __slots__ = ("deadline",)
+    """
+    Detector-local timing budget.
+
+    Why this is hybrid:
+    - wall-clock budget is too strict under FastAPI/threadpool/GIL scheduling
+      and can create false fail-closed blocks during concurrency tests.
+    - thread CPU time is a better proxy for actual detector work.
+    - hybrid mode still keeps a generous wall hard-cap so genuinely stuck calls
+      cannot run forever.
+
+    Env:
+      TCD_DETECTOR_BUDGET_CLOCK=hybrid|thread_cpu|wall
+      TCD_DETECTOR_WALL_BUDGET_FACTOR=20
+      TCD_DETECTOR_WALL_BUDGET_MAX_MS=10000
+    """
+
+    __slots__ = ("_clock", "_cpu_deadline", "_wall_deadline", "_wall_hard_deadline", "_budget_s")
 
     def __init__(self, ms: float):
-        self.deadline = time.perf_counter() + max(0.0005, float(ms) / 1000.0)
+        try:
+            budget_s = float(ms) / 1000.0
+        except Exception:
+            budget_s = float(_TIME_BUDGET_MS_DEFAULT) / 1000.0
+        if not math.isfinite(budget_s):
+            budget_s = float(_TIME_BUDGET_MS_DEFAULT) / 1000.0
+        budget_s = max(0.001, budget_s)
+
+        clock = _TIME_BUDGET_CLOCK_DEFAULT
+        cpu_now = self._thread_cpu_now()
+        wall_now = time.perf_counter()
+
+        if clock == "thread_cpu" and cpu_now is None:
+            clock = "wall"
+        if clock == "hybrid" and cpu_now is None:
+            clock = "wall"
+
+        wall_factor = max(1.0, float(_TIME_BUDGET_WALL_FACTOR_DEFAULT))
+        wall_hard_s = min(
+            max(budget_s, float(_TIME_BUDGET_WALL_MAX_MS_DEFAULT) / 1000.0),
+            max(budget_s, budget_s * wall_factor),
+        )
+
+        self._clock = clock
+        self._budget_s = budget_s
+        self._cpu_deadline = (cpu_now + budget_s) if cpu_now is not None else None
+
+        if clock == "wall":
+            self._wall_deadline = wall_now + budget_s
+            self._wall_hard_deadline = wall_now + budget_s
+        else:
+            # CPU/hybrid mode: wall cap is only a hard stuck-call guard.
+            self._wall_deadline = wall_now + wall_hard_s
+            self._wall_hard_deadline = wall_now + wall_hard_s
+
+    @staticmethod
+    def _thread_cpu_now() -> Optional[float]:
+        fn = getattr(time, "thread_time", None)
+        if not callable(fn):
+            return None
+        try:
+            x = float(fn())
+        except Exception:
+            return None
+        return x if math.isfinite(x) else None
 
     def check(self, *, where: str = "") -> None:
-        if time.perf_counter() > self.deadline:
-            raise TimeoutError(f"detector time budget exceeded{': ' + where if where else ''}")
+        where_s = f": {where}" if where else ""
+
+        if self._clock == "wall":
+            if time.perf_counter() > self._wall_deadline:
+                raise TimeoutError(f"detector wall time budget exceeded{where_s}")
+            return
+
+        cpu_now = self._thread_cpu_now()
+        if cpu_now is None or self._cpu_deadline is None:
+            if time.perf_counter() > self._wall_hard_deadline:
+                raise TimeoutError(f"detector wall hard budget exceeded{where_s}")
+            return
+
+        if cpu_now > self._cpu_deadline:
+            raise TimeoutError(f"detector thread CPU budget exceeded{where_s}")
+
+        if self._clock == "hybrid" and time.perf_counter() > self._wall_hard_deadline:
+            raise TimeoutError(f"detector wall hard budget exceeded{where_s}")
 
     def remaining_ms(self) -> float:
-        return max(0.0, (self.deadline - time.perf_counter()) * 1000.0)
+        vals = []
+
+        if self._clock == "wall":
+            vals.append(self._wall_deadline - time.perf_counter())
+        else:
+            cpu_now = self._thread_cpu_now()
+            if cpu_now is not None and self._cpu_deadline is not None:
+                vals.append(self._cpu_deadline - cpu_now)
+            vals.append(self._wall_hard_deadline - time.perf_counter())
+
+        if not vals:
+            return 0.0
+        return max(0.0, min(vals) * 1000.0)
+
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +718,25 @@ class EvidencePolicy:
         )
 
 
+
+@dataclass(frozen=True, slots=True)
+class HardBlockPolicy:
+    hard_block_risk: float
+    min_coverage: float
+    min_confidence: float
+    low_coverage_floor: float
+    low_coverage_block_risk: float
+
+    def normalized(self) -> "HardBlockPolicy":
+        return HardBlockPolicy(
+            hard_block_risk=_clamp01(float(self.hard_block_risk)),
+            min_coverage=_clamp01(float(self.min_coverage)),
+            min_confidence=_clamp01(float(self.min_confidence)),
+            low_coverage_floor=_clamp01(float(self.low_coverage_floor)),
+            low_coverage_block_risk=_clamp01(float(self.low_coverage_block_risk)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tokenization / truncation (budget-aware)
 # ---------------------------------------------------------------------------
@@ -718,7 +911,7 @@ def _deep_sanitize(
             if len(selected) >= policy.max_keys_per_dict and scanned >= policy.max_keys_per_dict:
                 # we already have enough keys and have scanned at least max_keys_per_dict,
                 # allow early exit for predictable CPU.
-                pass
+                break
 
         # Deterministic ordering: by sanitized key
         out: Dict[str, Any] = {}
@@ -870,7 +1063,7 @@ def _sanitize_evidence(evidence: Dict[str, Any], *, policy: EvidencePolicy, budg
             out.pop("pq_scheme", None)
 
     # Clamp known numeric fields
-    for fld in ("score_raw", "p_value", "risk", "e_value", "a_alloc", "score"):
+    for fld in ("score_raw", "p_value", "risk", "risk_score", "coverage", "confidence", "e_value", "a_alloc", "score"):
         if fld not in out:
             continue
         try:
@@ -881,7 +1074,7 @@ def _sanitize_evidence(evidence: Dict[str, Any], *, policy: EvidencePolicy, budg
         if not math.isfinite(vf):
             out.pop(fld, None)
             continue
-        if fld == "p_value":
+        if fld in ("p_value", "risk", "risk_score", "coverage", "confidence", "score_raw", "score"):
             out[fld] = _clamp01(vf)
         elif fld == "a_alloc":
             out[fld] = max(0.0, min(1.0, vf))
@@ -890,11 +1083,9 @@ def _sanitize_evidence(evidence: Dict[str, Any], *, policy: EvidencePolicy, budg
                 out.pop(fld, None)
             else:
                 out[fld] = max(0.0, vf)
-        else:
-            out[fld] = _clamp01(vf)
 
     # Boolean normalization
-    for fld in ("override_applied", "pq_required", "pq_ok"):
+    for fld in ("override_applied", "pq_required", "pq_ok", "trigger", "hard_block", "av_trigger"):
         if fld in out:
             out[fld] = bool(out[fld])
 
@@ -1029,8 +1220,20 @@ class Features:
     keywords_hit: int
 
 
+@dataclass(frozen=True, slots=True)
+class HeadScore:
+    name: str
+    raw_score: float
+    weight: float
+    keyword_hits: int
+    phrase_hits: int
+    hard_match: bool
+    tags: Tuple[str, ...]
+    available: bool = True
+
+
 class ScoreModel(Protocol):
-    """Pluggable scoring model: higher score â higher risk."""
+    """Pluggable scoring model: higher score -> higher risk."""
     name: str
     version: str
 
@@ -1038,39 +1241,157 @@ class ScoreModel(Protocol):
         ...
 
 
+def _safe_head_name(v: Any, default: str = "primary") -> str:
+    s = _safe_text(v, max_len=48).lower()
+    s = re.sub(r"[^a-z0-9_:-]+", "_", s).strip("_")
+    if not s or not _HEAD_NAME_RE.fullmatch(s):
+        return default
+    return s
+
+
+def _safe_threat_tag(v: Any) -> str:
+    s = _safe_text(v, max_len=32).lower()
+    s = re.sub(r"[^a-z0-9_:-]+", "_", s).strip("_")
+    if not s or not _THREAT_TAG_RE.fullmatch(s):
+        return ""
+    return s
+
+
+def _risk_label_from_risk(risk: float, *, hard_block: bool = False) -> str:
+    r = _clamp01(float(risk))
+    if hard_block or r >= 0.95:
+        return "critical"
+    if r >= 0.80:
+        return "high"
+    if r >= 0.45:
+        return "elevated"
+    if r >= 0.15:
+        return "normal"
+    return "low"
+
+
+def _av_label_from_state(*, decision: str, risk_label: str, hard_block: bool) -> str:
+    if hard_block:
+        return "critical"
+    if decision == "block":
+        return "high" if risk_label in {"high", "critical"} else "strict"
+    if decision == "throttle":
+        return "elevated"
+    return "normal"
+
+
+def _public_head_summaries(heads: List[HeadScore], *, max_items: int = 8) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    ordered = sorted(
+        heads,
+        key=lambda h: (float(h.raw_score) * float(h.weight), float(h.raw_score), str(h.name)),
+        reverse=True,
+    )
+    for h in ordered[:max_items]:
+        out.append(
+            {
+                "name": _safe_head_name(h.name),
+                "raw_score": _clamp01(float(h.raw_score)),
+                "weight": max(0.05, min(10.0, float(h.weight))),
+                "keyword_hits": max(0, int(h.keyword_hits)),
+                "phrase_hits": max(0, int(h.phrase_hits)),
+                "hard_match": bool(h.hard_match),
+                "available": bool(h.available),
+                "tags": [t for t in (_safe_threat_tag(x) for x in h.tags) if t],
+            }
+        )
+    return out
+
+
 class HeuristicKeywordModel:
     """
-    Deterministic heuristic baseline model (CPU-bounded, budget-aware).
-    """
-    name = "heuristic-keywords"
-    version = "0.4.0"
+    Multi-head deterministic heuristic baseline.
 
-    _KW = tuple(
-        kw.lower()
-        for kw in (
-            "weapon",
-            "bomb",
-            "suicide",
-            "kill",
-            "credit card",
-            "ssn",
-            "exploit",
-            "harm",
-            "hate",
-            "nsfw",
-            "jailbreak",
-            "prompt injection",
-        )
+    Backward compatibility:
+      - score(...) still returns (raw_score, evidence)
+      - score_heads(...) is optional richer interface consumed by Detector.detect()
+    """
+
+    name = "heuristic-keywords"
+    version = "0.7.0"
+
+    _HEADS: Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], float], ...] = (
+        (
+            "violence_self_harm",
+            ("weapon", "bomb", "suicide", "kill", "harm"),
+            ("self harm", "kill yourself", "make a bomb", "violent attack"),
+            ("kill yourself", "make a bomb", "suicide instructions"),
+            ("violence", "self_harm"),
+            1.05,
+        ),
+        (
+            "secrets_pii",
+            ("ssn", "passport", "password", "passwd", "token", "secret", "apikey", "iban", "swift", "cvv"),
+            ("credit card", "private key", "api key", "bank account", "social security", "routing number"),
+            ("private key", "credit card", "social security", "routing number", "cvv"),
+            ("secrets", "pii", "financial_data"),
+            1.20,
+        ),
+        (
+            "prompt_injection",
+            ("jailbreak", "override", "reveal", "system", "developer", "ignore"),
+            ("ignore previous instructions", "reveal system prompt", "developer mode", "prompt injection", "system prompt"),
+            ("ignore previous instructions", "reveal system prompt", "prompt injection"),
+            ("policy_bypass", "prompt_injection"),
+            1.10,
+        ),
+        (
+            "cyber_abuse",
+            ("exploit", "payload", "ransomware", "malware", "phishing", "ddos", "botnet", "shellcode", "c2", "credential"),
+            ("sql injection", "remote code execution", "credential stuffing", "buffer overflow"),
+            ("credential stuffing", "remote code execution", "sql injection", "shellcode"),
+            ("cyber", "fraud"),
+            1.15,
+        ),
+        (
+            "fraud_compliance",
+            ("fraud", "spoof", "launder", "smurfing", "evade", "bypass"),
+            ("money laundering", "sanctions evasion", "identity theft", "bypass controls"),
+            ("money laundering", "sanctions evasion", "identity theft"),
+            ("fraud", "compliance"),
+            1.10,
+        ),
+        (
+            "hate_abuse_nsfw",
+            ("hate", "slur", "harass", "nsfw", "porn"),
+            ("hate speech", "sexual content"),
+            ("hate speech",),
+            ("abuse", "nsfw"),
+            0.90,
+        ),
     )
 
-    def score(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[float, Dict[str, Any]]:
+    def __init__(self, *, head_weights: Optional[Mapping[str, float]] = None):
+        merged: Dict[str, float] = {name: float(weight) for name, *_rest, weight in self._HEADS}
+        if isinstance(head_weights, Mapping):
+            for k, v in head_weights.items():
+                name = _safe_head_name(k, default="")
+                if not name or name not in merged:
+                    continue
+                try:
+                    wf = float(v)
+                except Exception:
+                    continue
+                if not math.isfinite(wf) or wf <= 0.0:
+                    continue
+                merged[name] = max(0.05, min(10.0, wf))
+        self._weights = tuple(sorted(merged.items(), key=lambda x: x[0]))
+        self._weights_by_name = {k: v for k, v in self._weights}
+
+    def head_names(self) -> Tuple[str, ...]:
+        return tuple(name for name, *_rest in self._HEADS) + ("policy_keywords",)
+
+    def score_heads(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[List[HeadScore], Dict[str, Any]]:
         budget.check(where="model:enter")
 
         s = text or ""
         low = s.lower()
 
-        # Build a token set for faster membership checks on single-word keywords.
-        # Bound work: stop after 10k tokens.
         toks: Set[str] = set()
         if s:
             for i, m in enumerate(_TOK_RE.finditer(low)):
@@ -1081,42 +1402,17 @@ class HeuristicKeywordModel:
                     budget.check(where="model:tokenize")
         budget.check(where="model:tokenize_done")
 
-        hits = 0
-        kws: List[str] = list(self._KW)
-
-        # Meta-provided extra keywords are bounded by meta sanitizer upstream.
-        if meta and isinstance(meta.get("extra_keywords"), list):
-            kws = kws + [str(x).lower() for x in meta["extra_keywords"][:64]]
-
-        # Keyword hit count: token membership for single tokens; substring match for phrases.
-        for i, kw in enumerate(kws[:128]):
-            if not kw:
-                continue
-            if " " in kw:
-                if kw in low:
-                    hits += 1
-            else:
-                if kw in toks:
-                    hits += 1
-            if (i & 0x1F) == 0x1F:
-                budget.check(where="model:keywords")
-
-        # Lightweight structural features with O(n) scans (budget-aware).
         n_chars = len(s)
         n_bytes = len(s.encode("utf-8", "ignore"))
-        # Approx token count (bounded)
         n_tokens = min(10_000, _count_tokens_budgeted(s, stop_at=10_000, budget=budget, where="model:count_tokens"))
-
         has_url = ("http://" in low) or ("https://" in low) or ("www." in low)
 
         upper = 0
         digit = 0
-        # Bound loop by char cap already applied upstream; still budget-check.
         for j, ch in enumerate(s):
             o = ord(ch)
             if 65 <= o <= 90:
                 upper += 1
-            # digits
             if 48 <= o <= 57:
                 digit += 1
             if (j & 0x3FF) == 0x3FF:
@@ -1131,24 +1427,173 @@ class HeuristicKeywordModel:
             has_url=bool(has_url),
             upper_ratio=float(upper_ratio),
             digit_ratio=float(digit_ratio),
-            keywords_hit=int(hits),
+            keywords_hit=0,
         )
 
-        # Bounded scoring
-        base = hits + (0.6 if has_url else 0.0) + 0.4 * upper_ratio + 0.3 * digit_ratio
-        base = base / (3.0 + 0.25 * math.log1p(max(1, n_tokens)))
-        raw = 1.0 / (1.0 + math.exp(-3.0 * (base - 0.5)))
-        raw = _clamp01(float(raw))
+        coverage = _clamp01(
+            0.0
+            if n_tokens <= 0
+            else (0.20 + 0.80 * min(1.0, math.log1p(max(1, n_tokens)) / math.log1p(32.0)))
+        )
+
+        heads: List[HeadScore] = []
+        total_hits = 0
+
+        for idx, (name, keywords, phrases, hard_terms, tags, default_weight) in enumerate(self._HEADS):
+            if (idx & 0x07) == 0x07:
+                budget.check(where="model:heads")
+
+            keyword_hits = 0
+            for kw in keywords:
+                if kw in toks:
+                    keyword_hits += 1
+
+            phrase_hits = 0
+            for ph in phrases:
+                if ph in low:
+                    phrase_hits += 1
+
+            hard_match = False
+            for ht in hard_terms:
+                if ht in low:
+                    hard_match = True
+                    break
+
+            total_hits += keyword_hits + phrase_hits
+
+            effective = (
+                0.80 * min(4, keyword_hits)
+                + 1.35 * min(3, phrase_hits)
+                + (2.50 if hard_match else 0.0)
+            )
+            if name in {"cyber_abuse", "prompt_injection"} and has_url:
+                effective += 0.35
+            if name == "secrets_pii" and digit_ratio >= 0.12:
+                effective += 0.25
+
+            base = effective / (2.0 + 0.15 * math.log1p(max(1, n_tokens)))
+            raw = 1.0 / (1.0 + math.exp(-3.40 * (base - 0.85)))
+
+            heads.append(
+                HeadScore(
+                    name=name,
+                    raw_score=_clamp01(float(raw)),
+                    weight=float(self._weights_by_name.get(name, default_weight)),
+                    keyword_hits=int(keyword_hits),
+                    phrase_hits=int(phrase_hits),
+                    hard_match=bool(hard_match),
+                    tags=tuple(tags),
+                    available=True,
+                )
+            )
+
+        extra_hits = 0
+        if meta and isinstance(meta.get("extra_keywords"), list):
+            for i, kw in enumerate(meta["extra_keywords"][:64]):
+                if (i & 0x1F) == 0x1F:
+                    budget.check(where="model:extra_keywords")
+                s_kw = _safe_text(kw, max_len=64).lower()
+                if not s_kw:
+                    continue
+                if " " in s_kw:
+                    if s_kw in low:
+                        extra_hits += 1
+                else:
+                    if s_kw in toks:
+                        extra_hits += 1
+
+        if extra_hits > 0:
+            effective = 0.90 * min(6, extra_hits)
+            base = effective / (2.0 + 0.15 * math.log1p(max(1, n_tokens)))
+            raw = 1.0 / (1.0 + math.exp(-3.10 * (base - 0.75)))
+            heads.append(
+                HeadScore(
+                    name="policy_keywords",
+                    raw_score=_clamp01(float(raw)),
+                    weight=float(self._weights_by_name.get("policy_keywords", 0.75)),
+                    keyword_hits=int(extra_hits),
+                    phrase_hits=0,
+                    hard_match=False,
+                    tags=("policy",),
+                    available=True,
+                )
+            )
+
+        if heads:
+            total_w = sum(max(0.05, float(h.weight)) for h in heads)
+            survival = 1.0
+            for h in heads:
+                survival *= (1.0 - (_clamp01(h.raw_score) * (max(0.05, float(h.weight)) / total_w)))
+            raw = _clamp01(1.0 - survival)
+
+            ordered = sorted(
+                heads,
+                key=lambda h: (float(h.raw_score) * float(h.weight), float(h.raw_score), str(h.name)),
+                reverse=True,
+            )
+            top = ordered[0].raw_score
+            second = ordered[1].raw_score if len(ordered) > 1 else 0.0
+            margin = max(0.0, top - second)
+
+            disagreement = 0.0
+            for h in heads:
+                disagreement += abs(float(h.raw_score) - float(raw)) * (max(0.05, float(h.weight)) / total_w)
+
+            confidence = _clamp01(
+                0.10
+                + 0.55 * coverage
+                + 0.20 * margin
+                + 0.15 * (1.0 - min(1.0, disagreement / 0.60))
+            )
+            if any(h.hard_match for h in heads):
+                confidence = max(confidence, 0.85)
+        else:
+            raw = 0.0
+            ordered = []
+            confidence = 0.0
+
+        feats = Features(
+            len_bytes=int(n_bytes),
+            len_tokens=int(n_tokens),
+            has_url=bool(has_url),
+            upper_ratio=float(upper_ratio),
+            digit_ratio=float(digit_ratio),
+            keywords_hit=int(total_hits + extra_hits),
+        )
+
+        threat_tags: List[str] = []
+        for h in ordered:
+            if h.raw_score >= 0.45 or h.hard_match:
+                for tag in h.tags:
+                    safe_tag = _safe_threat_tag(tag)
+                    if safe_tag and safe_tag not in threat_tags:
+                        threat_tags.append(safe_tag)
+            if len(threat_tags) >= 6:
+                break
 
         evidence = {
             "features": dataclasses.asdict(feats),
-            "hits": int(hits),
-            # DO NOT expose caller-provided keywords; keep only a stable sample of built-in vocab.
-            "kw_sample": list(self._KW[:8]),
+            "score_raw": float(raw),
+            "coverage": float(coverage),
+            "confidence": float(confidence),
+            "dominant_head": (ordered[0].name if ordered else None),
+            "threat_tags": list(threat_tags),
+            "head_count": int(len(heads)),
+            "head_available": int(sum(1 for h in heads if h.available)),
+            "custom_keyword_count": int(extra_hits),
+            "heads": _public_head_summaries(heads),
         }
-        budget.check(where="model:exit")
-        return raw, evidence
 
+        budget.check(where="model:exit")
+        return heads, evidence
+
+    def score(self, text: str, meta: Optional[Dict[str, Any]], *, budget: _TimeBudget) -> Tuple[float, Dict[str, Any]]:
+        _heads, evidence = self.score_heads(text, meta, budget=budget)
+        try:
+            raw = float(evidence.get("score_raw", 0.0))
+        except Exception:
+            raw = 0.0
+        return _clamp01(raw), evidence
 
 # ---------------------------------------------------------------------------
 # Calibration
@@ -1455,7 +1900,6 @@ if _PYDANTIC_OK:
         model_id: str = Field(default="*", max_length=128)
         lang: str = Field(default="*", max_length=16)
         kind: str = Field(default="completion", max_length=16)
-        # Hard cap in chars; bytes are enforced by DetectorConfig.max_bytes during detect().
         text: str = Field(..., min_length=0, max_length=_HARD_MAX_TEXT_CHARS)
         meta: Optional[Dict[str, Any]] = Field(default=None)
 
@@ -1492,12 +1936,25 @@ if _PYDANTIC_OK:
         p_value: float
         risk: float
 
+        risk_score: float = 0.0
+        risk_label: str = "unknown"
+        coverage: float = 0.0
+        confidence: float = 0.0
+        trigger: bool = False
+        hard_block: bool = False
+        hard_block_reasons: List[str] = Field(default_factory=list)
+        threat_tags: List[str] = Field(default_factory=list)
+        av_label: Optional[str] = None
+        av_trigger: Optional[bool] = None
+        controller_mode: Optional[str] = "normal"
+        guarantee_scope: Optional[str] = "heuristic_only"
+
         latency_ms: float
         budget_left_ms: float
 
-        thresholds: Dict[str, float]  # risk thresholds
-        calibrator: Dict[str, Any]    # static
-        calibrator_state: Dict[str, Any]  # dynamic (bounded)
+        thresholds: Dict[str, float]
+        calibrator: Dict[str, Any]
+        calibrator_state: Dict[str, Any]
         model: Dict[str, str]
 
         engine_version: str
@@ -1510,6 +1967,7 @@ if _PYDANTIC_OK:
         evidence: Dict[str, Any]
 
 else:
+
     @dataclass(frozen=True, slots=True)
     class DetectRequest:
         tenant: str = "*"
@@ -1521,6 +1979,7 @@ else:
         text: str = ""
         meta: Optional[Dict[str, Any]] = None
 
+
     @dataclass(frozen=True, slots=True)
     class DetectOut:
         ok: bool
@@ -1529,23 +1988,39 @@ else:
         decision_legacy: Optional[str]
         reason_code: str
         error_code: str
+
         score_raw: float
         p_value: float
         risk: float
-        latency_ms: float
-        budget_left_ms: float
-        thresholds: Dict[str, float]
-        calibrator: Dict[str, Any]
-        calibrator_state: Dict[str, Any]
-        model: Dict[str, str]
-        engine_version: str
-        config_hash: str
-        policy_digest: str
-        state_digest: str
-        decision_id: str
-        evidence_hash: str
-        evidence: Dict[str, Any]
 
+        risk_score: float = 0.0
+        risk_label: str = "unknown"
+        coverage: float = 0.0
+        confidence: float = 0.0
+        trigger: bool = False
+        hard_block: bool = False
+        hard_block_reasons: List[str] = field(default_factory=list)
+        threat_tags: List[str] = field(default_factory=list)
+        av_label: Optional[str] = None
+        av_trigger: Optional[bool] = None
+        controller_mode: Optional[str] = "normal"
+        guarantee_scope: Optional[str] = "heuristic_only"
+
+        latency_ms: float = 0.0
+        budget_left_ms: float = 0.0
+
+        thresholds: Dict[str, float] = field(default_factory=dict)
+        calibrator: Dict[str, Any] = field(default_factory=dict)
+        calibrator_state: Dict[str, Any] = field(default_factory=dict)
+        model: Dict[str, str] = field(default_factory=dict)
+
+        engine_version: str = _DETECTOR_ENGINE_VERSION
+        config_hash: str = ""
+        policy_digest: str = ""
+        state_digest: str = ""
+        decision_id: str = ""
+        evidence_hash: str = ""
+        evidence: Dict[str, Any] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # DetectorConfig
@@ -1578,6 +2053,18 @@ class DetectorConfig:
     conformal_min_p_update: float = _CONFORMAL_MIN_P_UPDATE_DEFAULT
     conformal_allowed_sources: Tuple[str, ...] = tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT))
 
+    # Hard-block / ensemble governance
+    hard_block: HardBlockPolicy = dataclasses.field(
+        default_factory=lambda: HardBlockPolicy(
+            hard_block_risk=_HARD_BLOCK_RISK_DEFAULT,
+            min_coverage=_HARD_BLOCK_MIN_COVERAGE_DEFAULT,
+            min_confidence=_HARD_BLOCK_MIN_CONFIDENCE_DEFAULT,
+            low_coverage_floor=_LOW_COVERAGE_FLOOR_DEFAULT,
+            low_coverage_block_risk=_LOW_COVERAGE_BLOCK_RISK_DEFAULT,
+        )
+    )
+    head_weights: Tuple[Tuple[str, float], ...] = tuple(_HEAD_WEIGHTS_DEFAULT)
+
     # Evidence policy
     evidence_policy: EvidencePolicy = dataclasses.field(
         default_factory=lambda: EvidencePolicy(
@@ -1598,15 +2085,18 @@ class DetectorConfig:
     # Governance
     engine_version: str = _DETECTOR_ENGINE_VERSION
     name: str = "tcd-detector"
-    version: str = "0.5.0"
+    version: str = "0.7.0"
 
     def normalized(self) -> "DetectorConfig":
         low, high = _validate_risk_thresholds(self.t_low, self.t_high)
 
-        tb = float(self.time_budget_ms)
+        try:
+            tb = float(self.time_budget_ms)
+        except Exception:
+            tb = float(_TIME_BUDGET_MS_DEFAULT)
         if not math.isfinite(tb):
-            tb = 3.0
-        tb = max(0.5, min(50.0, tb))
+            tb = float(_TIME_BUDGET_MS_DEFAULT)
+        tb = max(1.0, min(float(_TIME_BUDGET_MAX_MS), tb))
 
         mt = int(self.max_tokens)
         mt = max(64, min(8192, mt))
@@ -1632,10 +2122,24 @@ class DetectorConfig:
             version=cal.version or "3.0.0",
         )
 
-        # Conformal guards
         ref_max = _clamp01(float(self.conformal_ref_max)) if math.isfinite(float(self.conformal_ref_max)) else _CONFORMAL_REF_MAX_DEFAULT
         min_p = _clamp01(float(self.conformal_min_p_update)) if math.isfinite(float(self.conformal_min_p_update)) else _CONFORMAL_MIN_P_UPDATE_DEFAULT
         sources = tuple(sorted({s for s in self.conformal_allowed_sources if s})) or tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT))
+
+        weights: List[Tuple[str, float]] = []
+        for name, weight in list(self.head_weights or ()):
+            s = str(name).strip().lower()
+            s = re.sub(r"[^a-z0-9_:-]+", "_", s).strip("_")
+            if not s or not _HEAD_NAME_RE.fullmatch(s):
+                continue
+            try:
+                wf = float(weight)
+            except Exception:
+                continue
+            if not math.isfinite(wf) or wf <= 0.0:
+                continue
+            weights.append((s, max(0.05, min(10.0, wf))))
+        weights.sort(key=lambda x: x[0])
 
         return DetectorConfig(
             t_low=low,
@@ -1647,12 +2151,13 @@ class DetectorConfig:
             conformal_ref_max=ref_max,
             conformal_min_p_update=min_p,
             conformal_allowed_sources=sources,
+            hard_block=self.hard_block.normalized(),
+            head_weights=tuple(weights),
             evidence_policy=self.evidence_policy.normalized(),
             engine_version=ev,
             name=self.name or "tcd-detector",
-            version=self.version or "0.5.0",
+            version=self.version or "0.7.0",
         )
-
 
 # ---------------------------------------------------------------------------
 # Metrics (optional)
@@ -1662,13 +2167,13 @@ if _METRICS_ENABLED:  # pragma: no cover
     _DET_LAT = Histogram(
         "tcd_detector_latency_seconds",
         "Detector end-to-end latency",
-        buckets=(0.001, 0.003, 0.005, 0.010, 0.020, 0.050),
+        buckets=(0.001, 0.003, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000, 2.000, 5.000),
     )
     _DET_STAGE_LAT = Histogram(
         "tcd_detector_stage_latency_seconds",
         "Detector stage latency",
         ["stage"],
-        buckets=(0.0002, 0.0005, 0.001, 0.002, 0.005, 0.010, 0.020),
+        buckets=(0.0002, 0.0005, 0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000),
     )
     _DET_DECISIONS = Counter("tcd_detector_decision_total", "Detector decisions", ["decision"])
     _DET_ERRORS = Counter("tcd_detector_error_total", "Detector errors", ["code"])
@@ -1687,9 +2192,7 @@ class Detector:
     """
     End-to-end safety detector:
       DetectRequest -> truncate -> model.score -> p_value -> decision -> evidence
-
     Detector.detect() never throws; it fails closed (decision="block") on error/timeout.
-
     NOTE on decisions:
       - decision is canonical ("allow"|"throttle"|"block").
       - decision_legacy is provided for older integrations ("cool" instead of "throttle").
@@ -1701,36 +2204,7 @@ class Detector:
         self._cfg = cfg.normalized()
         self._cal = _Calibrator(self._cfg.calibrator)
 
-        # Static digests
-        static_payload = {
-            "engine_version": self._cfg.engine_version,
-            "name": self._cfg.name,
-            "version": self._cfg.version,
-            "thresholds_risk": {"risk_low": float(self._cfg.t_low), "risk_high": float(self._cfg.t_high)},
-            "limits": {"time_budget_ms": float(self._cfg.time_budget_ms), "max_tokens": int(self._cfg.max_tokens), "max_bytes": int(self._cfg.max_bytes)},
-            "calibrator": self._cal.static_snapshot(),
-            "conformal_guards": {
-                "ref_max": float(self._cfg.conformal_ref_max),
-                "min_p_update": float(self._cfg.conformal_min_p_update),
-                "allowed_sources": list(self._cfg.conformal_allowed_sources),
-            },
-            "evidence_policy": {
-                "sanitize_evidence": bool(self._cfg.evidence_policy.sanitize_evidence),
-                "strip_pii": bool(self._cfg.evidence_policy.strip_pii),
-                "hash_pii_tags": bool(self._cfg.evidence_policy.hash_pii_tags),
-                "pii_mode": self._cfg.evidence_policy.pii_mode,
-                "allow_raw_tenant": bool(self._cfg.evidence_policy.allow_raw_tenant),
-                "max_evidence_keys": int(self._cfg.evidence_policy.max_evidence_keys),
-                "max_evidence_string": int(self._cfg.evidence_policy.max_evidence_string),
-                "pii_hmac": bool(self._cfg.evidence_policy.pii_hmac_key is not None),
-                "pii_hmac_key_id": self._cfg.evidence_policy.pii_hmac_key_id or None,
-                "evidence_hmac": bool(self._cfg.evidence_policy.evidence_hmac_key is not None),
-                "evidence_hmac_key_id": self._cfg.evidence_policy.evidence_hmac_key_id or None,
-                "forbidden_key_substrings": list(_FORBIDDEN_KEY_SUBSTRINGS),
-            },
-            "model": {"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
-        }
-
+        static_payload = self._build_static_hash_payload()
         self._config_hash = _canonical_hash(static_payload, ctx="tcd:detector", label="detector_cfg")
         self._policy_digest = _canonical_hash(static_payload, ctx="tcd:detector", label="detector_policy")
 
@@ -1756,16 +2230,107 @@ class Detector:
     def policy_digest(self) -> str:
         return self._policy_digest
 
-    def _route(self, *, risk: float) -> Tuple[DetectorDecision, DetectorActionHint, str]:
+    def _build_static_hash_payload(self) -> Dict[str, Any]:
+        ep = self._cfg.evidence_policy
+        hb = self._cfg.hard_block
+        head_names = []
+        try:
+            fn = getattr(self._model, "head_names", None)
+            if callable(fn):
+                head_names = list(fn())
+        except Exception:
+            head_names = []
+
+        return {
+            "engine_version": self._cfg.engine_version,
+            "name": self._cfg.name,
+            "version": self._cfg.version,
+            "thresholds_risk": {
+                "risk_low": float(self._cfg.t_low),
+                "risk_high": float(self._cfg.t_high),
+            },
+            "limits": {
+                "time_budget_ms": float(self._cfg.time_budget_ms),
+                "budget_clock": _TIME_BUDGET_CLOCK_DEFAULT,
+                "wall_budget_factor": float(_TIME_BUDGET_WALL_FACTOR_DEFAULT),
+                "wall_budget_max_ms": float(_TIME_BUDGET_WALL_MAX_MS_DEFAULT),
+                "max_tokens": int(self._cfg.max_tokens),
+                "max_bytes": int(self._cfg.max_bytes),
+            },
+            "calibrator": self._cal.static_snapshot(),
+            "conformal_guards": {
+                "ref_max": float(self._cfg.conformal_ref_max),
+                "min_p_update": float(self._cfg.conformal_min_p_update),
+                "allowed_sources": list(self._cfg.conformal_allowed_sources),
+            },
+            "hard_block_policy": {
+                "hard_block_risk": float(hb.hard_block_risk),
+                "min_coverage": float(hb.min_coverage),
+                "min_confidence": float(hb.min_confidence),
+                "low_coverage_floor": float(hb.low_coverage_floor),
+                "low_coverage_block_risk": float(hb.low_coverage_block_risk),
+            },
+            "multihead": {
+                "head_weights": list(self._cfg.head_weights),
+                "head_names": head_names,
+            },
+            "evidence_policy": {
+                "sanitize_evidence": bool(ep.sanitize_evidence),
+                "strip_pii": bool(ep.strip_pii),
+                "hash_pii_tags": bool(ep.hash_pii_tags),
+                "pii_mode": ep.pii_mode,
+                "tenant_identity_mode": "clear_allowed" if bool(ep.allow_raw_tenant) else "hashed_only",
+                "max_evidence_keys": int(ep.max_evidence_keys),
+                "max_evidence_string": int(ep.max_evidence_string),
+                "pii_hmac": bool(ep.pii_hmac_key is not None),
+                "pii_hmac_key_id": ep.pii_hmac_key_id or None,
+                "evidence_hmac": bool(ep.evidence_hmac_key is not None),
+                "evidence_hmac_key_id": ep.evidence_hmac_key_id or None,
+                "forbidden_key_substrings": list(_FORBIDDEN_KEY_SUBSTRINGS),
+            },
+            "model": {
+                "name": getattr(self._model, "name", "?"),
+                "version": getattr(self._model, "version", "?"),
+            },
+        }
+
+    def _route(
+        self,
+        *,
+        risk: float,
+        hard_block: bool = False,
+        coverage: Optional[float] = None,
+        confidence: Optional[float] = None,
+        hard_block_reasons: Optional[List[str]] = None,
+    ) -> Tuple[DetectorDecision, DetectorActionHint, str]:
         """
-        Route in calibrated risk space.
-        Returns (decision, action_hint, reason_code).
+        Route in calibrated risk space with hard-block / coverage / confidence overlays.
         """
         r = _clamp01(float(risk))
+        cov = _clamp01(float(coverage)) if coverage is not None and math.isfinite(float(coverage)) else 1.0
+        conf = _clamp01(float(confidence)) if confidence is not None and math.isfinite(float(confidence)) else 1.0
+        hb = self._cfg.hard_block
+
+        if hard_block:
+            rc = (hard_block_reasons or ["HARD_BLOCK"])[0]
+            rc = _safe_text(rc, max_len=64).upper().replace("-", "_").replace(" ", "_")
+            return "block", "BLOCK", rc or "HARD_BLOCK"
+
+        if cov < hb.low_coverage_floor and r >= hb.low_coverage_block_risk:
+            return "block", "BLOCK", "LOW_COVERAGE_HIGH_RISK"
+
         if r >= float(self._cfg.t_high):
             return "block", "BLOCK", "RISK_HIGH"
+
+        if conf < hb.min_confidence and r >= max(float(self._cfg.t_low), 0.55):
+            return "throttle", "THROTTLE", "LOW_CONFIDENCE_REVIEW"
+
+        if cov < hb.min_coverage and r >= max(0.20, float(self._cfg.t_low) * 0.50):
+            return "throttle", "THROTTLE", "LOW_COVERAGE_REVIEW"
+
         if r >= float(self._cfg.t_low):
             return "throttle", "THROTTLE", "RISK_MED"
+
         return "allow", "ALLOW", "RISK_LOW"
 
     def detect(self, req: DetectRequest) -> DetectOut:
@@ -1781,7 +2346,16 @@ class Detector:
         ok = True
         error_code: DetectorErrorCode = "OK"
 
-        # Safe request field extraction (never trust req type)
+        coverage = 0.0
+        confidence = 0.0
+        hard_block = False
+        hard_block_reasons: List[str] = []
+        threat_tags: List[str] = []
+        dominant_head: Optional[str] = None
+        heads_public: List[Dict[str, Any]] = []
+        controller_mode = "normal"
+        guarantee_scope = "heuristic_only"
+
         try:
             tenant = _safe_text(getattr(req, "tenant", "*"), max_len=64) or "*"
             user = _safe_text(getattr(req, "user", "*"), max_len=128) or "*"
@@ -1794,13 +2368,11 @@ class Detector:
         except Exception:
             tenant, user, session, model_id, kind, text_in, meta_in = "*", "*", "*", "*", "completion", "", None
 
-        # Ensure hard char cap regardless of schema
         if isinstance(text_in, str) and len(text_in) > _HARD_MAX_TEXT_CHARS:
             text_in = text_in[:_HARD_MAX_TEXT_CHARS]
         elif not isinstance(text_in, str):
-            text_in = _safe_text(text_in, max_len=0)  # non-string => empty
+            text_in = _safe_text(text_in, max_len=0)
 
-        # Stage: truncate
         stage = "truncate"
         try:
             budget.check(where="detect:truncate")
@@ -1836,7 +2408,6 @@ class Detector:
                     pass
             stage_t0 = time.perf_counter()
 
-        # Stage: meta sanitize
         stage = "meta"
         try:
             meta = _sanitize_meta_for_model(meta_in, budget=budget)
@@ -1850,21 +2421,147 @@ class Detector:
                     pass
             stage_t0 = time.perf_counter()
 
-        # Stage: score
         stage = "score"
-        raw = 1.0  # fail-closed default
+        raw = 1.0
         model_evidence: Dict[str, Any] = {"_model_evidence_type": "<none>"}
+
+        def _bounded01(v: Any, default: float) -> float:
+            try:
+                x = float(v)
+            except Exception:
+                return default
+            if not math.isfinite(x):
+                return default
+            return _clamp01(x)
 
         if ok:
             try:
                 budget.check(where="detect:before_score")
-                raw, me = self._model.score(text, meta, budget=budget)
-                model_evidence = _normalize_model_evidence(me, policy=self._cfg.evidence_policy, budget=budget)
+
+                score_heads_fn = getattr(self._model, "score_heads", None)
+
+                if callable(score_heads_fn):
+                    head_scores, me = score_heads_fn(text, meta, budget=budget)  # type: ignore[misc]
+                    safe_heads = [h for h in (head_scores or []) if isinstance(h, HeadScore)]
+
+                    raw = _bounded01(me.get("score_raw", 1.0) if isinstance(me, Mapping) else 1.0, 1.0)
+                    coverage = _bounded01(me.get("coverage", 0.0) if isinstance(me, Mapping) else 0.0, 0.0)
+                    confidence = _bounded01(me.get("confidence", 0.0) if isinstance(me, Mapping) else 0.0, 0.0)
+                    dominant_head = _safe_head_name(
+                        me.get("dominant_head") if isinstance(me, Mapping) else None,
+                        default=(safe_heads[0].name if safe_heads else "primary"),
+                    )
+                    heads_public = _public_head_summaries(safe_heads)
+
+                    if isinstance(me, Mapping) and isinstance(me.get("threat_tags"), list):
+                        for tag in me["threat_tags"][:8]:
+                            t = _safe_threat_tag(tag)
+                            if t and t not in threat_tags:
+                                threat_tags.append(t)
+                    elif safe_heads:
+                        ordered_heads = sorted(
+                            safe_heads,
+                            key=lambda h: (float(h.raw_score) * float(h.weight), float(h.raw_score), str(h.name)),
+                            reverse=True,
+                        )
+                        for h in ordered_heads:
+                            if h.raw_score >= 0.45 or h.hard_match:
+                                for tag in h.tags:
+                                    t = _safe_threat_tag(tag)
+                                    if t and t not in threat_tags:
+                                        threat_tags.append(t)
+                            if len(threat_tags) >= 8:
+                                break
+
+                    hb = self._cfg.hard_block
+                    for h in safe_heads[:32]:
+                        hname = _safe_head_name(h.name, default="head")
+                        hrisk = _clamp01(float(h.raw_score))
+                        if bool(h.hard_match) and hrisk >= min(0.85, hb.hard_block_risk):
+                            rc = f"HEAD_{hname.upper()}_HARD_MATCH"
+                            if rc not in hard_block_reasons:
+                                hard_block_reasons.append(rc)
+                        elif hrisk >= hb.hard_block_risk and coverage >= hb.min_coverage and confidence >= hb.min_confidence:
+                            rc = f"HEAD_{hname.upper()}_HARD"
+                            if rc not in hard_block_reasons:
+                                hard_block_reasons.append(rc)
+
+                    if coverage < hb.low_coverage_floor and raw >= hb.low_coverage_block_risk:
+                        if "LOW_COVERAGE_HIGH_RISK" not in hard_block_reasons:
+                            hard_block_reasons.append("LOW_COVERAGE_HIGH_RISK")
+
+                    hard_block = bool(hard_block_reasons)
+
+                    base_model_ev = dict(me) if isinstance(me, Mapping) else {"_model_evidence_type": f"<{type(me).__name__}>"}
+                    base_model_ev["heads"] = heads_public
+                    base_model_ev["hard_block_candidate"] = bool(hard_block)
+                    base_model_ev["hard_block_reasons"] = list(hard_block_reasons[:8])
+                    base_model_ev["dominant_head"] = dominant_head
+                    model_evidence = _normalize_model_evidence(base_model_ev, policy=self._cfg.evidence_policy, budget=budget)
+
+                else:
+                    raw, me = self._model.score(text, meta, budget=budget)
+                    raw = _bounded01(raw, 1.0)
+
+                    coverage = _clamp01(
+                        0.0
+                        if n_tokens <= 0
+                        else (0.20 + 0.80 * min(1.0, math.log1p(max(1, n_tokens)) / math.log1p(32.0)))
+                    )
+                    confidence = _clamp01(0.10 + 0.55 * coverage + 0.35 * abs(2.0 * raw - 1.0))
+                    dominant_head = "primary"
+
+                    hb = self._cfg.hard_block
+                    if raw >= hb.hard_block_risk and coverage >= hb.min_coverage and confidence >= hb.min_confidence:
+                        hard_block_reasons = ["PRIMARY_HARD"]
+                    elif coverage < hb.low_coverage_floor and raw >= hb.low_coverage_block_risk:
+                        hard_block_reasons = ["LOW_COVERAGE_HIGH_RISK"]
+                    hard_block = bool(hard_block_reasons)
+
+                    if raw >= max(float(self._cfg.t_low), 0.35):
+                        threat_tags = ["safety"]
+
+                    heads_public = [
+                        {
+                            "name": "primary",
+                            "raw_score": float(raw),
+                            "weight": 1.0,
+                            "keyword_hits": 0,
+                            "phrase_hits": 0,
+                            "hard_match": False,
+                            "available": True,
+                            "tags": list(threat_tags),
+                        }
+                    ]
+
+                    model_evidence = _normalize_model_evidence(
+                        {
+                            "score_raw": float(raw),
+                            "coverage": float(coverage),
+                            "confidence": float(confidence),
+                            "dominant_head": dominant_head,
+                            "heads": heads_public,
+                            "threat_tags": list(threat_tags),
+                            "hard_block_candidate": bool(hard_block),
+                            "hard_block_reasons": list(hard_block_reasons[:8]),
+                            "primary_evidence": me if isinstance(me, Mapping) else {"_model_evidence_type": f"<{type(me).__name__}>"},
+                        },
+                        policy=self._cfg.evidence_policy,
+                        budget=budget,
+                    )
+
                 budget.check(where="detect:after_score")
             except TimeoutError:
                 ok = False
                 error_code = "TIME_BUDGET_EXCEEDED"
                 raw = 1.0
+                coverage = 0.0
+                confidence = 0.0
+                hard_block = False
+                hard_block_reasons = []
+                threat_tags = []
+                dominant_head = None
+                heads_public = []
                 model_evidence = {"error": "timeout", "where": "model.score"}
                 if _METRICS_ENABLED:  # pragma: no cover
                     try:
@@ -1875,12 +2572,20 @@ class Detector:
                 ok = False
                 error_code = "MODEL_ERROR"
                 raw = 1.0
+                coverage = 0.0
+                confidence = 0.0
+                hard_block = False
+                hard_block_reasons = []
+                threat_tags = []
+                dominant_head = None
+                heads_public = []
                 model_evidence = {"error": "model_error", "exc_type": type(e).__name__}
                 if _METRICS_ENABLED:  # pragma: no cover
                     try:
                         _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
                     except Exception:
                         pass
+
         if _METRICS_ENABLED:  # pragma: no cover
             try:
                 _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
@@ -1888,7 +2593,6 @@ class Detector:
                 pass
         stage_t0 = time.perf_counter()
 
-        # Clamp raw conservatively
         try:
             raw_f = float(raw)
             if not math.isfinite(raw_f):
@@ -1897,9 +2601,8 @@ class Detector:
         except Exception:
             raw = 1.0
 
-        # Stage: calibrate
         stage = "calibrate"
-        p = 0.0  # fail-closed default (risk=1)
+        p = 0.0
         if ok:
             try:
                 budget.check(where="detect:before_calib")
@@ -1923,6 +2626,7 @@ class Detector:
                         _DET_STAGE_ERROR.labels(stage=stage, code=error_code).inc()
                     except Exception:
                         pass
+
         if _METRICS_ENABLED:  # pragma: no cover
             try:
                 _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
@@ -1932,9 +2636,18 @@ class Detector:
 
         risk = _clamp01(1.0 - p)
 
-        # Stage: route
         stage = "route"
-        decision, action_hint, reason_code = self._route(risk=risk) if ok else ("block", "BLOCK", "FAIL_CLOSED")
+        if ok:
+            decision, action_hint, reason_code = self._route(
+                risk=risk,
+                hard_block=hard_block,
+                coverage=coverage,
+                confidence=confidence,
+                hard_block_reasons=hard_block_reasons,
+            )
+        else:
+            decision, action_hint, reason_code = "block", "BLOCK", "FAIL_CLOSED"
+
         if _METRICS_ENABLED:  # pragma: no cover
             try:
                 _DET_STAGE_LAT.labels(stage=stage).observe(max(0.0, time.perf_counter() - stage_t0))
@@ -1942,17 +2655,26 @@ class Detector:
                 pass
         stage_t0 = time.perf_counter()
 
-        # Stage: evidence
+        def _refresh_derived() -> Tuple[str, bool, str, bool, str]:
+            rl = _risk_label_from_risk(risk, hard_block=hard_block)
+            trg = bool(hard_block or decision != "allow")
+            al = _av_label_from_state(decision=decision, risk_label=rl, hard_block=hard_block)
+            cm = "normal" if ok else "fail_closed"
+            return rl, trg, al, trg, cm
+
+        risk_label, trigger, av_label, av_trigger, controller_mode = _refresh_derived()
+        guarantee_scope = "heuristic_only"
+
         stage = "evidence"
         policy = self._cfg.evidence_policy
         evidence: Dict[str, Any] = {}
         evidence_hash = ""
         state = self._cal.state_snapshot()
         state_digest = str(state.get("state_digest") or "")
+
         try:
             budget.check(where="detect:before_evidence")
 
-            # Stable evidence core (schema-first)
             base_ev: Dict[str, Any] = {
                 "tenant": tenant,
                 "user": user,
@@ -1967,11 +2689,24 @@ class Detector:
                 "score_raw": float(raw),
                 "p_value": float(p),
                 "risk": float(risk),
+                "risk_score": float(risk),
+                "risk_label": risk_label,
+                "coverage": float(coverage),
+                "confidence": float(confidence),
+                "trigger": bool(trigger),
+                "hard_block": bool(hard_block),
+                "hard_block_reasons": list(hard_block_reasons[:8]),
+                "threat_tags": list(threat_tags[:8]),
+                "dominant_head": dominant_head,
                 "decision": decision,
                 "decision_legacy": ("cool" if decision == "throttle" else decision),
                 "action_hint": action_hint,
                 "reason_code": reason_code,
                 "error_code": error_code,
+                "av_label": av_label,
+                "av_trigger": bool(av_trigger),
+                "controller_mode": controller_mode,
+                "guarantee_scope": guarantee_scope,
                 "engine_version": self._cfg.engine_version,
                 "config_hash": self._config_hash,
                 "policy_digest": self._policy_digest,
@@ -1980,10 +2715,9 @@ class Detector:
                 "calibrator_state": state,
                 "model": {"name": getattr(self._model, "name", "?"), "version": getattr(self._model, "version", "?")},
                 "meta_summary": _meta_summary(meta),
+                "model_evidence": model_evidence,
             }
 
-            # Model evidence: include only a bounded sanitized mapping + its hash
-            base_ev["model_evidence"] = model_evidence
             budget.check(where="evidence:model_evidence_hash")
             me_hash = _hash_bytes(
                 json.dumps(_canon_for_hash(model_evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
@@ -1996,7 +2730,6 @@ class Detector:
 
             evidence = _sanitize_evidence(base_ev, policy=policy, budget=budget)
 
-            # Evidence hash domain-separated by config_hash; keyed if configured
             budget.check(where="evidence:evidence_hash")
             evidence_hash = _hash_bytes(
                 json.dumps(_canon_for_hash(evidence), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"),
@@ -2035,7 +2768,8 @@ class Detector:
                 except Exception:
                     pass
 
-        # decision_id (stable for fixed state+evidence)
+        risk_label, trigger, av_label, av_trigger, controller_mode = _refresh_derived()
+
         decision_id = _canonical_hash(
             {
                 "engine_version": self._cfg.engine_version,
@@ -2070,6 +2804,18 @@ class Detector:
             score_raw=float(raw),
             p_value=float(p),
             risk=float(risk),
+            risk_score=float(risk),
+            risk_label=risk_label,
+            coverage=float(coverage),
+            confidence=float(confidence),
+            trigger=bool(trigger),
+            hard_block=bool(hard_block),
+            hard_block_reasons=list(hard_block_reasons[:8]),
+            threat_tags=list(threat_tags[:8]),
+            av_label=av_label,
+            av_trigger=bool(av_trigger),
+            controller_mode=controller_mode,
+            guarantee_scope=guarantee_scope,
             latency_ms=float(dt * 1000.0),
             budget_left_ms=float(budget.remaining_ms()),
             thresholds={"risk_low": float(self._cfg.t_low), "risk_high": float(self._cfg.t_high)},
@@ -2096,13 +2842,11 @@ class Detector:
     ) -> bool:
         """
         Conformal reference update (poisoning-resistant). Returns True if accepted.
-
         Guards:
           - only applies in conformal mode
           - source must be allowlisted unless allow_override=True
           - if decision/p_value provided, requires decision=="allow" and p_value>=min_p_update
           - winsorize ref_score to <= conformal_ref_max
-
         This method never throws.
         """
 
@@ -2122,7 +2866,6 @@ class Detector:
 
             src = _safe_text(source, max_len=32).lower() or "unknown"
             allowed = set(self._cfg.conformal_allowed_sources)
-
             if not allow_override and src not in allowed:
                 _inc("rejected", "SRC")
                 return False
@@ -2147,10 +2890,11 @@ class Detector:
             self._cal.update_reference(s)
             _inc("accepted", "OK")
             return True
+
         except Exception:
             _inc("error", "EXC")
             return False
-            
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -2191,6 +2935,7 @@ def build_default_detector() -> Detector:
         alpha=_CONFORMAL_ALPHA_DEFAULT,
         version="3.0.0",
     )
+
     cfg = DetectorConfig(
         t_low=_THRESH_LOW_DEFAULT,
         t_high=_THRESH_HIGH_DEFAULT,
@@ -2201,6 +2946,14 @@ def build_default_detector() -> Detector:
         conformal_ref_max=_CONFORMAL_REF_MAX_DEFAULT,
         conformal_min_p_update=_CONFORMAL_MIN_P_UPDATE_DEFAULT,
         conformal_allowed_sources=tuple(sorted(_ALLOWED_SOURCES_SET_DEFAULT)),
+        hard_block=HardBlockPolicy(
+            hard_block_risk=_HARD_BLOCK_RISK_DEFAULT,
+            min_coverage=_HARD_BLOCK_MIN_COVERAGE_DEFAULT,
+            min_confidence=_HARD_BLOCK_MIN_CONFIDENCE_DEFAULT,
+            low_coverage_floor=_LOW_COVERAGE_FLOOR_DEFAULT,
+            low_coverage_block_risk=_LOW_COVERAGE_BLOCK_RISK_DEFAULT,
+        ),
+        head_weights=tuple(_HEAD_WEIGHTS_DEFAULT),
         evidence_policy=EvidencePolicy(
             sanitize_evidence=_SANITIZE_EVIDENCE_DEFAULT,
             strip_pii=_STRIP_PII_DEFAULT,
@@ -2216,11 +2969,11 @@ def build_default_detector() -> Detector:
         ),
         engine_version=_DETECTOR_ENGINE_VERSION,
         name="tcd-detector",
-        version="0.5.0",
+        version="0.7.0",
     )
-    model = HeuristicKeywordModel()
-    return Detector(model=model, cfg=cfg)
 
+    model = HeuristicKeywordModel(head_weights=dict(cfg.head_weights))
+    return Detector(model=model, cfg=cfg)
 
 # ---------------------------------------------------------------------------
 # Legacy shim (fail-closed, warn-once)
@@ -2261,4 +3014,5 @@ class TraceCollapseDetector:
         }
 
     def snapshot_state(self):
+
         return {"status": "legacy_shim_fail_closed"}
