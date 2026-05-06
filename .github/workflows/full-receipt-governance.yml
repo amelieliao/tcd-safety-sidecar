@@ -1,0 +1,61 @@
+name: full-receipt-governance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  full-receipt-governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TCD_CI: "1"
+      TCD_TEST_PORT: "8080"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install package and runtime deps
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [ -f pyproject.toml ] || [ -f setup.py ]; then
+            python -m pip install -e ".[dev]" || python -m pip install -e . || true
+          fi
+
+          python - <<'PY' || python -m pip install uvicorn fastapi "pydantic>=2" starlette prometheus-client numpy grpcio protobuf
+          import uvicorn, fastapi, pydantic, starlette, prometheus_client, numpy
+          PY
+
+      - name: Run full receipt governance CI gate
+        shell: bash
+        run: |
+          bash tests/ci/full_receipt_governance_suite.sh
+
+      - name: Upload receipt governance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-receipt-governance-artifacts
+          path: /tmp/tcd_receipt_full_*
+          if-no-files-found: ignore
