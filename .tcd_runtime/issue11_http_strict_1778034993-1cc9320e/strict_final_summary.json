@@ -1,0 +1,21 @@
+{
+  "runtime_after_restart": {
+    "evidence_store_backend": "sqlite",
+    "evidence_store_durable": true,
+    "evidence_store_error": null,
+    "receipt_ref_store_backend": "sqlite",
+    "receipt_ref_store_durable_size": 2
+  },
+  "verify_after_restart": {
+    "build_binding_verified": true,
+    "errors": [],
+    "expected_receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "image_binding_verified": true,
+    "ok": true,
+    "reason": "receipt",
+    "receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "receipt_ref": "3abd8b580d732eb2669bc4a7fbc39c5d61a8a068f2f98a995fed2fc28d58e12c",
+    "service_config_binding_verified": true,
+    "verify_input_source": "receipt_ref_lookup"
+  }
+}

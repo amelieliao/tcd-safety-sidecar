@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -149,6 +150,56 @@ _FORBIDDEN_META_KEY_TOKENS = {
     "private",
     "privatekey",
 }
+
+
+_EVIDENCE_META_KEYS_ALLOWED_WITH_FORBIDDEN_TOKENS = frozenset(
+    {
+        "request_id",
+        "trace_id",
+        "idempotency_key",
+        "event_id",
+        "decision_id",
+        "route_plan_id",
+        "route_id",
+        "audit_ref",
+        "receipt_ref",
+        "ledger_ref",
+        "attestation_ref",
+        "prepare_ref",
+        "commit_ref",
+        "outbox_ref",
+        "outbox_status",
+        "chain_id",
+        "chain_head",
+        "prev_head_hex",
+        "body_digest",
+        "payload_digest",
+        "event_digest",
+        "config_fingerprint",
+        "cfg_fp",
+        "service_config_fingerprint",
+        "route_config_fingerprint",
+        "receipt_cfg_fp",
+        "policy_ref",
+        "policyset_ref",
+        "policy_digest",
+        "security_policy_digest",
+        "route_policy_digest",
+        "detector_policy_digest",
+        "state_domain_id",
+        "adapter_registry_fp",
+        "selected_source",
+        "controller_mode",
+        "decision_mode",
+        "statistical_guarantee_scope",
+        "build_id",
+        "image_digest",
+        "pq_required",
+        "pq_ok",
+        "pq_signature_required",
+        "pq_signature_ok",
+    }
+)
 
 _DEFAULT_SEVERITY_WEIGHTS = MappingProxyType(
     {
@@ -505,7 +556,8 @@ def _json_sanitize(
                 continue
             toks = _key_tokenize(kk)
             if any(tok in _FORBIDDEN_META_KEY_TOKENS for tok in toks):
-                continue
+                if kk.lower() not in _EVIDENCE_META_KEYS_ALLOWED_WITH_FORBIDDEN_TOKENS:
+                    continue
             out[kk] = _json_sanitize(
                 v,
                 budget=budget,
@@ -1815,6 +1867,10 @@ class AlwaysValidRiskController:
         self._telemetry_emit_failures = 0
         self._receipt_emit_failures = 0
 
+        self._idempotency_lock = threading.RLock()
+        self._idempotency_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._idempotency_cache_capacity = 4096
+
     # ------------------------------------------------------------------
     # Public config / diagnostics API
     # ------------------------------------------------------------------
@@ -1978,6 +2034,90 @@ class AlwaysValidRiskController:
                     except Exception:
                         pass
 
+
+    def _idempotency_material(
+        self,
+        *,
+        bundle: _CompiledBundle,
+        identity: StreamIdentityResult,
+        stream_id: Optional[str],
+        p_value: Optional[float],
+        score: Optional[float],
+        score_adapter: Optional[str],
+        weight: float,
+        severity: Optional[str],
+        meta_s: Mapping[str, Any],
+        ctx_s: Mapping[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        raw_key: Optional[str] = None
+        for src in (meta_s, ctx_s):
+            for name in ("idempotency_key", "idem_key", "event_id"):
+                val = src.get(name) if isinstance(src, Mapping) else None
+                if val is not None:
+                    raw_key = _strip_unsafe_text(str(val), max_len=256)
+                    break
+            if raw_key:
+                break
+        if not raw_key:
+            return None, None
+
+        safe_key = _safe_id(raw_key, default=None, max_len=256)
+        if safe_key is None:
+            safe_key = hashlib.sha256(raw_key.encode("utf-8", errors="ignore")).hexdigest()
+
+        body_digest = None
+        for src in (meta_s, ctx_s):
+            val = src.get("body_digest") if isinstance(src, Mapping) else None
+            if val is not None:
+                body_digest = _strip_unsafe_text(str(val), max_len=256)
+                break
+
+        key_payload = {
+            "cfg_fp": bundle.cfg_fp,
+            "state_domain_id": bundle.state_domain_id,
+            "stream_hash": identity.stream_hash,
+            "key": safe_key,
+        }
+        fp_payload = {
+            "key": safe_key,
+            "body_digest": body_digest,
+            "stream_id": stream_id,
+            "p_value": _coerce_float(p_value),
+            "score": _coerce_float(score),
+            "score_adapter": _safe_id(score_adapter, default=None, max_len=64),
+            "weight": _coerce_float(weight),
+            "severity": _safe_label(severity, default="") if severity is not None else None,
+            "cfg_fp": bundle.cfg_fp,
+            "state_domain_id": bundle.state_domain_id,
+            "stream_hash": identity.stream_hash,
+        }
+        key = "avidem:" + hashlib.sha256(_canon_json(key_payload).encode("utf-8", errors="strict")).hexdigest()
+        fp = "avfp:" + hashlib.sha256(_canon_json(fp_payload).encode("utf-8", errors="strict")).hexdigest()
+        return key, fp
+
+    def _idempotency_lookup(self, key: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+        with self._idempotency_lock:
+            rec = self._idempotency_cache.get(key)
+            if rec is None:
+                return None
+            if rec.get("fingerprint") != fingerprint:
+                raise RuntimeError("idempotency_conflict")
+            result = rec.get("result")
+            self._idempotency_cache.move_to_end(key, last=True)
+            return copy.deepcopy(result) if isinstance(result, dict) else None
+
+    def _idempotency_store_result(self, key: str, fingerprint: str, result: Mapping[str, Any]) -> None:
+        with self._idempotency_lock:
+            self._idempotency_cache[key] = {
+                "fingerprint": fingerprint,
+                "result": copy.deepcopy(dict(result)),
+                "stored_at_unix_ns": time.time_ns(),
+            }
+            self._idempotency_cache.move_to_end(key, last=True)
+            while len(self._idempotency_cache) > max(1, int(self._idempotency_cache_capacity)):
+                self._idempotency_cache.popitem(last=False)
+
+
     # ------------------------------------------------------------------
     # Public runtime API
     # ------------------------------------------------------------------
@@ -2009,6 +2149,23 @@ class AlwaysValidRiskController:
             meta=meta_s,
             ctx=ctx_s,
         )
+
+        idem_key, idem_fingerprint = self._idempotency_material(
+            bundle=bundle,
+            identity=identity,
+            stream_id=stream_id,
+            p_value=p_value,
+            score=score,
+            score_adapter=score_adapter,
+            weight=weight,
+            severity=severity,
+            meta_s=meta_s,
+            ctx_s=ctx_s,
+        )
+        if idem_key and idem_fingerprint:
+            cached_result = self._idempotency_lookup(idem_key, idem_fingerprint)
+            if cached_result is not None:
+                return cached_result
 
         # Disabled
         if not bundle.enabled:
@@ -2509,6 +2666,8 @@ class AlwaysValidRiskController:
             receipt_ref=None,
         )
         self._emit_artifacts(bundle=bundle, result=result)
+        if idem_key and idem_fingerprint:
+            self._idempotency_store_result(idem_key, idem_fingerprint, result)
         return result
 
     def step_direct_p(
@@ -3412,7 +3571,7 @@ class AlwaysValidRiskController:
         state.last_calibration_ref = evidence.calibration_ref
         state.last_calibration_cfg_digest = evidence.calibration_cfg_digest
         state.last_calibration_state_digest = evidence.calibration_state_digest
-        state.last_guarantee_scope = evidence.guarantee_scope if evidence.controller_p_kind in {"calibrated", "heuristic"} else "none"
+        state.last_guarantee_scope = evidence.guarantee_scope if evidence.controller_p_kind in {"direct", "calibrated", "heuristic"} else "none"
 
         # Step evidence source counters / last p
         if evidence.current_step_has_direct_p and evidence.strict_p_value is not None:
@@ -3667,6 +3826,7 @@ class AlwaysValidRiskController:
             "controller_process_is_statistical_controller_not_pure_e_process": True,
             "decision_mode": bundle.policy_spec.decision_mode,
             "selected_source": selected_source,
+            "statistical_guarantee_scope": evidence.guarantee_scope if evidence.guarantee_scope != "none" else (state.last_guarantee_scope if state is not None else "none"),
             "p_source_this_step": evidence.controller_p_kind,
             "current_step_has_direct_p": evidence.current_step_has_direct_p,
             "current_step_has_calibrated_p": evidence.current_step_has_calibrated_p,
@@ -3712,6 +3872,9 @@ class AlwaysValidRiskController:
             )
         )
 
+        if guarantee_scope == "none" and evidence.guarantee_scope != "none":
+            guarantee_scope = evidence.guarantee_scope
+
         process = self._build_process_block(
             bundle,
             st,
@@ -3726,6 +3889,9 @@ class AlwaysValidRiskController:
             "policyset_ref": bundle.policy_spec.policyset_ref,
             "cfg_fp": bundle.cfg_fp,
             "bundle_version": bundle.version,
+            "controller_mode": controller_mode,
+            "decision_mode": bundle.policy_spec.decision_mode,
+            "adapter_registry_fp": bundle.adapter_registry_fp,
             "trigger": bool(process["trigger"]),
             "trigger_reason": reason,
             "block_on_trigger": bool(bundle.policy_spec.block_on_trigger),

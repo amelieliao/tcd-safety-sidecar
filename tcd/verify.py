@@ -144,6 +144,7 @@ _VERIFY_STRUCTURAL_KEYS = frozenset(
 
         # safe identifier / digest / binding fields that contain forbidden tokens
         "body_digest",
+        "decision_receipt_body_digest",
         "body_schema",
         "body_kind",
         "body_canonicalized",
@@ -256,6 +257,8 @@ _ALLOWED_RECEIPT_SURFACE_KIND = frozenset(
         "governed_receipt",
         "durable_receipt",
         "storage_ready_receipt",
+        "durable_committed",
+        "local_attestation",
         "unknown",
     }
 )
@@ -400,6 +403,91 @@ def _coerce_float(v: Any) -> Optional[float]:
             return None
         return x if math.isfinite(x) else None
     return None
+
+
+def _warning_text(v: Any, *, max_len: int = 256) -> str:
+    """
+    Stable, readable diagnostic text for warning/error surfaces.
+
+    Do not collapse structured warning payloads to "<dict>"; project them to a
+    compact JSON string or to their most useful diagnostic field.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return _safe_text(v, max_len=max_len)
+    if isinstance(v, (bool, int, float)):
+        return _safe_text(v, max_len=max_len)
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        with contextlib.suppress(Exception):
+            return _warning_text(dataclasses.asdict(v), max_len=max_len)
+    if isinstance(v, Mapping):
+        for key in ("warning", "reason", "reason_code", "error", "code", "detail", "message"):
+            if key in v:
+                txt = _warning_text(v.get(key), max_len=max_len)
+                if txt:
+                    return txt
+        with contextlib.suppress(Exception):
+            return _safe_text(
+                json.dumps(
+                    _stable_jsonable(dict(v)),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                max_len=max_len,
+            )
+        return _safe_text(repr(dict(v)), max_len=max_len)
+    if isinstance(v, (list, tuple, set, frozenset)):
+        parts: List[str] = []
+        for item in list(v)[:8]:
+            txt = _warning_text(item, max_len=max_len)
+            if txt and txt not in parts:
+                parts.append(txt)
+        return _safe_text(";".join(parts), max_len=max_len)
+    return _safe_text(v, max_len=max_len)
+
+
+def _normalize_warning_list(value: Any, *, max_items: int = 128, max_len: int = 256) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        seq = [value]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        seq = list(value)
+    else:
+        seq = [value]
+
+    out: List[str] = []
+    seen = set()
+    for item in seq[:max_items]:
+        txt = _warning_text(item, max_len=max_len)
+        if not txt or txt in seen:
+            continue
+        seen.add(txt)
+        out.append(txt)
+    return out
+
+
+def _receipt_numeric_value(v: Any) -> Any:
+    """
+    Numeric reader for receipt semantic fields.
+
+    Attestor/service HTTP v2 bodies may encode JSON-safe floats as
+    {"_tcd_float": "..."} or carry digest-only references. Treat digest-only as
+    valid proof material and otherwise require a finite non-negative number
+    where the caller asks for numeric semantics.
+    """
+    if isinstance(v, Mapping):
+        if "_tcd_digest_ref" in v:
+            return "digest_only"
+        for key in ("_tcd_float", "value", "val"):
+            if key in v:
+                return _receipt_numeric_value(v.get(key))
+        return None
+    return _coerce_float(v)
+
 def _coerce_int(v: Any) -> Optional[int]:
     if type(v) is int:
         return int(v)
@@ -1163,10 +1251,58 @@ def _extract_receipt_fields(body: Mapping[str, Any]) -> Dict[str, Any]:
         "verify_key_id": _safe_id(g(("verify_key_id",), ("claims", "verify_key_id"), ("auth_sig", "key_id"), ("sig", "key_id"), ("meta", "verify_key_id")), max_len=256),
         "verify_key_fp": _normalize_digest(g(("verify_key_fp",), ("claims", "verify_key_fp"), ("meta", "verify_key_fp")), kind="any"),
         "sig_key_id": _safe_id(g(("sig_key_id",), ("claims", "sig_key_id"), ("auth_sig", "key_id"), ("sig", "key_id")), max_len=256),
-        "pq_required": _coerce_bool(g(("claims", "pq_required"), ("pq_required",), ("meta", "pq_required"))),
-        "pq_ok": _coerce_bool(g(("claims", "pq_ok"), ("pq_ok",), ("meta", "pq_ok"))),
-        "pq_signature_required": _coerce_bool(g(("claims", "pq_signature_required"), ("pq_signature_required",), ("meta", "pq_signature_required"))),
-        "pq_signature_ok": _coerce_bool(g(("claims", "pq_signature_ok"), ("pq_signature_ok",), ("meta", "pq_signature_ok"))),
+        "pq_required": _coerce_bool(
+            g(
+                ("claims", "pq_required"),
+                ("pq_required",),
+                ("meta", "pq_required"),
+                ("comp", "pq_required"),
+                ("comp", "security", "pq_required"),
+                ("comp", "artifacts", "pq_required"),
+                ("comp", "evidence_identity", "pq_required"),
+                ("req", "pq_required"),
+                ("e", "pq_required"),
+            )
+        ),
+        "pq_ok": _coerce_bool(
+            g(
+                ("claims", "pq_ok"),
+                ("pq_ok",),
+                ("meta", "pq_ok"),
+                ("comp", "pq_ok"),
+                ("comp", "security", "pq_ok"),
+                ("comp", "artifacts", "pq_ok"),
+                ("comp", "evidence_identity", "pq_ok"),
+                ("req", "pq_ok"),
+                ("e", "pq_ok"),
+            )
+        ),
+        "pq_signature_required": _coerce_bool(
+            g(
+                ("claims", "pq_signature_required"),
+                ("pq_signature_required",),
+                ("meta", "pq_signature_required"),
+                ("comp", "pq_signature_required"),
+                ("comp", "security", "pq_signature_required"),
+                ("comp", "artifacts", "pq_signature_required"),
+                ("comp", "evidence_identity", "pq_signature_required"),
+                ("req", "pq_signature_required"),
+                ("e", "pq_signature_required"),
+            )
+        ),
+        "pq_signature_ok": _coerce_bool(
+            g(
+                ("claims", "pq_signature_ok"),
+                ("pq_signature_ok",),
+                ("meta", "pq_signature_ok"),
+                ("comp", "pq_signature_ok"),
+                ("comp", "security", "pq_signature_ok"),
+                ("comp", "artifacts", "pq_signature_ok"),
+                ("comp", "evidence_identity", "pq_signature_ok"),
+                ("req", "pq_signature_ok"),
+                ("e", "pq_signature_ok"),
+            )
+        ),
         "receipt_surface_kind": _safe_label(g(("claims", "receipt_surface_kind"), ("receipt_surface_kind",), ("meta", "receipt_surface_kind")), default=""),
         "receipt_delivery_state": _safe_label(g(("claims", "receipt_delivery_state"), ("receipt_delivery_state",), ("meta", "receipt_delivery_state")), default=""),
         "evidence_durable": _coerce_bool(g(("claims", "evidence_durable"), ("evidence_durable",), ("meta", "evidence_durable"))),
@@ -1440,11 +1576,24 @@ def _verify_pq(
     *,
     enforce_required: bool,
     enforce_signature: bool,
+    signature_verified: Optional[bool] = None,
 ) -> Tuple[Optional[bool], List[str], Optional[bool], Optional[bool], Optional[bool], Optional[bool]]:
     pq_required = _coerce_bool(fields.get("pq_required"))
     pq_ok = _coerce_bool(fields.get("pq_ok"))
     pq_sig_required = _coerce_bool(fields.get("pq_signature_required"))
     pq_sig_ok = _coerce_bool(fields.get("pq_signature_ok"))
+
+    if pq_required is True and pq_sig_required is not True:
+        pq_sig_required = True
+    elif pq_sig_required is None and pq_required is not None:
+        pq_sig_required = bool(pq_required)
+
+    if pq_sig_required is True and pq_sig_ok is None and signature_verified is not None:
+        pq_sig_ok = bool(signature_verified)
+
+    if pq_required is True and pq_ok is None and pq_sig_ok is not None:
+        pq_ok = bool(pq_sig_ok)
+
     errs: List[str] = []
     if enforce_required and pq_required and (pq_ok is not True):
         errs.append("pq_required_not_ok")
@@ -1678,6 +1827,8 @@ class ReceiptVerifyReport:
     pq_signature_ok: Optional[bool] = None
     build_id: Optional[str] = None
     image_digest: Optional[str] = None
+    build_binding_verified: Optional[bool] = None
+    image_binding_verified: Optional[bool] = None
     env_fingerprint: Optional[str] = None
     prepare_ref: Optional[str] = None
     commit_ref: Optional[str] = None
@@ -1831,6 +1982,8 @@ class ReceiptVerifyReport:
             "verify_key_id": self.verify_key_id or self.sig_key_id,
             "verify_key_fp": self.verify_key_fp,
             "receipt_integrity": self.receipt_integrity,
+            "pq_required": self.pq_required,
+            "pq_ok": self.pq_ok,
             "pq_signature_required": self.pq_signature_required,
             "pq_signature_ok": self.pq_signature_ok,
             "integrity_ok": self.integrity_ok,
@@ -1892,6 +2045,10 @@ class ReceiptVerifyReport:
             "verify_key_allowed": self.verify_key_allowed,
             "policy_binding_verified": self.policy_binding_verified,
             "cfg_binding_verified": self.cfg_binding_verified,
+            "pq_required": self.pq_required,
+            "pq_ok": self.pq_ok,
+            "pq_signature_required": self.pq_signature_required,
+            "pq_signature_ok": self.pq_signature_ok,
             "integrity_ok": self.integrity_ok,
             "integrity_errors": list(self.integrity_errors),
         }
@@ -2035,6 +2192,8 @@ class ReceiptVerifyReport:
             "pq_signature_ok": self.pq_signature_ok,
             "build_id": self.build_id,
             "image_digest": self.image_digest,
+            "build_binding_verified": self.build_binding_verified,
+            "image_binding_verified": self.image_binding_verified,
             "env_fingerprint": self.env_fingerprint,
             "prepare_ref": self.prepare_ref,
             "commit_ref": self.commit_ref,
@@ -2224,7 +2383,7 @@ def compile_verify_bundle(config: Optional[VerifyConfig] = None) -> VerifyPolicy
         attest_contract_ok=attest_contract_ok,
         schemas_contract_ok=schemas_contract_ok,
         compat_mode_used=compat_mode_used,
-        warnings=tuple(dict.fromkeys(warnings)),
+        warnings=tuple(_normalize_warning_list(warnings)),
         errors=tuple(dict.fromkeys(errors)),
     )
     return VerifyPolicyBundle(
@@ -2354,7 +2513,7 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             canonicalization_version=_CANONICALIZATION_VERSION,
             integrity_ok=False,
             integrity_errors=tuple(dict.fromkeys(errors)),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
@@ -2379,7 +2538,7 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             canonicalization_version=_CANONICALIZATION_VERSION,
             integrity_ok=False,
             integrity_errors=("invalid_receipt_head",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -2404,7 +2563,7 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             head=head_input,
             integrity_ok=False,
             integrity_errors=("invalid_receipt_body",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -2438,7 +2597,7 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             head=head_input,
             integrity_ok=False,
             integrity_errors=(f"body_parse:{_safe_text(exc, max_len=96)}",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -2463,7 +2622,7 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             head=head_input,
             integrity_ok=False,
             integrity_errors=("body_not_mapping",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -2471,6 +2630,10 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
     body = dict(body_obj)
     phases.append(VerifyPhaseResult("parse", True, R_OK, elapsed_ms=(time.perf_counter() - t1) * 1000.0))
     fields = _extract_receipt_fields(body)
+    pq_required_hint = _coerce_bool(fields.get("pq_required"))
+    pq_signature_required_hint = _coerce_bool(fields.get("pq_signature_required"))
+    if pq_required_hint is True or pq_signature_required_hint is True:
+        require_signature = True
     t2 = time.perf_counter()
     ok_sec, sec_errs = _validate_body_security(body, strict=strict)
     if not ok_sec:
@@ -2548,7 +2711,9 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
             if not ok_att:
                 errors.append(f"attest:{reason_att}")
                 if details_att:
-                    warnings.append(_safe_text(details_att, max_len=256))
+                    warn_txt = _warning_text(details_att, max_len=256)
+                    if warn_txt:
+                        warnings.append(warn_txt)
                 phases.append(
                     VerifyPhaseResult(
                         "attest_contract",
@@ -2734,6 +2899,15 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
         expected_image_digest=inp.expected_image_digest,
         enforce=bool(bundle.enforce_supply_chain_match and strict),
     )
+    build_binding_verified: Optional[bool] = None
+    if inp.expected_build_id is not None:
+        got_build_id = _safe_text(fields.get("build_id"), max_len=256) or None
+        build_binding_verified = bool(got_build_id is not None and got_build_id == inp.expected_build_id)
+    image_binding_verified: Optional[bool] = None
+    if inp.expected_image_digest is not None:
+        got_image_digest = _normalize_digest(fields.get("image_digest"), kind="any") or (_safe_text(fields.get("image_digest"), max_len=256) or None)
+        expected_image_digest = _normalize_digest(inp.expected_image_digest, kind="any") or inp.expected_image_digest
+        image_binding_verified = bool(got_image_digest is not None and got_image_digest == expected_image_digest)
     if supply_errs:
         errors.extend(supply_errs)
         phases.append(
@@ -2751,8 +2925,9 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
     t10 = time.perf_counter()
     _pq_ok, pq_errs, pq_required, pq_ok, pq_sig_required, pq_sig_ok = _verify_pq(
         fields,
-        enforce_required=bool(strict and bundle.enforce_pq_required_in_strict),
-        enforce_signature=bool(strict and bundle.enforce_pq_signature_in_strict),
+        enforce_required=bool(strict and (bundle.enforce_pq_required_in_strict or pq_required_hint is True)),
+        enforce_signature=bool(strict and (bundle.enforce_pq_signature_in_strict or pq_signature_required_hint is True or pq_required_hint is True)),
+        signature_verified=signature_verified,
     )
     if pq_errs:
         errors.extend(pq_errs)
@@ -2966,6 +3141,8 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
         pq_signature_ok=pq_sig_ok,
         build_id=fields.get("build_id"),
         image_digest=fields.get("image_digest"),
+        build_binding_verified=build_binding_verified,
+        image_binding_verified=image_binding_verified,
         env_fingerprint=fields.get("env_fingerprint"),
         prepare_ref=fields.get("prepare_ref"),
         commit_ref=fields.get("commit_ref"),
@@ -2993,9 +3170,9 @@ def _verify_receipt_report(inp: VerifyReceiptInput, *, bundle: VerifyPolicyBundl
         governance_path_verified=governance_path_verified,
         integrity_ok=ok,
         integrity_errors=tuple(dict.fromkeys(errors)),
-        warnings=tuple(dict.fromkeys(warnings)),
-        normalization_warnings=tuple(dict.fromkeys(normalization_warnings)),
-        compat_warnings=tuple(dict.fromkeys(compat_warnings)),
+        warnings=tuple(_normalize_warning_list(warnings)),
+        normalization_warnings=tuple(_normalize_warning_list(normalization_warnings)),
+        compat_warnings=tuple(_normalize_warning_list(compat_warnings)),
         compat_mode_used=bundle.diagnostics.compat_mode_used,
         phases=tuple(phases),
         latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -3124,7 +3301,7 @@ def _verify_chain_report(inp: VerifyChainInput, *, bundle: VerifyPolicyBundle) -
             selected_chain_len=0,
             integrity_ok=False,
             integrity_errors=tuple(dict.fromkeys(errs)),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
@@ -3140,7 +3317,7 @@ def _verify_chain_report(inp: VerifyChainInput, *, bundle: VerifyPolicyBundle) -
             selected_chain_len=0,
             integrity_ok=False,
             integrity_errors=("chain_not_sequence",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -3156,7 +3333,7 @@ def _verify_chain_report(inp: VerifyChainInput, *, bundle: VerifyPolicyBundle) -
             selected_chain_len=0,
             integrity_ok=False,
             integrity_errors=("chain_length_invalid",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -3172,7 +3349,7 @@ def _verify_chain_report(inp: VerifyChainInput, *, bundle: VerifyPolicyBundle) -
             selected_chain_len=0,
             integrity_ok=False,
             integrity_errors=("chain_window_too_large",),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(_normalize_warning_list(warnings)),
             compat_mode_used=bundle.diagnostics.compat_mode_used,
             phases=tuple(phases),
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -3348,7 +3525,7 @@ def _verify_chain_report(inp: VerifyChainInput, *, bundle: VerifyPolicyBundle) -
         integrity_ok=ok,
         integrity_errors=tuple(dict.fromkeys(errs)),
         item_errors=tuple(dict.fromkeys(item_errs)),
-        warnings=tuple(dict.fromkeys(warnings)),
+        warnings=tuple(_normalize_warning_list(warnings)),
         compat_mode_used=bundle.diagnostics.compat_mode_used,
         phases=tuple(phases),
         latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -3384,8 +3561,10 @@ def _validate_body_security(body: Mapping[str, Any], *, strict: bool) -> Tuple[b
             errs.append(f"{key_name}_invalid")
     e_val = _nested_get_first(body, (("e_value",), ("e", "e_value")))
     if e_val is not None:
-        ef = _coerce_float(e_val)
-        if ef is None or ef < 0.0:
+        ef = _receipt_numeric_value(e_val)
+        if ef == "digest_only":
+            pass
+        elif ef is None or float(ef) < 0.0:
             errs.append("e_value_invalid")
     supply = _nested_get_first(body, (("supply_chain",),))
     if supply is not None:
@@ -3411,404 +3590,4 @@ def _validate_body_security(body: Mapping[str, Any], *, strict: bool) -> Tuple[b
     if obs and obs not in _ALLOWED_OUTBOX_STATUS:
         errs.append("outbox_status_invalid")
     return len(errs) == 0, tuple(dict.fromkeys(errs))
-
-
-# BEGIN TCD VERIFY STRICT CONTRACT V2 COMPAT
-#
-# Compatibility contract for tcd.attest.body.v2 + service_http/security_router receipts.
-#
-# Why this exists:
-#   The cryptographic verifier can already validate head/body/integrity/policy/cfg.
-#   Older strict semantic checks may still reject:
-#     - attest.py JSON-safe float wrappers: {"_tcd_float": "..."}
-#     - flat service_http e_obj: {"e_value": ..., "alpha_alloc": ...}
-#     - benign canonical v2 receipt keys produced by service_http/security_router
-#
-# This wrapper only converts a failure to success when:
-#   1) the original verifier has already validated cryptographic binding;
-#   2) the only semantic errors are the known contract-drift errors;
-#   3) the receipt body is a valid tcd.attest.body.v2 object;
-#   4) no raw prompt/secret/header material is present;
-#   5) e-value semantics are valid under the v2 contract.
-#
-try:
-    _TCD_ORIGINAL_VERIFY_RECEIPT_EX
-except NameError:
-    _TCD_ORIGINAL_VERIFY_RECEIPT_EX = verify_receipt_ex  # type: ignore[name-defined]
-
-def _tcd_v2_get(obj, name, default=None):
-    try:
-        if isinstance(obj, dict):
-            return obj.get(name, default)
-    except Exception:
-        pass
-    return getattr(obj, name, default)
-
-def _tcd_v2_bool(v):
-    if type(v) is bool:
-        return v
-    if v is None:
-        return False
-    if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "yes", "y", "ok"}
-    return bool(v)
-
-def _tcd_v2_errors(report):
-    e = _tcd_v2_get(report, "errors", [])
-    if e is None:
-        return []
-    if isinstance(e, (list, tuple, set)):
-        return [str(x) for x in e if str(x)]
-    return [str(e)] if str(e) else []
-
-def _tcd_v2_warnings(report):
-    w = _tcd_v2_get(report, "warnings", [])
-    if w is None:
-        return []
-    if isinstance(w, (list, tuple, set)):
-        return [str(x) for x in w if str(x)]
-    return [str(w)] if str(w) else []
-
-def _tcd_v2_num(v):
-    import math as _math
-    if type(v) is bool or v is None:
-        return None
-    if isinstance(v, (int, float)):
-        try:
-            x = float(v)
-            return x if _math.isfinite(x) else None
-        except Exception:
-            return None
-    if isinstance(v, str):
-        s = v.strip()
-        if not s or len(s) > 128:
-            return None
-        try:
-            x = float(s)
-            return x if _math.isfinite(x) else None
-        except Exception:
-            return None
-    if isinstance(v, dict):
-        for key in ("_tcd_float", "value", "val"):
-            if key in v:
-                return _tcd_v2_num(v.get(key))
-        if "_tcd_digest_ref" in v:
-            return "digest_only"
-    return None
-
-def _tcd_v2_is_digest_ref(v):
-    return isinstance(v, dict) and isinstance(v.get("_tcd_digest_ref"), dict)
-
-def _tcd_v2_is_redacted_or_digest(v):
-    if v is None:
-        return True
-    if _tcd_v2_is_digest_ref(v):
-        return True
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return True
-        if s in {"[REDACTED]", "<redacted>", "<bytes>"}:
-            return True
-        if s.startswith(("sha256:", "blake3:", "body:sha256:", "body:blake3:", "sp2:sha256:", "ssg2:sha256:", "scx2:sha256:")):
-            return True
-        if s.startswith("[") and s.endswith("]"):
-            return True
-        return False
-    if isinstance(v, (int, float, bool)):
-        return True
-    if isinstance(v, list):
-        return all(_tcd_v2_is_redacted_or_digest(x) for x in v)
-    if isinstance(v, dict):
-        return all(_tcd_v2_is_redacted_or_digest(x) for x in v.values())
-    return False
-
-def _tcd_v2_scan_for_unsafe_raw_keys(obj, *, path="$"):
-    """
-    Reject genuinely unsafe raw material, but do not reject canonical proof keys.
-    """
-    critical_exact = {
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "cookies",
-        "set-cookie",
-        "password",
-        "passwd",
-        "api_key",
-        "apikey",
-        "x-api-key",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "private_key",
-        "privatekey",
-        "bearer",
-    }
-    # "token" and "secret" can appear as substrings in safe domain terms
-    # such as tokens_delta or policy refs. Treat exact unsafe keys strictly.
-    critical_exact.update({"token", "secret"})
-
-    raw_content_keys = {
-        "detector_text",
-        "prompt",
-        "completion",
-        "messages",
-        "message",
-        "content",
-        "input",
-        "input_text",
-        "query",
-        "instruction",
-        "instructions",
-        "headers",
-        "header",
-        "payload",
-        "request_body",
-        "response_body",
-    }
-
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            ks = str(k).strip().lower()
-            p = f"{path}.{ks}"
-            if ks in critical_exact:
-                if not _tcd_v2_is_redacted_or_digest(v):
-                    return False, f"unsafe_secret_key:{p}"
-            if ks in raw_content_keys:
-                if not _tcd_v2_is_redacted_or_digest(v):
-                    return False, f"unsafe_raw_content_key:{p}"
-            ok, why = _tcd_v2_scan_for_unsafe_raw_keys(v, path=p)
-            if not ok:
-                return ok, why
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj[:4096]):
-            ok, why = _tcd_v2_scan_for_unsafe_raw_keys(v, path=f"{path}[{i}]")
-            if not ok:
-                return ok, why
-    return True, None
-
-def _tcd_v2_e_semantics_ok(body_obj):
-    if not isinstance(body_obj, dict):
-        return False, "body_not_dict"
-    e = body_obj.get("e")
-    if e is None:
-        return True, "e_absent"
-    if _tcd_v2_is_digest_ref(e):
-        return True, "e_digest_only"
-    if not isinstance(e, dict):
-        return False, "e_not_mapping"
-
-    # Service HTTP flat shape.
-    candidates = [
-        e.get("e_value"),
-        e.get("selected_e_value"),
-        e.get("controller_e_value"),
-        e.get("strict_e_value"),
-        e.get("score"),
-    ]
-
-    # E-process nested shape.
-    proc = e.get("process")
-    if isinstance(proc, dict):
-        candidates.extend([
-            proc.get("selected_e_value"),
-            proc.get("e_value"),
-            proc.get("controller_e_value"),
-            proc.get("strict_e_value"),
-            proc.get("threshold_e_value"),
-        ])
-
-    # Attestor may place process under e_state in some compatibility paths.
-    e_state = e.get("e_state")
-    if isinstance(e_state, dict):
-        p2 = e_state.get("process")
-        if isinstance(p2, dict):
-            candidates.extend([
-                p2.get("selected_e_value"),
-                p2.get("e_value"),
-                p2.get("controller_e_value"),
-                p2.get("strict_e_value"),
-            ])
-
-    values = [_tcd_v2_num(x) for x in candidates]
-    values = [x for x in values if x is not None]
-
-    if not values:
-        # A receipt can be integrity-valid and have a redacted/digest-only e payload.
-        if any(_tcd_v2_is_digest_ref(v) for v in e.values()):
-            return True, "e_digest_field"
-        return False, "no_e_value_candidate"
-
-    for x in values:
-        if x == "digest_only":
-            return True, "e_digest_only"
-        try:
-            if float(x) < 0.0:
-                return False, "negative_e_value"
-        except Exception:
-            return False, "bad_e_value"
-
-    # Other numeric controller fields, if present, only need to be finite.
-    for k in ("alpha_alloc", "alpha_wealth", "alpha_spent", "threshold", "budget_remaining"):
-        if k in e:
-            n = _tcd_v2_num(e.get(k))
-            if n is None:
-                return False, f"{k}_not_numeric"
-            if n != "digest_only":
-                try:
-                    float(n)
-                except Exception:
-                    return False, f"{k}_bad"
-
-    return True, "ok"
-
-def _tcd_v2_report_copy(report, *, ok, errors, warnings):
-    from types import SimpleNamespace as _SimpleNamespace
-
-    ok_bool = bool(ok)
-    errors_tuple = tuple(dict.fromkeys(str(x) for x in (errors or []) if str(x)))
-    warnings_tuple = tuple(dict.fromkeys(str(x) for x in (warnings or []) if str(x)))
-    reason_val = (
-        R_OK
-        if ok_bool and not errors_tuple
-        else (
-            _tcd_v2_get(report, "reason", None)
-            or _tcd_v2_get(report, "reason_code", None)
-            or R_BODY_SECURITY_INVALID
-        )
-    )
-
-    if dataclasses.is_dataclass(report) and not isinstance(report, type):
-        try:
-            field_names = {f.name for f in dataclasses.fields(report)}
-            changes = {}
-            for name, value in {
-                "ok": ok_bool,
-                "reason": reason_val,
-                "integrity_ok": ok_bool and not errors_tuple,
-                "integrity_errors": errors_tuple,
-                "warnings": warnings_tuple,
-            }.items():
-                if name in field_names:
-                    changes[name] = value
-            return dataclasses.replace(report, **changes)
-        except Exception:
-            pass
-
-    fields = {
-        "ok": ok_bool,
-        "reason": reason_val,
-        "reason_code": reason_val,
-        "errors": list(errors_tuple),
-        "integrity_errors": errors_tuple,
-        "integrity_ok": ok_bool and not errors_tuple,
-        "warnings": list(warnings_tuple),
-        "head_verified": _tcd_v2_get(report, "head_verified", None),
-        "body_canonical_verified": _tcd_v2_get(report, "body_canonical_verified", None),
-        "integrity_hash_verified": _tcd_v2_get(report, "integrity_hash_verified", None),
-        "signature_verified": _tcd_v2_get(report, "signature_verified", None),
-        "verify_key_allowed": _tcd_v2_get(report, "verify_key_allowed", None),
-        "policy_binding_verified": _tcd_v2_get(report, "policy_binding_verified", None),
-        "cfg_binding_verified": _tcd_v2_get(report, "cfg_binding_verified", None),
-        "build_binding_verified": _tcd_v2_get(report, "build_binding_verified", None),
-        "image_binding_verified": _tcd_v2_get(report, "image_binding_verified", None),
-    }
-
-    # Preserve any extra public attributes on namespace-like reports, except fields
-    # whose semantics we explicitly repaired above.
-    for name in dir(report):
-        if name.startswith("_") or name in fields:
-            continue
-        try:
-            val = getattr(report, name)
-        except Exception:
-            continue
-        if callable(val):
-            continue
-        fields.setdefault(name, val)
-
-    return _SimpleNamespace(**fields)
-
-def _tcd_v2_contract_rewrite(report, *, receipt_body_json=None, receipt_body=None, expected_policy_ref=None, expected_policyset_ref=None, expected_policy_digest=None, expected_cfg_fp=None, **kwargs):
-    errors = _tcd_v2_errors(report)
-    report_ok = _tcd_v2_bool(_tcd_v2_get(report, "ok", False))
-
-    if report_ok and not errors:
-        return report
-
-    warnings = _tcd_v2_warnings(report)
-
-    # forbidden_key_present is security-significant. Structural false positives
-    # must be fixed in _scan_forbidden_keys, not relaxed here.
-    forbidden_errors = [
-        e for e in errors
-        if e == "forbidden_key_present" or e.startswith("forbidden_key:")
-    ]
-    if forbidden_errors:
-        if report_ok and "ok_true_with_errors_corrected" not in warnings:
-            warnings.append("ok_true_with_errors_corrected")
-            return _tcd_v2_report_copy(report, ok=False, errors=errors, warnings=warnings)
-        return report
-
-    # Only old e-value contract drift is relaxable here.
-    relaxable = {"e_value_invalid"}
-    if not set(errors).issubset(relaxable):
-        if report_ok:
-            if "ok_true_with_errors_corrected" not in warnings:
-                warnings.append("ok_true_with_errors_corrected")
-            return _tcd_v2_report_copy(report, ok=False, errors=errors, warnings=warnings)
-        return report
-
-    # Never relax cryptographic / binding failures.
-    if not _tcd_v2_bool(_tcd_v2_get(report, "head_verified", False)):
-        return report
-    if not _tcd_v2_bool(_tcd_v2_get(report, "integrity_hash_verified", False)):
-        return report
-
-    if expected_policy_ref is not None or expected_policyset_ref is not None or expected_policy_digest is not None:
-        if not _tcd_v2_bool(_tcd_v2_get(report, "policy_binding_verified", False)):
-            return report
-    if expected_cfg_fp is not None:
-        if not _tcd_v2_bool(_tcd_v2_get(report, "cfg_binding_verified", False)):
-            return report
-
-    body = receipt_body_json if isinstance(receipt_body_json, str) else receipt_body
-    if not isinstance(body, str) or not body:
-        return report
-
-    try:
-        import json as _json
-        body_obj = _json.loads(body)
-    except Exception:
-        return report
-
-    if not isinstance(body_obj, dict):
-        return report
-
-    # Contract gate: only the attest v2 receipt body gets this compatibility treatment.
-    v = body_obj.get("v")
-    schema = str(body_obj.get("schema") or "")
-    if v not in (2, "2") and "attest.body.v2" not in schema:
-        return report
-
-    if "e_value_invalid" in errors:
-        e_ok, why = _tcd_v2_e_semantics_ok(body_obj)
-        if not e_ok:
-            if why and why not in warnings:
-                warnings.append(why)
-            return _tcd_v2_report_copy(report, ok=False, errors=errors, warnings=warnings)
-
-    if "strict_contract_v2_compat_applied" not in warnings:
-        warnings.append("strict_contract_v2_compat_applied")
-
-    return _tcd_v2_report_copy(report, ok=True, errors=[], warnings=warnings)
-
-def verify_receipt_ex(*args, **kwargs):  # type: ignore[override]
-    report = _TCD_ORIGINAL_VERIFY_RECEIPT_EX(*args, **kwargs)
-    try:
-        return _tcd_v2_contract_rewrite(report, **kwargs)
-    except Exception:
-        return report
-# END TCD VERIFY STRICT CONTRACT V2 COMPAT
 

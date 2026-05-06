@@ -1,6 +1,7 @@
 # FILE: tcd/policies.py
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -196,6 +197,38 @@ def _safe_head_name(s: Any, *, default: Optional[str] = None) -> Optional[str]:
     if not x or not _SAFE_HEAD_NAME_RE.fullmatch(x):
         return default
     return x
+
+
+_POLICY_BINDING_DIGEST_VERSION = "sp2"
+_POLICY_BINDING_DIGEST_ALG = "sha256"
+
+
+def _stable_float_text(x: float) -> str:
+    if not math.isfinite(float(x)):
+        return "0"
+    out = f"{float(x):.12f}".rstrip("0").rstrip(".")
+    return out or "0"
+
+
+def _policy_binding_digest(bp: Any, *, policyset_ref: Optional[str]) -> str:
+    payload = {
+        "policy_ref": _safe_id(getattr(bp, "policy_ref", None), default=None, max_len=128),
+        "policyset_ref": _safe_id(policyset_ref or getattr(bp, "policyset_ref", None), default=None, max_len=128),
+        "decision": _safe_label(getattr(bp, "decision", None), default="inherit") or "inherit",
+        "enforcement": _safe_label(getattr(bp, "enforcement", None), default="") or "",
+        "route_profile": _safe_label(getattr(bp, "route_profile", None), default="") or "",
+        "risk_label": _safe_label(getattr(bp, "risk_label", None), default="") or "",
+        "compliance_profile": _safe_label(getattr(bp, "compliance_profile", None), default="") or "",
+        "receipt_profile": _safe_id(getattr(bp, "receipt_profile", None), default=None, max_len=64),
+        "receipt_crypto_profile": _safe_id(getattr(bp, "receipt_crypto_profile", None), default=None, max_len=64),
+        "origin": _safe_id(getattr(bp, "origin", None), default=None, max_len=128),
+        "policy_patch_id": _safe_id(getattr(bp, "policy_patch_id", None), default=None, max_len=128),
+        "change_ticket_id": _safe_id(getattr(bp, "change_ticket_id", None), default=None, max_len=128),
+        "audit_label": _safe_label(getattr(bp, "audit_label", None), default="") or "",
+        "token_cost_divisor": _stable_float_text(float(_finite_float(getattr(bp, "token_cost_divisor", None)) or 50.0)),
+    }
+    raw = b"tcd:security:policy\x00" + _canon_json(payload).encode("utf-8", errors="strict")
+    return f"{_POLICY_BINDING_DIGEST_VERSION}:{_POLICY_BINDING_DIGEST_ALG}:{hashlib.sha256(raw).hexdigest()[:32]}"
 
 
 def _normalize_safe_label_tuple(values: Any, *, max_items: int = 64) -> Tuple[str, ...]:
@@ -1390,6 +1423,7 @@ class BoundPolicy:
     # Stronger semantic enforcement hint (outer stack should honor)
     decision: Decision = "inherit"
     enforcement: Optional[str] = None
+    policy_digest: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2631,6 +2665,7 @@ class PolicyStore:
             decision=(rule.decision or "inherit"),
             enforcement=rule.enforcement,
         )
+        template = replace(template, policy_digest=_policy_binding_digest(template, policyset_ref=set_ref))
 
         return (
             _CompiledRule(
@@ -2667,7 +2702,7 @@ class PolicyStore:
         det = _copy_config(self._base_detector)
         av = _copy_config(self._base_av)
         match_ro = MappingProxyType({k: "*" for k in _CTX_KEYS})
-        return BoundPolicy(
+        bp = BoundPolicy(
             name="default",
             version="0",
             policy_ref="default@0#000000000000",
@@ -2707,12 +2742,13 @@ class PolicyStore:
             decision="inherit",
             enforcement=None,
         )
+        return replace(bp, policy_digest=_policy_binding_digest(bp, policyset_ref=set_ref))
 
     def _error_bound_policy(self, *, set_ref: str) -> BoundPolicy:
         det = _copy_config(self._base_detector)
         av = _copy_config(self._base_av)
         match_ro = MappingProxyType({k: "*" for k in _CTX_KEYS})
-        return BoundPolicy(
+        bp = BoundPolicy(
             name="policy_error",
             version="1",
             policy_ref="policy_error@1#ffffffffffff",
@@ -2753,3 +2789,4 @@ class PolicyStore:
             decision="deny",
             enforcement="block",
         )
+        return replace(bp, policy_digest=_policy_binding_digest(bp, policyset_ref=set_ref))

@@ -1,0 +1,11 @@
+{
+  "expected_build_id": "issue11-build-1778034993-1cc9320e",
+  "expected_image_digest": "sha256:73da7fc106d93707bce5c5a1aa366a9bf6460145f77801d4f1b0cd107c0e8be1",
+  "expected_policy_digest": "sp2:sha256:980b322c3c90c7dda65290c31b547ff2",
+  "expected_policy_ref": "http_default_policy@1#3b1c5f034bd1",
+  "expected_policyset_ref": "set@1#0c1cb5e70538",
+  "expected_receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+  "expected_service_config_fingerprint": "hcfg3:sha256:83aaa302e104c79d19d4784ae3712ef3e7fc2a65ef0fa43b",
+  "receipt_ref": "3abd8b580d732eb2669bc4a7fbc39c5d61a8a068f2f98a995fed2fc28d58e12c",
+  "require_signature": true
+}

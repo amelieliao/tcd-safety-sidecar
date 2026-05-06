@@ -2144,9 +2144,11 @@ class AlwaysValidRiskController:
 
 try:
     if "build_v2_body" not in __all__:  # type: ignore[name-defined]
-        __all__ = list(__all__) + ["build_v2_body"]  # type: ignore[name-defined]
+        __all__ = list(__all__) + ["build_v2_body"]
+    if "build_commit_v2_body" not in __all__:
+        __all__ = list(__all__) + ["build_commit_v2_body"]  # type: ignore[name-defined]
 except Exception:
-    __all__ = ["build_v2_body"]
+    __all__ = ["build_v2_body", "build_commit_v2_body"]
 
 _RV2_RE = __import__("re")
 
@@ -2523,4 +2525,112 @@ def build_v2_body(
             "schema": _RECEIPT_V2_META_SCHEMA,
             "version": _RECEIPT_V2_META_VERSION,
             "kind": "receipt_meta",
+        }
+
+
+def build_commit_v2_body(
+    *,
+    decision_receipt_ref: Optional[str] = None,
+    decision_receipt_head: Optional[str] = None,
+    decision_receipt_body_digest: Optional[str] = None,
+    ledger_ref: Optional[str] = None,
+    commit_ref: Optional[str] = None,
+    chain_namespace: Optional[str] = None,
+    chain_id: Optional[str] = None,
+    chain_seq: Optional[int] = None,
+    audit_ref: Optional[str] = None,
+    receipt_ref: Optional[str] = None,
+    event_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    route_plan_id: Optional[str] = None,
+    evidence_durable: bool = True,
+    evidence_storage_ready: bool = True,
+    ledger_stage: str = "committed",
+    receipt_delivery_state: str = "committed",
+    receipt_surface_kind: str = "durable_committed",
+    governance_terminal: bool = True,
+    receipt_governance_ready: bool = True,
+    **extra: Any,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "schema": "tcd.receipt.commit.meta.v2",
+        "version": 2,
+        "kind": "commit_receipt_meta",
+    }
+
+    commit = _rv2_sanitize_mapping(
+        {
+            "decision_receipt_ref": decision_receipt_ref,
+            "decision_receipt_head": decision_receipt_head,
+            "decision_receipt_body_digest": decision_receipt_body_digest,
+            "ledger_ref": ledger_ref,
+            "commit_ref": commit_ref,
+            "chain_namespace": chain_namespace,
+            "chain_id": chain_id,
+            "chain_seq": chain_seq,
+            "audit_ref": audit_ref,
+            "receipt_ref": receipt_ref,
+            "event_id": event_id,
+            "decision_id": decision_id,
+            "route_plan_id": route_plan_id,
+            "evidence_durable": evidence_durable,
+            "evidence_storage_ready": evidence_storage_ready,
+            "ledger_stage": ledger_stage,
+            "receipt_delivery_state": receipt_delivery_state,
+            "receipt_surface_kind": receipt_surface_kind,
+            "governance_terminal": governance_terminal,
+            "receipt_governance_ready": receipt_governance_ready,
+        },
+        allowed_keys=(
+            "decision_receipt_ref",
+            "decision_receipt_head",
+            "decision_receipt_body_digest",
+            "ledger_ref",
+            "commit_ref",
+            "chain_namespace",
+            "chain_id",
+            "chain_seq",
+            "audit_ref",
+            "receipt_ref",
+            "event_id",
+            "decision_id",
+            "route_plan_id",
+            "evidence_durable",
+            "evidence_storage_ready",
+            "ledger_stage",
+            "receipt_delivery_state",
+            "receipt_surface_kind",
+            "governance_terminal",
+            "receipt_governance_ready",
+        ),
+        max_items=32,
+        max_str_len=256,
+    )
+    if commit:
+        out["commit"] = commit
+
+    if extra:
+        x = _rv2_sanitize_mapping(
+            extra,
+            max_items=16,
+            max_str_len=256,
+        )
+        if x:
+            out["extra"] = x
+
+    try:
+        return json.loads(
+            json.dumps(
+                out,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except Exception:
+        return {
+            "schema": "tcd.receipt.commit.meta.v2",
+            "version": 2,
+            "kind": "commit_receipt_meta",
         }

@@ -654,6 +654,9 @@ def _policyset_ref(store: Any) -> Optional[str]:
 
 
 def _policy_digest(bp: Any, *, policyset_ref: Optional[str]) -> str:
+    existing = _safe_id(getattr(bp, "policy_digest", None), default=None, max_len=128)
+    if existing:
+        return existing
     payload = {
         "policy_ref": _safe_id(getattr(bp, "policy_ref", None), default=None, max_len=128),
         "policyset_ref": _safe_id(policyset_ref or getattr(bp, "policyset_ref", None), default=None, max_len=128),
@@ -884,6 +887,11 @@ def _fallback_receipt_public(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "head": payload.get("receipt") or payload.get("head"),
         "receipt_ref": payload.get("receipt_ref") or payload.get("receipt") or payload.get("head"),
         "audit_ref": payload.get("audit_ref"),
+        "attestation_ref": payload.get("attestation_ref"),
+        "ledger_ref": payload.get("ledger_ref"),
+        "prepare_ref": payload.get("prepare_ref") or payload.get("ledger_prepare_ref"),
+        "commit_ref": payload.get("commit_ref") or payload.get("ledger_commit_ref"),
+        "outbox_ref": payload.get("outbox_ref"),
         "event_id": payload.get("event_id"),
         "decision_id": payload.get("decision_id"),
         "route_plan_id": payload.get("route_plan_id"),
@@ -979,6 +987,7 @@ def _annotate_receipt_surfaces(
     ledger_stage = artifacts.get("ledger_stage")
     outbox_status = artifacts.get("outbox_status")
     outbox_ref = artifacts.get("outbox_ref")
+    attestation_ref = artifacts.get("attestation_ref")
     prepare_ref = artifacts.get("prepare_ref") or artifacts.get("ledger_prepare_ref")
     commit_ref = artifacts.get("commit_ref") or artifacts.get("ledger_commit_ref")
     ledger_ref = artifacts.get("ledger_ref") or commit_ref or prepare_ref
@@ -986,6 +995,7 @@ def _annotate_receipt_surfaces(
     for obj in (raw, public, verification):
         obj["receipt_ref"] = obj.get("receipt_ref") or receipt_ref
         obj["audit_ref"] = obj.get("audit_ref") or audit_ref
+        obj["attestation_ref"] = obj.get("attestation_ref") or attestation_ref
         obj["receipt_surface_kind"] = surface_kind
         obj["receipt_delivery_state"] = delivery_state
         obj["evidence_durable"] = evidence_durable
@@ -1105,6 +1115,21 @@ def _security_router_auto_attestor_requested() -> bool:
         or _sr_env_bool("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS", default=False)
         or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT", default=False)
         or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT", default=False)
+    )
+
+
+def _security_router_auto_audit_requested() -> bool:
+    if _sr_env_bool("TCD_SECURITY_ROUTER_LOCAL_AUDIT_DISABLE", default=False):
+        return False
+    return bool(
+        _sr_env_bool("TCD_SECURITY_ROUTER_LOCAL_AUDIT_ENABLE", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_AUDIT_ENABLE", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_AUDIT_ENABLED", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT", default=False)
+        or _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT", default=False)
+        or bool(os.getenv("TCD_SECURITY_ROUTER_AUDIT_PATH"))
+        or bool(os.getenv("TCD_AUDIT_LOG"))
     )
 
 
@@ -1339,6 +1364,59 @@ class _LocalSQLiteReceiptLedgerSink:
         return self._append(phase="commit", event_id=event_id0, head=head, body=body, sig=sig)
 
 
+class _LocalAuditSink:
+    """
+    Local decision audit sink backed by tcd.audit.AuditLedger.
+    """
+
+    def __init__(self, *, path: Optional[str] = None, rotate_mb: Optional[int] = None) -> None:
+        from .audit import AuditLedger, AuditLedgerConfig  # imported lazily
+
+        out_path = (
+            path
+            or _sr_env_text("TCD_SECURITY_ROUTER_AUDIT_PATH", "")
+            or _sr_env_text("TCD_AUDIT_LOG", "")
+            or os.path.join(".tcd_runtime", "security_router.audit.log")
+        )
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+        except Exception:
+            pass
+
+        rot = rotate_mb
+        if rot is None:
+            rot = _clamp_int(os.getenv("TCD_SECURITY_ROUTER_AUDIT_ROTATE_MB"), default=50, lo=1, hi=4096)
+
+        cfg = AuditLedgerConfig(
+            path=out_path,
+            rotate_mb=int(rot),
+            record_format=_sr_env_text("TCD_SECURITY_ROUTER_AUDIT_RECORD_FORMAT", "jsonl") or "jsonl",
+            sync_on_write=_sr_env_bool("TCD_SECURITY_ROUTER_AUDIT_SYNC_ON_WRITE", default=True),
+            fsync_every_n=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_AUDIT_FSYNC_EVERY_N"), default=1, lo=1, hi=10000),
+            fsync_interval_ms=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_AUDIT_FSYNC_INTERVAL_MS"), default=0, lo=0, hi=60000),
+            include_policy_block=True,
+            include_index_root_in_markers=True,
+            sanitize_payload=True,
+            redact_secrets=True,
+            max_payload_depth=12,
+            max_payload_items=256,
+            max_record_bytes=512 * 1024,
+            max_line_bytes=1024 * 1024,
+        )
+        self._audit = AuditLedger(path=out_path, rotate_mb=int(rot), cfg=cfg)
+
+    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Optional[str]:
+        record = {
+            "schema": "tcd.security_router.audit.v1",
+            "event_type": _safe_label(event_type, default="security_router"),
+            "payload": _stable_jsonable(dict(payload)),
+            "ts_ns": time.time_ns(),
+        }
+        res = self._audit.append_ex(record)
+        head = _safe_id(getattr(res, "head", None), default=None, max_len=256)
+        return f"audit:{head}" if head else None
+
+
 class _LocalAuditOutboxSink:
     """
     Local audit/outbox sink backed by tcd.audit.AuditLedger.
@@ -1418,6 +1496,19 @@ def _build_local_audit_outbox_sink_from_env() -> Optional[SecurityOutboxSink]:
     except Exception as e:
         _LOG.exception("failed to build local audit outbox sink: %s", type(e).__name__)
         if _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_LOCAL_OUTBOX", default=False):
+            raise
+        return None
+
+
+def _build_local_audit_sink_from_env() -> Optional[SecurityAuditSink]:
+    try:
+        return _LocalAuditSink(
+            path=_sr_env_text("TCD_SECURITY_ROUTER_AUDIT_PATH", "") or _sr_env_text("TCD_AUDIT_LOG", "") or None,
+            rotate_mb=_clamp_int(os.getenv("TCD_SECURITY_ROUTER_AUDIT_ROTATE_MB"), default=50, lo=1, hi=4096),
+        )
+    except Exception as e:
+        _LOG.exception("failed to build local audit sink: %s", type(e).__name__)
+        if _sr_env_bool("TCD_SECURITY_ROUTER_REQUIRE_LOCAL_AUDIT", default=False):
             raise
         return None
 
@@ -2067,6 +2158,7 @@ class SecurityRouteContract:
 
     policy_ref: Optional[str]
     policyset_ref: Optional[str]
+    policy_digest: Optional[str]
     patch_id: Optional[str]
     change_ticket_id: Optional[str]
     activated_by: Optional[str]
@@ -2143,6 +2235,7 @@ class SecurityRouteContract:
             "bundle_updated_at_unix_ns": self.bundle_updated_at_unix_ns,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
+            "policy_digest": self.policy_digest,
             "patch_id": self.patch_id,
             "change_ticket_id": self.change_ticket_id,
             "activated_by": self.activated_by,
@@ -2210,6 +2303,7 @@ class SecurityRouteContract:
             "bundle_version": self.bundle_version,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
+            "policy_digest": self.policy_digest,
             "route_plan_id": self.route_plan_id,
             "decision_id": self.decision_id,
             "safety_tier": self.safety_tier,
@@ -2246,6 +2340,7 @@ class SecurityRouteContract:
             "bundle_version": self.bundle_version,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
+            "policy_digest": self.policy_digest,
             "patch_id": self.patch_id,
             "change_ticket_id": self.change_ticket_id,
             "required_action": self.required_action,
@@ -2789,6 +2884,9 @@ class SecurityRouter:
         if self._outbox_sink is None and _security_router_auto_outbox_requested():
             self._outbox_sink = _build_local_audit_outbox_sink_from_env()
 
+        if self._audit_sink is None and _security_router_auto_audit_requested():
+            self._audit_sink = _build_local_audit_sink_from_env()
+
         self._instance_id = os.urandom(8).hex()
         self._seq_lock = threading.Lock()
         self._decision_seq = 0
@@ -2884,6 +2982,7 @@ class SecurityRouter:
             "error_count": len(d.errors),
             "warning_count": len(d.warnings),
             "has_attestor": self._attestor is not None,
+            "has_audit_sink": self._audit_sink is not None,
             "has_ledger_sink": self._ledger_sink is not None,
             "has_outbox_sink": self._outbox_sink is not None,
             "errors": list(d.errors[:50]),
@@ -4236,7 +4335,7 @@ class SecurityRouter:
                     artifacts["ledger_stage"] = "prepared"
                     artifacts["governance_path"] = "ledger_prepare_commit"
                     reason_codes.append("LEDGER_PREPARED")
-                    audit_ref = prepare_ref or audit_ref
+                    artifacts["audit_ref"] = audit_ref
                 except Exception:
                     artifacts["ledger_stage"] = "prepare_failed"
                     reason_codes.append("LEDGER_PREPARE_FAILED")
@@ -4302,6 +4401,10 @@ class SecurityRouter:
                     if receipt_private:
                         receipt_raw = dict(receipt_private)
                         receipt_ref = _safe_id(receipt_private.get("receipt_ref") or receipt_private.get("receipt"), default=None, max_len=256) or receipt_ref
+                        attestation_ref = _safe_id(receipt_private.get("attestation_ref"), default=None, max_len=512) or (f"attest:{receipt_ref}" if receipt_ref else None)
+                        if attestation_ref:
+                            receipt_private["attestation_ref"] = receipt_private.get("attestation_ref") or attestation_ref
+                            artifacts["attestation_ref"] = attestation_ref
                         reason_codes.append("RECEIPT_ISSUED")
                     else:
                         reason_codes.append("RECEIPT_SKIPPED")
@@ -4441,7 +4544,7 @@ class SecurityRouter:
                     reason_codes.append("LEDGER_COMMITTED")
                     if receipt_private is not None:
                         reason_codes.append("RECEIPT_DURABLE_COMMITTED")
-                    audit_ref = commit_ref or audit_ref
+                    artifacts["audit_ref"] = audit_ref
                 except Exception:
                     artifacts["ledger_stage"] = "commit_failed"
                     reason_codes.append("LEDGER_COMMIT_FAILED")
@@ -4559,7 +4662,10 @@ class SecurityRouter:
                 audit_payload["audit_ref"] = audit_ref
                 audit_payload["receipt_ref"] = receipt_ref
                 audit_payload["receipt_public"] = dict(receipt_public or {})
-                audit_ref = self._audit_sink.emit("security_router.decision", audit_payload) or audit_ref
+                audit_emit_ref = self._audit_sink.emit("security_router.decision", audit_payload)
+                audit_ref = audit_emit_ref or audit_ref
+                if audit_ref:
+                    artifacts["audit_ref"] = audit_ref
             except Exception:
                 reason_codes.append("AUDIT_EMIT_FAIL")
                 if self._outbox_sink is not None and bundle.config.outbox_enabled and bundle.config.queue_audit_on_failure:
@@ -4581,6 +4687,43 @@ class SecurityRouter:
                     if audit_outbox_ref is not None:
                         artifacts["audit_outbox_ref"] = audit_outbox_ref
                         reason_codes.append("AUDIT_OUTBOX_QUEUED")
+
+        # ------------------------------------------------------------------
+        # 5b) Optional publication outbox for public refs.
+        # ------------------------------------------------------------------
+        if (
+            self._outbox_sink is not None
+            and bundle.config.outbox_enabled
+            and _sr_env_bool(
+                "TCD_SECURITY_ROUTER_OUTBOX_PUBLIC_REFS",
+                default=_sr_env_bool("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS", default=False),
+            )
+        ):
+            if not artifacts.get("outbox_ref"):
+                public_refs_outbox_ref = self._enqueue_outbox(
+                    kind="security_router.public_refs",
+                    dedupe_key=f"{decision.event_id}:public_refs",
+                    payload={
+                        "schema": "tcd.security_router.public_refs.v1",
+                        "event_id": decision.event_id,
+                        "decision_id": decision.decision_id,
+                        "route_plan_id": decision.route_plan_id,
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_ref,
+                        "attestation_ref": artifacts.get("attestation_ref"),
+                        "ledger_ref": artifacts.get("ledger_ref"),
+                        "prepare_ref": artifacts.get("prepare_ref") or artifacts.get("ledger_prepare_ref"),
+                        "commit_ref": artifacts.get("commit_ref") or artifacts.get("ledger_commit_ref"),
+                        "ledger_stage": artifacts.get("ledger_stage"),
+                        "receipt_surface_kind": artifacts.get("receipt_surface_kind"),
+                        "evidence_durable": bool(artifacts.get("evidence_durable", False)),
+                        "evidence_storage_ready": bool(artifacts.get("evidence_storage_ready", False)),
+                    },
+                )
+                if public_refs_outbox_ref is not None:
+                    artifacts["outbox_ref"] = public_refs_outbox_ref
+                    artifacts["outbox_status"] = "queued"
+                    reason_codes.append("OUTBOX_QUEUED")
 
         # ------------------------------------------------------------------
         # 6) Final outward blocks
@@ -5021,6 +5164,7 @@ class SecurityRouter:
             bundle_updated_at_unix_ns=bundle.updated_at_unix_ns,
             policy_ref=policy.policy_ref,
             policyset_ref=policy.policyset_ref,
+            policy_digest=policy.policy_digest,
             patch_id=bundle.config.patch_id,
             change_ticket_id=bundle.config.change_ticket_id,
             activated_by=bundle.config.activated_by,
@@ -5201,6 +5345,7 @@ class SecurityRouter:
             bundle_updated_at_unix_ns=_coerce_int(route_dict.get("bundle_updated_at_unix_ns")) or bundle.updated_at_unix_ns,
             policy_ref=_safe_id(route_dict.get("policy_ref"), default=policy.policy_ref, max_len=128),
             policyset_ref=_safe_id(route_dict.get("policyset_ref"), default=policy.policyset_ref, max_len=128),
+            policy_digest=_safe_id(route_dict.get("policy_digest"), default=policy.policy_digest, max_len=256),
             patch_id=_safe_id(route_dict.get("patch_id"), default=bundle.config.patch_id, max_len=128),
             change_ticket_id=_safe_id(route_dict.get("change_ticket_id"), default=bundle.config.change_ticket_id, max_len=128),
             activated_by=_safe_id(route_dict.get("activated_by"), default=bundle.config.activated_by, max_len=128),
@@ -5287,6 +5432,10 @@ class SecurityRouter:
                 state_domain_id = _safe_id(ctrl.get("state_domain_id"), default=None, max_len=256)
                 adapter_registry_fp = _safe_id(ctrl.get("adapter_registry_fp"), default=None, max_len=256)
 
+        detector_policy_digest = None
+        if isinstance(snap.detector.security, Mapping):
+            detector_policy_digest = _safe_id(snap.detector.security.get("policy_digest"), default=None, max_len=256)
+
         return {
             "event_id": snap.event_id,
             "decision_seq": snap.decision_seq,
@@ -5298,6 +5447,9 @@ class SecurityRouter:
             "security_policy_ref": snap.policy.policy_ref,
             "security_policyset_ref": snap.policy.policyset_ref,
             "security_policy_digest": policy_digest,
+            "policy_digest": policy_digest,
+            "route_policy_digest": policy_digest,
+            "detector_policy_digest": detector_policy_digest,
             "route_cfg_fp": getattr(route, "config_fingerprint", None) if route is not None else None,
             "route_bundle_version": getattr(route, "bundle_version", None) if route is not None else None,
             "route_policy_ref": getattr(route, "policy_ref", None) if route is not None else None,
@@ -5325,11 +5477,20 @@ class SecurityRouter:
         pq_ok = None
         if pq_required:
             pq_ok = None if not snap.ctx.pq_unhealthy else False
+        detector_policy_digest = None
+        if isinstance(snap.detector.security, Mapping):
+            detector_policy_digest = _safe_id(snap.detector.security.get("policy_digest"), default=None, max_len=256)
         return {
             "event_id": snap.event_id,
             "trust_zone": snap.ctx.trust_zone,
             "route_profile": snap.policy.route_profile,
             "risk_label": snap.detector.risk_label or snap.policy.risk_label,
+            "policy_ref": snap.policy.policy_ref,
+            "policyset_ref": snap.policy.policyset_ref,
+            "policy_digest": snap.policy.policy_digest,
+            "security_policy_digest": snap.policy.policy_digest,
+            "route_policy_digest": snap.policy.policy_digest,
+            "detector_policy_digest": detector_policy_digest,
             "controller_mode": snap.detector.controller_mode,
             "statistical_guarantee_scope": snap.detector.guarantee_scope,
             "state_domain_id": (
@@ -5453,6 +5614,9 @@ class SecurityRouter:
             "policy_ref": decision.policy_ref,
             "policyset_ref": decision.policyset_ref,
             "policy_digest": decision.policy_digest,
+            "security_policy_digest": decision.policy_digest,
+            "route_policy_digest": decision.evidence_identity.get("route_policy_digest") or decision.policy_digest,
+            "detector_policy_digest": decision.evidence_identity.get("detector_policy_digest"),
             "reason_codes": list(decision.reason_codes),
             "route": route_receipt,
             "audit_ref": audit_ref,
@@ -5474,6 +5638,8 @@ class SecurityRouter:
                 "alpha_spent": 0.0,
                 "budget_remaining": 0.0,
                 "policy_digest": decision.policy_digest,
+                "security_policy_digest": decision.policy_digest,
+                "detector_policy_digest": decision.evidence_identity.get("detector_policy_digest"),
             }
 
         witness_segments: List[Dict[str, Any]] = [
@@ -5513,6 +5679,9 @@ class SecurityRouter:
             "policy_ref": decision.policy_ref,
             "policyset_ref": decision.policyset_ref,
             "policy_digest": decision.policy_digest,
+            "security_policy_digest": decision.policy_digest,
+            "route_policy_digest": decision.evidence_identity.get("route_policy_digest") or decision.policy_digest,
+            "detector_policy_digest": decision.evidence_identity.get("detector_policy_digest"),
             "route_profile": snap.policy.route_profile,
             "trust_zone": ctx.trust_zone,
             "audit_ref": audit_ref,
@@ -5569,6 +5738,7 @@ class SecurityRouter:
         sig = _safe_id(out.get("receipt_sig"), default=None, max_len=8192)
         verify_key = _safe_id(out.get("verify_key"), default=None, max_len=4096)
         receipt_ref = _safe_id(out.get("receipt_ref"), default=None, max_len=512) or head
+        attestation_ref = _safe_id(out.get("attestation_ref"), default=None, max_len=512) or (f"attest:{receipt_ref}" if receipt_ref else None)
 
         enriched: Dict[str, Any] = {
             "schema": "tcd.receipt.security_router.v2",
@@ -5588,12 +5758,16 @@ class SecurityRouter:
             "receipt_sig_secondary": out.get("receipt_sig_secondary"),
             "receipt_ref": receipt_ref,
             "audit_ref": audit_ref,
+            "attestation_ref": attestation_ref,
             "event_id": decision.event_id,
             "decision_id": decision.decision_id,
             "route_plan_id": decision.route_plan_id,
             "policy_ref": decision.policy_ref,
             "policyset_ref": decision.policyset_ref,
             "policy_digest": decision.policy_digest,
+            "security_policy_digest": decision.policy_digest,
+            "route_policy_digest": decision.evidence_identity.get("route_policy_digest") or decision.policy_digest,
+            "detector_policy_digest": decision.evidence_identity.get("detector_policy_digest"),
             "cfg_fp": snap.bundle.cfg_fp,
             "state_domain_id": decision.evidence_identity.get("state_domain_id"),
             "adapter_registry_fp": decision.evidence_identity.get("adapter_registry_fp"),

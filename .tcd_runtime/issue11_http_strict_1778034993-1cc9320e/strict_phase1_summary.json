@@ -1,0 +1,45 @@
+{
+  "diagnose": {
+    "allowed": true,
+    "audit_ref": "audit:3e6bd89c7a2183ef32a7eb1b3be16dcd0c4f837734215216f97f115299de36be",
+    "commit_ref": "ch2:blake2s:617eb4fc7fcf070cfe82a1233b132690a88b900bf6b20adb3a7bfa562d2cda58",
+    "components.security_router_nonempty": true,
+    "decision": "degrade",
+    "evidence_durable": true,
+    "evidence_storage_ready": true,
+    "governance_terminal": true,
+    "ledger_ref": "ch2:blake2s:617eb4fc7fcf070cfe82a1233b132690a88b900bf6b20adb3a7bfa562d2cda58",
+    "ledger_stage": "committed",
+    "receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "receipt_governance_ready": true,
+    "receipt_ref": "3abd8b580d732eb2669bc4a7fbc39c5d61a8a068f2f98a995fed2fc28d58e12c",
+    "required_action": "degrade",
+    "route_config_fingerprint": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "service_config_fingerprint": "hcfg3:sha256:83aaa302e104c79d19d4784ae3712ef3e7fc2a65ef0fa43b"
+  },
+  "runtime": {
+    "evidence_store_backend": "sqlite",
+    "evidence_store_durable": true,
+    "evidence_store_enabled": true,
+    "evidence_store_error": null,
+    "has_attestor": true,
+    "has_authenticator": true,
+    "has_policy_store": true,
+    "has_security_router": true,
+    "receipt_ref_lookup": true,
+    "receipt_ref_store_backend": "sqlite",
+    "strict_mode": true
+  },
+  "verify_before_restart": {
+    "build_binding_verified": true,
+    "errors": [],
+    "expected_receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "image_binding_verified": true,
+    "ok": true,
+    "reason": "receipt",
+    "receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "receipt_ref": "3abd8b580d732eb2669bc4a7fbc39c5d61a8a068f2f98a995fed2fc28d58e12c",
+    "service_config_binding_verified": true,
+    "verify_input_source": "receipt_ref_lookup"
+  }
+}

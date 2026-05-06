@@ -760,6 +760,46 @@ def _get_by_dot_path(obj: Any, path: str) -> Optional[Any]:
     return cur
 
 
+_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+=@#,\-]{0,511}$")
+
+
+def _safe_ref_text(v: Any, *, max_len: int = 512) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        raw = v.strip()
+        if not raw or raw.lower() in {"none", "null", "nil"}:
+            return None
+    s = _safe_text(v, max_len=max_len)
+    if not s or s.lower() in {"none", "null", "nil"}:
+        return None
+    return s if _REF_TOKEN_RE.fullmatch(s) else None
+
+
+def _first_ref(record: Dict[str, Any], *paths: str) -> Optional[str]:
+    for path in paths:
+        v = _get_by_dot_path(record, path)
+        ref = _safe_ref_text(v, max_len=512)
+        if ref:
+            return ref
+    return None
+
+
+def _make_audit_ref(head: str) -> Optional[str]:
+    h = _safe_ref_text(head, max_len=256)
+    return f"audit:{h}" if h else None
+
+
+def _make_audit_ledger_ref(head: str, stage: Optional[str]) -> Optional[str]:
+    h = _safe_ref_text(head, max_len=256)
+    if not h:
+        return None
+    st = _safe_text(stage or "audit", max_len=32).lower() or "audit"
+    if st not in {"prepare", "commit", "append", "audit", "outbox"}:
+        st = "audit"
+    return f"ledger:{st}:{h}"
+
+
 # ---------------------------------------------------------------------------
 # Append result for platform integrations
 # ---------------------------------------------------------------------------
@@ -773,6 +813,14 @@ class AppendResult:
     rotated: bool = False
     fsync_ok: bool = True
     warning: Optional[str] = None
+    audit_ref: Optional[str] = None
+    receipt_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
+    stage: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1641,6 +1689,8 @@ class AuditLedger:
                 "format": self._record_format,
                 "seq": int(self._seq),
                 "head": self._prev,
+                "audit_ref": _make_audit_ref(self._prev) if self._seq >= 0 else None,
+                "ledger_ref": _make_audit_ledger_ref(self._prev, "audit") if self._seq >= 0 else None,
                 "file_size": size,
                 "bytes_written": int(self._bytes_written),
                 "rotate_bytes": int(self.rotate_bytes),
@@ -1670,6 +1720,10 @@ class AuditLedger:
         if not isinstance(record, dict):
             raise AuditConfigError("append record must be a dict")
 
+        stage_safe = _safe_text(stage, max_len=32).lower() if stage else None
+        if stage_safe and stage_safe not in {"prepare", "commit", "append", "audit", "outbox"}:
+            stage_safe = "audit"
+
         if not self._gate.try_acquire():
             raise AuditOverloadedError("admission gate full")
 
@@ -1692,6 +1746,78 @@ class AuditLedger:
                 if self._fd is None:
                     raise AuditIOError("file descriptor unavailable")
 
+                def _result_ref_payload(head_value: str) -> Dict[str, Optional[str]]:
+                    receipt_ref = _first_ref(
+                        record,
+                        "receipt_ref",
+                        "payload.receipt_ref",
+                        "payload.evidence_identity.receipt_ref",
+                        "payload.artifacts.receipt_ref",
+                    )
+                    audit_ref = _first_ref(
+                        record,
+                        "audit_ref",
+                        "payload.audit_ref",
+                        "payload.evidence_identity.audit_ref",
+                        "payload.artifacts.audit_ref",
+                    ) or _make_audit_ref(head_value)
+                    ledger_ref = _first_ref(
+                        record,
+                        "ledger_ref",
+                        "payload.ledger_ref",
+                        "payload.evidence_identity.ledger_ref",
+                        "payload.artifacts.ledger_ref",
+                    ) or _make_audit_ledger_ref(head_value, stage_safe)
+                    prepare_ref = _first_ref(
+                        record,
+                        "prepare_ref",
+                        "payload.prepare_ref",
+                        "payload.ledger_prepare_ref",
+                        "payload.evidence_identity.prepare_ref",
+                        "payload.evidence_identity.ledger_prepare_ref",
+                        "payload.artifacts.prepare_ref",
+                        "payload.artifacts.ledger_prepare_ref",
+                    )
+                    commit_ref = _first_ref(
+                        record,
+                        "commit_ref",
+                        "payload.commit_ref",
+                        "payload.ledger_commit_ref",
+                        "payload.evidence_identity.commit_ref",
+                        "payload.evidence_identity.ledger_commit_ref",
+                        "payload.artifacts.commit_ref",
+                        "payload.artifacts.ledger_commit_ref",
+                    )
+                    if not prepare_ref and stage_safe == "prepare":
+                        prepare_ref = _make_audit_ledger_ref(head_value, "prepare")
+                    if not commit_ref and stage_safe == "commit":
+                        commit_ref = _make_audit_ledger_ref(head_value, "commit")
+                    attestation_ref = _first_ref(
+                        record,
+                        "attestation_ref",
+                        "payload.attestation_ref",
+                        "payload.evidence_identity.attestation_ref",
+                        "payload.artifacts.attestation_ref",
+                    )
+                    if not attestation_ref and receipt_ref:
+                        attestation_ref = f"attest:{receipt_ref}"
+                    outbox_ref = _first_ref(
+                        record,
+                        "outbox_ref",
+                        "payload.outbox_ref",
+                        "payload.evidence_identity.outbox_ref",
+                        "payload.artifacts.outbox_ref",
+                    )
+                    return {
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_ref,
+                        "ledger_ref": ledger_ref,
+                        "prepare_ref": prepare_ref,
+                        "commit_ref": commit_ref,
+                        "attestation_ref": attestation_ref,
+                        "outbox_ref": outbox_ref,
+                    }
+
                 # Dedupe (correct, under lock)
                 duplicated = False
                 if cfg.dedupe_cache_size > 0 and cfg.dedupe_key_path:
@@ -1701,7 +1827,14 @@ class AuditLedger:
                         if dk_s:
                             old = self._dedupe.get(dk_s)
                             if old is not None:
-                                return AppendResult(head=str(old), seq=int(self._seq), ts_ns=int(ts_ns), duplicated=True)
+                                return AppendResult(
+                                    head=str(old),
+                                    seq=int(self._seq),
+                                    ts_ns=int(ts_ns),
+                                    duplicated=True,
+                                    stage=stage_safe,
+                                    **_result_ref_payload(str(old)),
+                                )
 
                 # Build policy block
                 policy_block: Dict[str, Any] = {}
@@ -1771,8 +1904,8 @@ class AuditLedger:
                     inner["origin"] = origin_block
                 if policy_block:
                     inner["policy"] = policy_block
-                if stage:
-                    inner["stage"] = _safe_text(stage, max_len=32)
+                if stage_safe:
+                    inner["stage"] = stage_safe
 
                 body = _canonical_json(inner)
                 body_bytes = body.encode("utf-8")
@@ -1909,7 +2042,16 @@ class AuditLedger:
                     self._last_error = f"append_failed:{_safe_text(e, max_len=200)}"
                     raise
 
-                return AppendResult(head=str(head), seq=int(seq_val), ts_ns=int(ts_ns), duplicated=duplicated, rotated=rotated, fsync_ok=fsync_ok)
+                return AppendResult(
+                    head=str(head),
+                    seq=int(seq_val),
+                    ts_ns=int(ts_ns),
+                    duplicated=duplicated,
+                    rotated=rotated,
+                    fsync_ok=fsync_ok,
+                    stage=stage_safe,
+                    **_result_ref_payload(str(head)),
+                )
 
             finally:
                 try:

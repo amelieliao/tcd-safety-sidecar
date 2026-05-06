@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import hmac
 import inspect
 import ipaddress
 import json
+import base64
 import logging
 import math
 import os
@@ -16,6 +18,15 @@ import threading
 import time
 import unicodedata
 import uuid
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r'Field name "schema" in ".*" shadows an attribute in parent "_CompatViewModel"',
+    category=UserWarning,
+)
+
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -27,17 +38,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from starlette.middleware.cors import CORSMiddleware
 
-from .attest import Attestor
+from .attest import Attestor, AttestorConfig
 from .config import make_reloadable_settings
 from .exporter import TCDPrometheusExporter
 from .kv import RollingHasher
 from .multivariate import MultiVarConfig, MultiVarDetector
 from .otel_exporter import TCDOtelExporter
-from .receipt_v2 import build_v2_body
+from .receipt_v2 import build_commit_v2_body, build_v2_body
 from .routing import StrategyRouter
 from .telemetry_gpu import GpuSampler
 from .utils import sanitize_floats
 from .verify import verify_chain, verify_receipt_ex
+
+try:  # durable evidence / receipt-chain store runtime
+    from .storage import ReceiptEnvelope as _StorageReceiptEnvelope
+    from .storage import StorageConfig as _StorageConfig
+    from .storage import make_receipt_store as _make_receipt_store
+except Exception:  # pragma: no cover
+    _StorageReceiptEnvelope = None  # type: ignore[assignment]
+    _StorageConfig = None  # type: ignore[assignment]
+    _make_receipt_store = None  # type: ignore[assignment]
 
 try:  # formal detector runtime
     from .detector import DetectRequest, build_default_detector
@@ -46,7 +66,13 @@ except Exception:  # pragma: no cover
     build_default_detector = None  # type: ignore[assignment]
 
 try:
-    from .schemas import ReceiptView
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r'Field name "schema" in ".*" shadows an attribute in parent "_CompatViewModel"',
+            category=UserWarning,
+        )
+        from .schemas import ReceiptView
 except Exception:  # pragma: no cover
     ReceiptView = None  # type: ignore[assignment]
 
@@ -336,6 +362,45 @@ def _coerce_bool(v: Any, *, default: bool = False) -> bool:
         if s in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _coerce_optional_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if type(v) is bool:
+        return v
+    if type(v) is int:
+        if v == 0:
+            return False
+        if v == 1:
+            return True
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _first_optional_bool_value(*values: Any) -> Optional[bool]:
+    for value in values:
+        b = _coerce_optional_bool(value)
+        if b is not None:
+            return b
+    return None
+
+
+def _first_optional_bool_from_mappings(key: str, *sources: Any) -> Optional[bool]:
+    for src in sources:
+        if not isinstance(src, Mapping):
+            continue
+        if key not in src:
+            continue
+        b = _coerce_optional_bool(src.get(key))
+        if b is not None:
+            return b
+    return None
 
 
 def _clamp_float(v: Any, *, default: float, lo: float, hi: float) -> float:
@@ -1031,9 +1096,103 @@ def _av_step_compat(
     return {}
 
 
+def _receipt_hmac_key_from_env() -> Optional[bytes]:
+    raw = (
+        os.getenv("TCD_ATTEST_HMAC_KEY")
+        or os.getenv("TCD_RECEIPT_HMAC_KEY")
+        or os.getenv("TCD_ATTEST_SIGNING_KEY")
+        or os.getenv("TCD_RECEIPT_SIGNING_KEY")
+        or ""
+    ).strip()
+    if not raw:
+        return None
+
+    low = raw.lower()
+    key: Optional[bytes] = None
+
+    if low.startswith("hex:"):
+        hx = raw[4:].strip()
+        if len(hx) % 2 == 0 and _HEX_RE.fullmatch(hx):
+            with contextlib.suppress(Exception):
+                key = bytes.fromhex(hx)
+    elif low.startswith("b64:"):
+        b64 = raw[4:].strip()
+        with contextlib.suppress(Exception):
+            key = base64.urlsafe_b64decode(b64 + ("=" * ((4 - len(b64) % 4) % 4)))
+    elif len(raw) % 2 == 0 and _HEX_RE.fullmatch(raw):
+        with contextlib.suppress(Exception):
+            key = bytes.fromhex(raw)
+    else:
+        key = raw.encode("utf-8", errors="strict")
+
+    if key is None or len(key) < 16:
+        _LOG.error("Receipt HMAC signing key missing or shorter than 16 bytes; strict receipt signatures disabled")
+        return None
+
+    return key
+
+
+def _receipt_hmac_key_id_from_env() -> str:
+    raw = (
+        os.getenv("TCD_ATTEST_HMAC_KEY_ID")
+        or os.getenv("TCD_RECEIPT_HMAC_KEY_ID")
+        or "tcd-attestor:hmac:local"
+    )
+    return _safe_id(raw, default="tcd-attestor:hmac:local", max_len=256) or "tcd-attestor:hmac:local"
+
+
+def _receipt_hmac_signer_from_env() -> Optional[Any]:
+    key = _receipt_hmac_key_from_env()
+    if key is None:
+        return None
+
+    def _sign(body_bytes: bytes) -> bytes:
+        return hmac.new(key, body_bytes, hashlib.sha256).digest()
+
+    return _sign
+
+
+def _receipt_hmac_verify_from_env() -> Optional[Any]:
+    key = _receipt_hmac_key_from_env()
+    if key is None:
+        return None
+
+    expected_key_id = _receipt_hmac_key_id_from_env()
+
+    def _verify(
+        alg: str,
+        key_id: Optional[str],
+        body_bytes: bytes,
+        signature_bytes: bytes,
+        **_kwargs: Any,
+    ) -> bool:
+        if str(alg or "").strip().lower() not in {"hmac-sha256", "hmac_sha256"}:
+            return False
+        if key_id is not None and str(key_id) != expected_key_id:
+            return False
+        expected = hmac.new(key, body_bytes, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, bytes(signature_bytes))
+
+    return _verify
+
+
 def _build_attestor_compat(*, hash_alg: str) -> Optional[Any]:
     if Attestor is None:
         return None
+
+    sign_func = _receipt_hmac_signer_from_env()
+    if sign_func is not None:
+        with contextlib.suppress(Exception):
+            return Attestor(
+                cfg=AttestorConfig(
+                    hash_alg=hash_alg,
+                    sign_func=sign_func,
+                    sig_alg="hmac-sha256",
+                    sig_key_id=_receipt_hmac_key_id_from_env(),
+                    allowed_sig_algs=["hmac-sha256"],
+                )
+            )
+
     ctor = Attestor
     kwargs = _filtered_kwargs_for(ctor, {"hash_alg": hash_alg})
     with contextlib.suppress(Exception):
@@ -1062,12 +1221,64 @@ def _build_security_router_compat(
         "base_av": AlwaysValidConfig(),
         "strategy_router": strategy_router if use_strategy_router else None,
     }
-    with contextlib.suppress(Exception):
-        return SecurityRouter(**_filtered_kwargs_for(SecurityRouter, kwargs))
-    with contextlib.suppress(Exception):
-        return SecurityRouter(policy_store, rate_limiter, attestor=attestor, detector_runtime=detector_runtime)
-    return None
 
+    first_err = None
+    try:
+        return SecurityRouter(**_filtered_kwargs_for(SecurityRouter, kwargs))
+    except Exception as e:
+        first_err = e
+        _LOG.exception("SecurityRouter build failed on keyword path: %s", type(e).__name__)
+
+    try:
+        return SecurityRouter(policy_store, rate_limiter, attestor=attestor, detector_runtime=detector_runtime)
+    except Exception as e:
+        _LOG.exception(
+            "SecurityRouter build failed on positional fallback path: %s first_error=%s",
+            type(e).__name__,
+            type(first_err).__name__ if first_err is not None else None,
+        )
+        return None
+
+
+
+def _security_router_requested_from_env(cfg: "ServiceHttpConfig") -> bool:
+    """
+    Explicit opt-in switch for the HTTP factory path.
+
+    SecurityRouter needs a PolicyStore. In the default uvicorn factory path there
+    may be no external policy file, so a router request should also enable the
+    built-in safe default policy store.
+    """
+    return bool(
+        _coerce_bool(os.getenv("TCD_HTTP_SECURITY_ROUTER_ENABLE"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_ENABLE"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRED"), default=False)
+        or _coerce_bool(os.getenv("TCD_HTTP_REQUIRE_SECURITY_ROUTER"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_LEDGER_WHEN_REQUIRED"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_LEDGER_REQUIRED_ON_DENY"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_LOCAL_LEDGER_ENABLE"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_LOCAL_AUDIT_ENABLE"), default=False)
+        or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_ENABLE"), default=False)
+        or bool(os.getenv("TCD_SECURITY_ROUTER_LEDGER_DB"))
+        or bool(os.getenv("TCD_LEDGER_DB"))
+        or bool(os.getenv("TCD_SECURITY_ROUTER_AUDIT_PATH"))
+        or bool(os.getenv("TCD_SECURITY_ROUTER_OUTBOX_AUDIT_PATH"))
+        or _coerce_bool(os.getenv("TCD_POLICY_STORE_ENABLE"), default=False)
+        or bool(os.getenv("TCD_POLICIES_FILE"))
+        or bool(os.getenv("TCD_POLICY_FILE"))
+        or bool(os.getenv("TCD_POLICIES_PATH"))
+        or bool(os.getenv("TCD_SECURITY_POLICIES_FILE"))
+        or bool(os.getenv("TCD_POLICIES_JSON"))
+        or bool(os.getenv("TCD_POLICY_JSON"))
+        or bool(os.getenv("TCD_SECURITY_POLICIES_JSON"))
+        or (
+            bool(getattr(cfg, "strict_mode", False))
+            and bool(getattr(cfg, "require_security_router_when_strict", False))
+        )
+    )
 
 
 def _build_policy_store_from_env_compat(*, cfg: "ServiceHttpConfig") -> Optional[Any]:
@@ -1092,7 +1303,10 @@ def _build_policy_store_from_env_compat(*, cfg: "ServiceHttpConfig") -> Optional
     if PolicyStore is Any:
         return None
 
-    enabled = _coerce_bool(os.getenv("TCD_POLICY_STORE_ENABLE"), default=False)
+    enabled = bool(
+        _coerce_bool(os.getenv("TCD_POLICY_STORE_ENABLE"), default=False)
+        or _security_router_requested_from_env(cfg)
+    )
 
     policy_file = (
         _safe_text(os.getenv("TCD_POLICIES_FILE"), max_len=4096)
@@ -1149,6 +1363,70 @@ def _build_policy_store_from_env_compat(*, cfg: "ServiceHttpConfig") -> Optional
             return fn(*args)
         except Exception:
             raise
+
+    if enabled and not policy_file and not policy_json:
+        default_rules = [
+            {
+                "name": "http_default_policy",
+                "version": "1",
+                "priority": 0,
+                "match": {
+                    "tenant": "*",
+                    "user": "*",
+                    "session": "*",
+                    "model_id": "*",
+                    "gpu_id": "*",
+                    "task": "*",
+                    "lang": "*",
+                    "env": "*",
+                    "trust_zone": "*",
+                    "route": "*",
+                    "data_class": "*",
+                    "workload": "*",
+                    "jurisdiction": "*",
+                    "regulation": "*",
+                    "client_app": "*",
+                    "access_channel": "*"
+                },
+                "routing": {
+                    "fallback_decoder": "cautious",
+                    "action_hint": "degrade",
+                    "route_profile": "inference"
+                },
+                "receipt": {
+                    "enable_issue": True,
+                    "enable_verify_metrics": True,
+                    "attach_policy_refs": True,
+                    "attach_match_context": False,
+                    "profile": "http_default",
+                    "crypto_profile": "local_hmac",
+                    "match_context_level": "coarse"
+                },
+                "audit": {
+                    "audit_label": "http",
+                    "sample_rate": 1.0,
+                    "log_level": "info",
+                    "incident_class": "runtime",
+                    "force_audit_on_violation": True,
+                    "require_full_trace": False
+                },
+                "sre": {
+                    "token_cost_divisor": float(cfg.tokens_divisor_default)
+                },
+                "decision": "allow",
+                "enforcement": "advisory",
+                "origin": "service_http_default_env",
+                "policy_patch_id": "http-default-00000000",
+                "change_ticket_id": "TCD-13"
+            }
+        ]
+        try:
+            obj = PolicyStore(default_rules, **_filtered_kwargs_for(PolicyStore, common_kwargs))
+            if _looks_like_policy_store(obj):
+                _LOG.info("PolicyStore loaded via service_http default fallback policy")
+                return obj
+        except Exception:
+            _LOG.exception("PolicyStore default fallback policy failed")
 
     # 1) File-based factories.
     if policy_file:
@@ -1381,6 +1659,35 @@ _RECEIPT_AUDIT_REF_KEYS = (
     "auditRef",
 )
 
+_RECEIPT_ATTESTATION_REF_KEYS = (
+    "attestation_ref",
+    "attestationRef",
+)
+
+_RECEIPT_LEDGER_REF_KEYS = (
+    "ledger_ref",
+    "ledgerRef",
+)
+
+_RECEIPT_PREPARE_REF_KEYS = (
+    "prepare_ref",
+    "prepareRef",
+    "ledger_prepare_ref",
+    "ledgerPrepareRef",
+)
+
+_RECEIPT_COMMIT_REF_KEYS = (
+    "commit_ref",
+    "commitRef",
+    "ledger_commit_ref",
+    "ledgerCommitRef",
+)
+
+_RECEIPT_OUTBOX_REF_KEYS = (
+    "outbox_ref",
+    "outboxRef",
+)
+
 _RECEIPT_INTEGRITY_KEYS = (
     "receipt_integrity",
     "receiptIntegrity",
@@ -1393,7 +1700,7 @@ _RECEIPT_BODY_DIGEST_KEYS = (
 
 _RECEIPT_POLICY_REF_KEYS = ("policy_ref", "policyRef")
 _RECEIPT_POLICYSET_REF_KEYS = ("policyset_ref", "policysetRef")
-_RECEIPT_CFG_FP_KEYS = ("cfg_fp", "cfgFp", "config_fingerprint", "configFingerprint")
+_RECEIPT_CFG_FP_KEYS = ("receipt_cfg_fp", "receiptCfgFp", "cfg_fp", "cfgFp", "route_config_fingerprint", "routeConfigFingerprint", "config_fingerprint", "configFingerprint")
 _RECEIPT_EVENT_ID_KEYS = ("event_id", "eventId")
 _RECEIPT_DECISION_ID_KEYS = ("decision_id", "decisionId")
 _RECEIPT_ROUTE_PLAN_ID_KEYS = ("route_plan_id", "routePlanId", "route_id", "routeId")
@@ -1408,6 +1715,11 @@ class _ReceiptArtifact:
 
     receipt_ref: Optional[str] = None
     audit_ref: Optional[str] = None
+    attestation_ref: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
+    outbox_ref: Optional[str] = None
 
     verify_key_id: Optional[str] = None
     verify_key_fp: Optional[str] = None
@@ -1468,6 +1780,11 @@ def _receipt_artifact_from_mapping(
     verify_key_fp = pick(_RECEIPT_VERIFY_KEY_FP_KEYS, max_len=4096) or _hash_handle_public(verify_key)
     receipt_ref = pick(_RECEIPT_REF_KEYS, max_len=512) or head
     audit_ref = pick(_RECEIPT_AUDIT_REF_KEYS, max_len=512)
+    attestation_ref = pick(_RECEIPT_ATTESTATION_REF_KEYS, max_len=512)
+    ledger_ref = pick(_RECEIPT_LEDGER_REF_KEYS, max_len=512)
+    prepare_ref = pick(_RECEIPT_PREPARE_REF_KEYS, max_len=512)
+    commit_ref = pick(_RECEIPT_COMMIT_REF_KEYS, max_len=512)
+    outbox_ref = pick(_RECEIPT_OUTBOX_REF_KEYS, max_len=512)
     receipt_integrity = pick(_RECEIPT_INTEGRITY_KEYS, max_len=512)
 
     body_digest = pick(_RECEIPT_BODY_DIGEST_KEYS, max_len=512)
@@ -1481,6 +1798,11 @@ def _receipt_artifact_from_mapping(
         verify_key=verify_key,
         receipt_ref=receipt_ref,
         audit_ref=audit_ref,
+        attestation_ref=attestation_ref,
+        ledger_ref=ledger_ref,
+        prepare_ref=prepare_ref,
+        commit_ref=commit_ref,
+        outbox_ref=outbox_ref,
         verify_key_id=verify_key_id,
         verify_key_fp=verify_key_fp,
         receipt_integrity=receipt_integrity,
@@ -1496,21 +1818,84 @@ def _receipt_artifact_from_mapping(
     )
 
 
+def _policy_binding_expectation_present(
+    *,
+    expected_policy_ref: Any = None,
+    expected_policyset_ref: Any = None,
+    expected_policy_digest: Any = None,
+) -> bool:
+    return bool(
+        _safe_text(expected_policy_ref, max_len=512)
+        or _safe_text(expected_policyset_ref, max_len=512)
+        or _safe_text(expected_policy_digest, max_len=512)
+    )
+
+
+def _normalize_policy_binding_verified(
+    value: Any,
+    *,
+    expected_policy_ref: Any = None,
+    expected_policyset_ref: Any = None,
+    expected_policy_digest: Any = None,
+) -> Optional[bool]:
+    if not _policy_binding_expectation_present(
+        expected_policy_ref=expected_policy_ref,
+        expected_policyset_ref=expected_policyset_ref,
+        expected_policy_digest=expected_policy_digest,
+    ):
+        return None
+    if value is None:
+        return None
+    return bool(_coerce_bool(value, default=False))
+
+
+def _normalize_receipt_verification_policy_binding_surface(
+    payload: Optional[Mapping[str, Any]],
+    source_payload: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    out = dict(payload)
+    src = dict(source_payload or {})
+    out["policy_binding_verified"] = _normalize_policy_binding_verified(
+        out.get("policy_binding_verified"),
+        expected_policy_ref=out.get("expected_policy_ref") or src.get("expected_policy_ref"),
+        expected_policyset_ref=out.get("expected_policyset_ref") or src.get("expected_policyset_ref"),
+        expected_policy_digest=out.get("expected_policy_digest") or src.get("expected_policy_digest"),
+    )
+    for key in ("expected_policy_ref", "expected_policyset_ref", "expected_policy_digest"):
+        out.pop(key, None)
+    return out
+
+
 def _receipt_artifact_public_dict(artifact: _ReceiptArtifact, payload: Mapping[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "schema": payload.get("schema"),
         "head": artifact.head,
         "receipt_ref": artifact.receipt_ref or artifact.head,
         "audit_ref": artifact.audit_ref,
+        "attestation_ref": artifact.attestation_ref or payload.get("attestation_ref"),
+        "ledger_ref": artifact.ledger_ref or payload.get("ledger_ref"),
+        "prepare_ref": artifact.prepare_ref or payload.get("prepare_ref") or payload.get("ledger_prepare_ref"),
+        "commit_ref": artifact.commit_ref or payload.get("commit_ref") or payload.get("ledger_commit_ref"),
+        "outbox_ref": artifact.outbox_ref or payload.get("outbox_ref"),
         "event_id": artifact.event_id,
         "decision_id": artifact.decision_id,
         "route_plan_id": artifact.route_plan_id,
         "policy_ref": artifact.policy_ref,
         "policyset_ref": artifact.policyset_ref,
+        "policy_digest": payload.get("policy_digest"),
+        "security_policy_digest": payload.get("security_policy_digest"),
+        "route_policy_digest": payload.get("route_policy_digest"),
+        "detector_policy_digest": payload.get("detector_policy_digest"),
         "cfg_fp": artifact.cfg_fp,
         "verify_key_id": artifact.verify_key_id,
         "verify_key_fp": artifact.verify_key_fp,
         "receipt_integrity": artifact.receipt_integrity,
+        "pq_required": payload.get("pq_required"),
+        "pq_ok": payload.get("pq_ok"),
+        "pq_required": payload.get("pq_required"),
+        "pq_ok": payload.get("pq_ok"),
         "pq_required": payload.get("pq_required"),
         "pq_ok": payload.get("pq_ok"),
         "pq_signature_required": payload.get("pq_signature_required"),
@@ -1553,13 +1938,22 @@ def _receipt_artifact_verification_dict(
         "route_plan_id": artifact.route_plan_id,
         "policy_ref": artifact.policy_ref,
         "policyset_ref": artifact.policyset_ref,
+        "policy_digest": payload.get("policy_digest"),
+        "security_policy_digest": payload.get("security_policy_digest"),
+        "route_policy_digest": payload.get("route_policy_digest"),
+        "detector_policy_digest": payload.get("detector_policy_digest"),
         "cfg_fp": artifact.cfg_fp,
         "head_verified": payload.get("head_verified"),
         "body_canonical_verified": payload.get("body_canonical_verified"),
         "integrity_hash_verified": payload.get("integrity_hash_verified"),
         "signature_verified": payload.get("signature_verified"),
         "verify_key_allowed": payload.get("verify_key_allowed"),
-        "policy_binding_verified": payload.get("policy_binding_verified"),
+        "policy_binding_verified": _normalize_policy_binding_verified(
+            payload.get("policy_binding_verified"),
+            expected_policy_ref=payload.get("expected_policy_ref"),
+            expected_policyset_ref=payload.get("expected_policyset_ref"),
+            expected_policy_digest=payload.get("expected_policy_digest"),
+        ),
         "cfg_binding_verified": payload.get("cfg_binding_verified"),
         "pq_signature_required": payload.get("pq_signature_required"),
         "pq_signature_ok": payload.get("pq_signature_ok"),
@@ -1572,7 +1966,11 @@ def _receipt_artifact_verification_dict(
         "integrity_ok": payload.get("integrity_ok"),
         "integrity_errors": payload.get("integrity_errors") or [],
     }
-    return {k: v for k, v in out.items() if v is not None}
+    return {
+        k: v
+        for k, v in out.items()
+        if v is not None or k in {"policy_binding_verified", "cfg_binding_verified"}
+    }
 
 def _receipt_view_model(payload: Mapping[str, Any]) -> Any:
     if ReceiptView is None:
@@ -1618,6 +2016,8 @@ def _build_receipt_surfaces(
     def _fallback() -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         pub2 = _fallback_receipt_public(payload_dict)
         ver2 = _fallback_receipt_verification(payload_dict, include_verify_key=bool(expose_verify_key_public))
+        if ver2 is not None:
+            ver2 = _normalize_receipt_verification_policy_binding_surface(ver2, payload_dict)
         if not expose_verification_bundle_public:
             ver2 = None
         return pub2 if _receipt_payload_has_public_material(pub2) else {}, (
@@ -1644,6 +2044,23 @@ def _build_receipt_surfaces(
             pub, ver = projected
             pub = dict(pub or {})
             ver = dict(ver or {}) if ver is not None else None
+            if ver is not None:
+                ver = _normalize_receipt_verification_policy_binding_surface(ver, payload_dict)
+
+            for key in (
+                "policy_digest",
+                "security_policy_digest",
+                "route_policy_digest",
+                "detector_policy_digest",
+                "pq_required",
+                "pq_ok",
+                "pq_signature_required",
+                "pq_signature_ok",
+            ):
+                if pub.get(key) is None and fallback_pub.get(key) is not None:
+                    pub[key] = fallback_pub.get(key)
+                if ver is not None and fallback_ver is not None and ver.get(key) is None and fallback_ver.get(key) is not None:
+                    ver[key] = fallback_ver.get(key)
 
             if not _receipt_payload_has_public_material(pub) and _receipt_payload_has_public_material(fallback_pub):
                 pub = fallback_pub
@@ -1670,6 +2087,73 @@ def _first_text(*values: Any, max_len: int = 256) -> Optional[str]:
         if s:
             return s
     return None
+
+
+def _looks_like_service_config_fingerprint(v: Any) -> bool:
+    s = _safe_text(v, max_len=512)
+    return bool(s and s.startswith("hcfg"))
+
+
+def _first_route_config_fingerprint(*values: Any, max_len: int = 512) -> Optional[str]:
+    for v in values:
+        s = _safe_text(v, max_len=max_len)
+        if not s:
+            continue
+        if _looks_like_service_config_fingerprint(s):
+            continue
+        return s
+    return None
+
+
+def _derive_route_config_fingerprint(
+    *,
+    route_info: Mapping[str, Any],
+    policy_ref: Optional[str] = None,
+    policyset_ref: Optional[str] = None,
+    policy_digest: Optional[str] = None,
+    fallback_seed: Optional[str] = None,
+) -> str:
+    candidate = _first_route_config_fingerprint(
+        route_info.get("route_config_fingerprint") if isinstance(route_info, Mapping) else None,
+        route_info.get("config_fingerprint") if isinstance(route_info, Mapping) else None,
+        route_info.get("cfg_fp") if isinstance(route_info, Mapping) else None,
+    )
+    if candidate:
+        return candidate
+    payload = {
+        "schema": "tcd.http.route_config_fingerprint.v1",
+        "router": _safe_text(route_info.get("router") if isinstance(route_info, Mapping) else None, max_len=128),
+        "version": _safe_text(route_info.get("version") if isinstance(route_info, Mapping) else None, max_len=128),
+        "policy_ref": policy_ref,
+        "policyset_ref": policyset_ref,
+        "policy_digest": policy_digest,
+        "required_action": _safe_text(route_info.get("required_action") if isinstance(route_info, Mapping) else None, max_len=64),
+        "action_hint": _safe_text(route_info.get("action_hint") if isinstance(route_info, Mapping) else None, max_len=64),
+        "enforcement_mode": _safe_text(route_info.get("enforcement_mode") if isinstance(route_info, Mapping) else None, max_len=64),
+        "safety_tier": _safe_text(route_info.get("safety_tier") if isinstance(route_info, Mapping) else None, max_len=64),
+        "route_profile": _safe_text(route_info.get("route_profile") if isinstance(route_info, Mapping) else None, max_len=64),
+        "trust_zone": _safe_text(route_info.get("trust_zone") if isinstance(route_info, Mapping) else None, max_len=64),
+        "fallback_seed": fallback_seed,
+    }
+    return f"cfg1:sha256:{_hash_hex(ctx='tcd:http:route_cfg', payload=payload, out_hex=64, alg='sha256')}"
+
+
+def _receipt_cfg_fp_from_sources(
+    *sources: Optional[Mapping[str, Any]],
+    route_config_fingerprint: Optional[str],
+) -> Optional[str]:
+    for src in sources:
+        if not isinstance(src, Mapping):
+            continue
+        val = _first_route_config_fingerprint(
+            src.get("receipt_cfg_fp"),
+            src.get("cfg_fp"),
+            src.get("config_fingerprint"),
+            src.get("route_config_fingerprint"),
+        )
+        if val:
+            return val
+    return _first_route_config_fingerprint(route_config_fingerprint)
 
 
 def _first_float(*values: Any, default: float = 0.0) -> float:
@@ -1801,6 +2285,52 @@ def _receipt_report_get(report: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+
+
+def _diagnostic_text(v: Any, *, max_len: int = 256) -> str:
+    """
+    Stable, readable text for verify/report diagnostics.
+
+    This preserves observability when a dependency returns structured warning
+    objects instead of plain strings.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return _safe_text(v, max_len=max_len)
+    if isinstance(v, (bool, int, float)):
+        return _safe_text(v, max_len=max_len)
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        with contextlib.suppress(Exception):
+            return _diagnostic_text(dataclasses.asdict(v), max_len=max_len)
+    if isinstance(v, Mapping):
+        for key in ("warning", "reason", "reason_code", "error", "code", "detail", "message"):
+            if key in v:
+                txt = _diagnostic_text(v.get(key), max_len=max_len)
+                if txt:
+                    return txt
+        with contextlib.suppress(Exception):
+            return _safe_text(
+                json.dumps(
+                    _stable_jsonable(dict(v)),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                max_len=max_len,
+            )
+        return _safe_text(repr(dict(v)), max_len=max_len)
+    if isinstance(v, (list, tuple, set, frozenset)):
+        parts: List[str] = []
+        for item in list(v)[:8]:
+            txt = _diagnostic_text(item, max_len=max_len)
+            if txt and txt not in parts:
+                parts.append(txt)
+        return _safe_text(";".join(parts), max_len=max_len)
+    return _safe_text(v, max_len=max_len)
+
+
 def _receipt_report_list(report: Any, *keys: str) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -1815,7 +2345,7 @@ def _receipt_report_list(report: Any, *keys: str) -> List[str]:
         else:
             seq = [val]
         for item in seq:
-            txt = _safe_text(item, max_len=256)
+            txt = _diagnostic_text(item, max_len=256)
             if not txt or txt in seen:
                 continue
             seen.add(txt)
@@ -1840,7 +2370,7 @@ def _normalize_text_list(value: Any, *, max_items: int = 64, max_len: int = 256)
     out: List[str] = []
     seen = set()
     for item in seq[:max_items]:
-        s = _safe_text(item, max_len=max_len)
+        s = _diagnostic_text(item, max_len=max_len)
         if not s or s in seen:
             continue
         seen.add(s)
@@ -1948,6 +2478,20 @@ def _sanitize_receipt_verification_surface(obj: Any) -> Optional[Dict[str, Any]]
         ("receiptRef", "receipt_ref", 4096),
         ("audit_ref", "audit_ref", 4096),
         ("auditRef", "audit_ref", 4096),
+        ("attestation_ref", "attestation_ref", 4096),
+        ("attestationRef", "attestation_ref", 4096),
+        ("ledger_ref", "ledger_ref", 4096),
+        ("ledgerRef", "ledger_ref", 4096),
+        ("prepare_ref", "prepare_ref", 4096),
+        ("prepareRef", "prepare_ref", 4096),
+        ("ledger_prepare_ref", "prepare_ref", 4096),
+        ("ledgerPrepareRef", "prepare_ref", 4096),
+        ("commit_ref", "commit_ref", 4096),
+        ("commitRef", "commit_ref", 4096),
+        ("ledger_commit_ref", "commit_ref", 4096),
+        ("ledgerCommitRef", "commit_ref", 4096),
+        ("outbox_ref", "outbox_ref", 4096),
+        ("outboxRef", "outbox_ref", 4096),
 
         ("body", "body", _DEFAULT_RECEIPT_BODY_LIMIT),
         ("receipt_body", "body", _DEFAULT_RECEIPT_BODY_LIMIT),
@@ -1997,6 +2541,24 @@ def _derive_audit_ref(
             return val
     return _first_text(fallback, max_len=512)
 
+def _derive_attestation_ref(
+    *,
+    receipt_public: Optional[Mapping[str, Any]] = None,
+    receipt_verification: Optional[Mapping[str, Any]] = None,
+    receipt_private: Optional[Mapping[str, Any]] = None,
+    raw_receipt: Optional[Mapping[str, Any]] = None,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    for src in (receipt_public, receipt_verification, receipt_private, raw_receipt):
+        artifact = _receipt_artifact_from_mapping(src or {}, include_verify_key=False)
+        val = _first_text(artifact.attestation_ref, max_len=512)
+        if val:
+            return val
+        base = _first_text(artifact.receipt_ref, artifact.head, max_len=512)
+        if base:
+            return f"attest:{base}"
+    return _first_text(fallback, max_len=512)
+
 def _normalize_artifact_refs(
     artifacts: Mapping[str, Any],
     *,
@@ -2008,23 +2570,43 @@ def _normalize_artifact_refs(
     prepare_ref = _first_text(src.get("prepare_ref"), src.get("ledger_prepare_ref"), max_len=256)
     commit_ref = _first_text(src.get("commit_ref"), src.get("ledger_commit_ref"), max_len=256)
     ledger_ref = _first_text(src.get("ledger_ref"), commit_ref, prepare_ref, max_len=256)
+    attestation_ref = _first_text(src.get("attestation_ref"), src.get("attestationRef"), max_len=512)
+    if not attestation_ref and receipt_ref:
+        attestation_ref = f"attest:{receipt_ref}"
 
     produced_by_raw = src.get("produced_by")
-    if isinstance(produced_by_raw, (list, tuple, set, frozenset)):
-        produced_by = [
-            _safe_text(x, max_len=128)
-            for x in list(produced_by_raw)[:16]
-            if _safe_text(x, max_len=128)
-        ]
+    if isinstance(produced_by_raw, str):
+        produced_by_seq = [produced_by_raw]
+    elif isinstance(produced_by_raw, (list, tuple, set, frozenset)):
+        produced_by_seq = list(produced_by_raw)
     else:
-        produced_by = []
+        produced_by_seq = []
+
+    produced_by: List[str] = []
+    for item in produced_by_seq[:16]:
+        producer = _safe_text(item, max_len=128)
+        if producer and producer not in produced_by:
+            produced_by.append(producer)
+
+    if (
+        _coerce_bool(src.get("evidence_storage_ready"), default=False)
+        or _first_text(src.get("evidence_store_chain_id"), src.get("evidence_store_chain_head"), max_len=256)
+    ):
+        for producer in (
+            "service_http.local",
+            "tcd.attest",
+            "service_http.local_evidence_store",
+            "tcd.storage",
+        ):
+            if producer not in produced_by:
+                produced_by.append(producer)
 
     normalized = {
         **src,
         "audit_ref": _first_text(src.get("audit_ref"), audit_ref, max_len=256),
         "receipt_ref": _first_text(src.get("receipt_ref"), receipt_ref, max_len=256),
         "ledger_ref": ledger_ref,
-        "attestation_ref": _first_text(src.get("attestation_ref"), max_len=256),
+        "attestation_ref": attestation_ref,
         "prepare_ref": prepare_ref,
         "commit_ref": commit_ref,
         "ledger_stage": _first_text(src.get("ledger_stage"), max_len=64),
@@ -2035,8 +2617,8 @@ def _normalize_artifact_refs(
         "body_digest": _first_text(src.get("body_digest"), body_digest, max_len=128),
         "event_digest": _first_text(src.get("event_digest"), max_len=128),
         "payload_digest": _first_text(src.get("payload_digest"), max_len=128),
-        "chain_id": _first_text(src.get("chain_id"), max_len=128),
-        "chain_head": _first_text(src.get("chain_head"), max_len=256),
+        "chain_id": _first_text(src.get("chain_id"), src.get("evidence_store_chain_id"), max_len=128),
+        "chain_head": _first_text(src.get("chain_head"), src.get("evidence_store_chain_head"), max_len=256),
         "produced_by": produced_by,
         "provenance_path_digest": _first_text(src.get("provenance_path_digest"), max_len=128),
     }
@@ -2352,6 +2934,752 @@ class _ReceiptArtifactStore:
         if self._durable is not None:
             return self.durable_size()
         return self.memory_size()
+
+
+
+def _http_evidence_storage_config_compat(cfg: Any) -> Any:
+    """
+    service_http durable evidence stores attestor-issued receipt bodies.
+
+    These bodies are already service-side sanitized and content-agnostic, but
+    they may contain structural field names such as body_digest / request_id /
+    evidence_identity. For this evidence-store path, preserve the exact receipt
+    body instead of letting storage reject structural receipt metadata.
+    """
+    if cfg is None:
+        return None
+
+    relax = _coerce_bool(
+        os.getenv("TCD_HTTP_EVIDENCE_STORE_RELAX_RECEIPT_BODY_VALIDATION"),
+        default=True,
+    )
+
+    desired: Dict[str, Any] = {}
+    if relax:
+        desired.update(
+            {
+                "reject_forbidden_body_keys": False,
+                "verify_receipt_head": False,
+                "verify_attestation_semantics_if_possible": False,
+                "strict_dict_top_level_external": False,
+                "canonicalize_receipt_body": False,
+            }
+        )
+
+    if not desired:
+        return cfg
+
+    usable = {k: v for k, v in desired.items() if hasattr(cfg, k)}
+    if not usable:
+        return cfg
+
+    if dataclasses.is_dataclass(cfg):
+        with contextlib.suppress(Exception):
+            return dataclasses.replace(cfg, **usable)
+
+    for k, v in usable.items():
+        with contextlib.suppress(Exception):
+            setattr(cfg, k, v)
+
+    return cfg
+
+
+def _exception_diagnostic_text(exc: BaseException, *, max_len: int = 512) -> str:
+    parts: List[str] = []
+    seen = set()
+
+    def add(label: str, value: Any) -> None:
+        s = _safe_text(value, max_len=max_len)
+        if not s:
+            return
+        item = f"{label}={s}"
+        if item in seen:
+            return
+        seen.add(item)
+        parts.append(item)
+
+    add("str", str(exc))
+
+    args = getattr(exc, "args", None)
+    if args:
+        with contextlib.suppress(Exception):
+            add(
+                "args",
+                json.dumps(
+                    _stable_jsonable(list(args)),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
+        add("args_repr", repr(args))
+
+    for attr in ("reason", "detail", "message", "code"):
+        with contextlib.suppress(Exception):
+            val = getattr(exc, attr, None)
+            if val is not None:
+                add(attr, val)
+
+    add("repr", repr(exc))
+
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        add("cause", f"{type(cause).__name__}:{str(cause) or repr(cause)}")
+
+    context = getattr(exc, "__context__", None)
+    if context is not None and context is not cause:
+        add("context", f"{type(context).__name__}:{str(context) or repr(context)}")
+
+    out = ";".join(parts)
+    return _safe_text(out, max_len=max_len) or "no_exception_message"
+
+
+def _http_evidence_body_debug(body: Optional[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"body_present": bool(body)}
+    if not body:
+        return out
+
+    with contextlib.suppress(Exception):
+        body_bytes = body.encode("utf-8", errors="strict")
+        out["body_bytes"] = len(body_bytes)
+        out["body_sha256_16"] = hashlib.sha256(body_bytes).hexdigest()[:16]
+
+    with contextlib.suppress(Exception):
+        parsed = json.loads(body)
+        out["body_json_type"] = type(parsed).__name__
+        if isinstance(parsed, Mapping):
+            keys = [
+                _safe_text(k, max_len=64)
+                for k in parsed.keys()
+                if isinstance(k, str) and _safe_text(k, max_len=64)
+            ]
+            out["body_top_keys"] = keys[:32]
+            out["service_forbidden_like_top_keys"] = [
+                k for k in keys if _receipt_key_forbidden(k)
+            ][:16]
+
+    return out
+
+
+def _http_evidence_commit_diagnostic(
+    *,
+    artifact: _ReceiptArtifact,
+    receipt_ref_eff: Optional[str],
+    audit_ref_eff: Optional[str],
+    chain_namespace: str,
+    chain_id: str,
+    prev_chain_head: Optional[str],
+    prev_chain_seq: Optional[int],
+    env_kwargs: Mapping[str, Any],
+    env_filtered_keys: Sequence[str],
+    max_len: int = 768,
+) -> str:
+    payload: Dict[str, Any] = {
+        "receipt_ref": receipt_ref_eff,
+        "audit_ref": audit_ref_eff,
+        "head": artifact.head,
+        "body_digest": artifact.body_digest,
+        "has_sig": bool(artifact.sig),
+        "has_verify_key": bool(artifact.verify_key),
+        "verify_key_id": artifact.verify_key_id,
+        "verify_key_fp": artifact.verify_key_fp,
+        "chain_namespace": chain_namespace,
+        "chain_id": chain_id,
+        "prev_chain_head": prev_chain_head,
+        "prev_chain_seq": prev_chain_seq,
+        "requested_chain_seq": env_kwargs.get("chain_seq"),
+        "env_filtered_keys": list(env_filtered_keys)[:80],
+    }
+    payload.update(_http_evidence_body_debug(artifact.body))
+
+    with contextlib.suppress(Exception):
+        return _safe_text(
+            json.dumps(
+                _stable_jsonable(payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            max_len=max_len,
+        )
+
+    return _safe_text(payload, max_len=max_len)
+
+@dataclass(frozen=True)
+class _ReceiptEvidenceCommit:
+    receipt_ref: str
+    audit_ref: Optional[str]
+    ledger_ref: Optional[str]
+    commit_ref: Optional[str]
+    chain_namespace: Optional[str]
+    chain_id: Optional[str]
+    chain_seq: Optional[int]
+    chain_head: Optional[str]
+    store_backend: str
+    store_id: Optional[int]
+    stored: bool
+    idempotent: bool
+
+
+@dataclass
+class _ReceiptEvidenceStore:
+    """
+    Durable evidence store for service_http-local receipts.
+
+    This is intentionally separate from _ReceiptArtifactStore:
+      - _ReceiptArtifactStore is receipt_ref -> verification material lookup.
+      - _ReceiptEvidenceStore is governed receipt evidence persistence / chain commit.
+
+    It only marks evidence durable when the configured backend is persistent sqlite,
+    never merely because receipt_ref lookup exists.
+    """
+
+    dsn: Optional[str] = None
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _store: Optional[Any] = field(default=None, init=False, repr=False)
+    _backend: str = field(default="none", init=False)
+    _error: Optional[str] = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        dsn = self._normalize_dsn(self.dsn)
+        if not dsn:
+            return
+
+        if _make_receipt_store is None or _StorageReceiptEnvelope is None:
+            self._error = "storage_receipt_store_unavailable"
+            _LOG.error("Durable evidence store requested but tcd.storage receipt store is unavailable")
+            return
+
+        path = dsn[len("sqlite:///") :] if dsn.lower().startswith("sqlite:///") else ""
+        if path and path not in {":memory:", ""}:
+            with contextlib.suppress(Exception):
+                os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+
+        try:
+            storage_cfg = None
+            if _StorageConfig is not None:
+                from_env = getattr(_StorageConfig, "from_env", None)
+                if callable(from_env):
+                    with contextlib.suppress(Exception):
+                        storage_cfg = from_env()
+                if storage_cfg is None:
+                    with contextlib.suppress(Exception):
+                        storage_cfg = _StorageConfig()
+            storage_cfg = _http_evidence_storage_config_compat(storage_cfg)
+            self._store = _make_receipt_store(dsn, config=storage_cfg) if storage_cfg is not None else _make_receipt_store(dsn)
+            with contextlib.suppress(Exception):
+                stats = self._store.stats()
+                if isinstance(stats, Mapping):
+                    self._backend = _safe_text(stats.get("backend"), max_len=64) or "configured"
+        except Exception as e:
+            self._store = None
+            self._backend = "none"
+            self._error = f"evidence_store_init_failed:{type(e).__name__}"
+            _LOG.exception("Durable evidence store initialization failed")
+
+    def _normalize_dsn(self, dsn: Optional[str]) -> Optional[str]:
+        raw = _opaque_handle(dsn, max_len=4096)
+        if not raw:
+            return None
+        low = raw.lower()
+        if low in {"none", "disabled", "off", "false", "0", "mem://", "memory"}:
+            return None
+        if low.startswith("sqlite:///"):
+            return raw
+        if low.startswith("sqlite://"):
+            self._error = "unsupported_evidence_store_dsn"
+            return None
+        return "sqlite:///" + os.path.abspath(raw)
+
+    def enabled(self) -> bool:
+        return self._store is not None
+
+    def backend(self) -> str:
+        if self._store is None:
+            return "none"
+        with contextlib.suppress(Exception):
+            stats = self._store.stats()
+            if isinstance(stats, Mapping):
+                return _safe_text(stats.get("backend"), max_len=64) or self._backend or "configured"
+        return self._backend or "configured"
+
+    def durable_enabled(self) -> bool:
+        if self._store is None:
+            return False
+        with contextlib.suppress(Exception):
+            stats = self._store.stats()
+            if not isinstance(stats, Mapping):
+                return False
+            backend = _safe_text(stats.get("backend"), max_len=64)
+            db_path = _safe_text(stats.get("db_path"), max_len=4096)
+            return bool(backend == "sqlite" and db_path and db_path != ":memory:")
+        return False
+
+    def verify_window(
+        self,
+        *,
+        head_hex: Optional[str] = None,
+        chain_namespace: Optional[str] = None,
+        chain_id: Optional[str] = None,
+        limit: int = 100,
+        expected_latest_chain_head: Optional[str] = None,
+        expected_ledger_ref: Optional[str] = None,
+        expected_commit_ref: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        ns = _safe_id(
+            chain_namespace or os.getenv("TCD_HTTP_EVIDENCE_CHAIN_NAMESPACE"),
+            default=None,
+            max_len=128,
+        ) or "service_http"
+        cid = _safe_id(
+            chain_id or os.getenv("TCD_HTTP_EVIDENCE_CHAIN_ID"),
+            default=None,
+            max_len=128,
+        ) or "receipts"
+
+        expected_latest = _first_text(expected_latest_chain_head, expected_ledger_ref, expected_commit_ref, max_len=512)
+        expected_ledger = _first_text(expected_ledger_ref, max_len=512)
+        expected_commit = _first_text(expected_commit_ref, max_len=512)
+        lim = max(1, min(100000, int(limit)))
+
+        if self._store is None:
+            return {
+                "ok": False,
+                "reason": "evidence_store_unavailable",
+                "chain_namespace": ns,
+                "chain_id": cid,
+                "expected_latest_chain_head_hex": expected_latest,
+                "latest_chain_head_hex": None,
+                "integrity_ok": False,
+                "reasons": ["evidence_store_unavailable"],
+            }
+
+        verify_fn = getattr(self._store, "verify_window", None)
+        if not callable(verify_fn):
+            return {
+                "ok": False,
+                "reason": "evidence_store_verify_window_unavailable",
+                "chain_namespace": ns,
+                "chain_id": cid,
+                "expected_latest_chain_head_hex": expected_latest,
+                "latest_chain_head_hex": None,
+                "integrity_ok": False,
+                "reasons": ["evidence_store_verify_window_unavailable"],
+            }
+
+        try:
+            with self._lock:
+                try:
+                    report = verify_fn(
+                        head_hex=head_hex,
+                        chain_namespace=ns,
+                        chain_id=cid,
+                        limit=lim,
+                        expected_latest_chain_head_hex=expected_latest,
+                    )
+                except TypeError:
+                    report = verify_fn(
+                        head_hex=head_hex,
+                        chain_namespace=ns,
+                        chain_id=cid,
+                        limit=lim,
+                    )
+            self._error = None
+        except Exception as e:
+            detail = _exception_diagnostic_text(e, max_len=512)
+            self._error = _safe_text(
+                f"evidence_store_verify_window_failed:{type(e).__name__}:{detail}",
+                max_len=1024,
+            )
+            return {
+                "ok": False,
+                "reason": "evidence_store_verify_window_failed",
+                "chain_namespace": ns,
+                "chain_id": cid,
+                "expected_latest_chain_head_hex": expected_latest,
+                "latest_chain_head_hex": None,
+                "integrity_ok": False,
+                "reasons": [self._error],
+            }
+
+        out: Dict[str, Any] = {}
+        if isinstance(report, Mapping):
+            out = dict(report)
+        elif hasattr(report, "to_dict"):
+            with contextlib.suppress(Exception):
+                out = dict(report.to_dict())
+        elif dataclasses.is_dataclass(report):
+            with contextlib.suppress(Exception):
+                out = dataclasses.asdict(report)
+        else:
+            out = {"ok": bool(report)}
+
+        latest = _first_text(out.get("latest_chain_head_hex"), max_len=512)
+        reasons = _normalize_text_list(out.get("reasons"), max_items=128, max_len=256)
+        ok = bool(out.get("ok", False))
+
+        out["expected_latest_chain_head_hex"] = expected_latest
+        out["expected_ledger_ref"] = expected_ledger
+        out["expected_commit_ref"] = expected_commit
+
+        if expected_latest:
+            latest_match = bool(latest and hmac.compare_digest(latest, expected_latest))
+            out["latest_matches_expected"] = latest_match
+            if not latest_match:
+                ok = False
+                if "latest_chain_head_mismatch" not in reasons:
+                    reasons.append("latest_chain_head_mismatch")
+
+        if expected_ledger:
+            ledger_match = bool(latest and hmac.compare_digest(latest, expected_ledger))
+            out["latest_matches_ledger_ref"] = ledger_match
+            if not ledger_match:
+                ok = False
+                if "ledger_ref_mismatch" not in reasons:
+                    reasons.append("ledger_ref_mismatch")
+
+        if expected_commit:
+            commit_match = bool(latest and hmac.compare_digest(latest, expected_commit))
+            out["latest_matches_commit_ref"] = commit_match
+            if not commit_match:
+                ok = False
+                if "commit_ref_mismatch" not in reasons:
+                    reasons.append("commit_ref_mismatch")
+
+        out["ok"] = bool(ok)
+        out["integrity_ok"] = bool(ok)
+        out["reasons"] = reasons
+        out["verify_input_source"] = "evidence_store_window"
+        return out
+
+
+    def error(self) -> Optional[str]:
+        return self._error
+
+    def _latest_chain_state(self, *, chain_namespace: str, chain_id: str) -> Tuple[Optional[str], Optional[int]]:
+        if self._store is None:
+            return None, None
+
+        latest_fn = getattr(self._store, "latest", None)
+        if not callable(latest_fn):
+            return None, None
+
+        rec = None
+        with contextlib.suppress(Exception):
+            rec = latest_fn(chain_namespace=chain_namespace, chain_id=chain_id)
+
+        if rec is None:
+            with contextlib.suppress(Exception):
+                rec = latest_fn()
+
+        if rec is None:
+            return None, None
+
+        rec_ns = _safe_text(getattr(rec, "chain_namespace", None), max_len=128)
+        rec_cid = _safe_text(getattr(rec, "chain_id", None), max_len=128)
+        if rec_ns and rec_ns != chain_namespace:
+            return None, None
+        if rec_cid and rec_cid != chain_id:
+            return None, None
+
+        chain_head = (
+            _safe_text(getattr(rec, "chain_head_hex", None), max_len=512)
+            or _safe_text(getattr(rec, "head_hex", None), max_len=512)
+            or None
+        )
+        chain_seq = _coerce_int(getattr(rec, "chain_seq", None))
+        return chain_head, chain_seq
+
+    def put_from_sources(
+        self,
+        *sources: Optional[Mapping[str, Any]],
+        event_id: Optional[str],
+        decision_id: Optional[str],
+        route_plan_id: Optional[str],
+        policy_ref: Optional[str],
+        policyset_ref: Optional[str],
+        cfg_fp: Optional[str],
+        audit_ref: Optional[str],
+        receipt_ref: Optional[str],
+    ) -> Optional[_ReceiptEvidenceCommit]:
+        if self._store is None or _StorageReceiptEnvelope is None:
+            return None
+
+        chain_namespace = (
+            _safe_id(os.getenv("TCD_HTTP_EVIDENCE_CHAIN_NAMESPACE"), default=None, max_len=128)
+            or "service_http"
+        )
+        chain_id = (
+            _safe_id(os.getenv("TCD_HTTP_EVIDENCE_CHAIN_ID"), default=None, max_len=128)
+            or "receipts"
+        )
+
+        for src in sources:
+            if not isinstance(src, Mapping) or not src:
+                continue
+
+            artifact = _receipt_artifact_from_mapping(src, include_verify_key=True)
+            if not (artifact.head and artifact.body):
+                continue
+
+            receipt_ref_eff = _first_text(
+                artifact.receipt_ref,
+                receipt_ref,
+                artifact.head,
+                max_len=512,
+            ) or artifact.head
+            audit_ref_eff = _first_text(
+                artifact.audit_ref,
+                audit_ref,
+                max_len=512,
+            )
+
+            prev_chain_head: Optional[str] = None
+            prev_chain_seq: Optional[int] = None
+            env_kwargs: Dict[str, Any] = {}
+            env_filtered_keys: Tuple[str, ...] = tuple()
+
+            try:
+                with self._lock:
+                    prev_chain_head, prev_chain_seq = self._latest_chain_state(
+                        chain_namespace=chain_namespace,
+                        chain_id=chain_id,
+                    )
+
+                    env_kwargs = {
+                        "head_hex": artifact.head,
+                        "body_json": artifact.body,
+                        "head_semantics": "external_receipt_passthrough",
+                        "sig": artifact.sig,
+                        "verify_key": artifact.verify_key,
+                        "verify_key_fp": artifact.verify_key_fp,
+                        "verify_key_id": artifact.verify_key_id,
+                        "receipt_integrity": artifact.receipt_integrity,
+                        "schema": _first_text(src.get("schema"), max_len=128),
+                        "receipt_kind": _first_text(src.get("receipt_kind"), max_len=128),
+                        "event_type": _first_text(src.get("event_type"), max_len=128) or "service_http.final_decision",
+                        "body_kind": artifact.body_kind or "canonical_json",
+                        "body_digest": artifact.body_digest,
+                        "policy_ref": artifact.policy_ref or policy_ref,
+                        "policyset_ref": artifact.policyset_ref or policyset_ref,
+                        "policy_digest": _first_text(src.get("policy_digest"), max_len=256),
+                        "cfg_fp": artifact.cfg_fp or cfg_fp,
+                        "state_domain_id": _first_text(src.get("state_domain_id"), max_len=256),
+                        "adapter_registry_fp": _first_text(src.get("adapter_registry_fp"), max_len=256),
+                        "request_id": _first_text(
+                            src.get("request_id"),
+                            src.get("meta", {}).get("request_id") if isinstance(src.get("meta"), Mapping) else None,
+                            max_len=256,
+                        ),
+                        "event_id": artifact.event_id or event_id,
+                        "decision_id": artifact.decision_id or decision_id,
+                        "route_plan_id": artifact.route_plan_id or route_plan_id,
+                        "route_id": artifact.route_plan_id or route_plan_id,
+                        "audit_ref": audit_ref_eff,
+                        "receipt_ref": receipt_ref_eff,
+                        "chain_namespace": chain_namespace,
+                        "chain_id": chain_id,
+                        "prev_head_hex": prev_chain_head,
+                        "chain_seq": (prev_chain_seq + 1) if prev_chain_seq is not None else None,
+                        "ledger_stage": "committed",
+                        "outbox_status": "none",
+                        "produced_by": ("service_http.local_evidence_store",),
+                        "meta": {
+                            "chain_append_mode": "latest",
+                            "storage_purpose": "receipt_evidence",
+                            "source": "service_http",
+                            "receipt_surface_kind": "durable_committed",
+                            "receipt_delivery_state": "committed",
+                            "evidence_durable": True,
+                            "evidence_storage_ready": True,
+                            "governance_terminal": True,
+                            "receipt_governance_ready": True,
+                        },
+                    }
+
+                    env_filtered = _filtered_kwargs_for(_StorageReceiptEnvelope, env_kwargs)
+                    env_filtered_keys = tuple(sorted(env_filtered.keys()))
+                    env = _StorageReceiptEnvelope(**env_filtered)
+
+                    put_result = self._store.put_receipt(env)
+                    self._error = None
+
+                chain_head = _safe_text(getattr(put_result, "chain_head_hex", None), max_len=512) or None
+                store_backend = _safe_text(getattr(put_result, "store_backend", None), max_len=64) or self.backend()
+                store_id = _coerce_int(getattr(put_result, "store_id", None))
+
+                return _ReceiptEvidenceCommit(
+                    receipt_ref=receipt_ref_eff,
+                    audit_ref=audit_ref_eff,
+                    ledger_ref=chain_head,
+                    commit_ref=chain_head,
+                    chain_namespace=chain_namespace,
+                    chain_id=chain_id,
+                    chain_seq=_coerce_int(getattr(put_result, "chain_seq", None)),
+                    chain_head=chain_head,
+                    store_backend=store_backend,
+                    store_id=store_id,
+                    stored=bool(getattr(put_result, "stored", False)),
+                    idempotent=bool(getattr(put_result, "idempotent", False)),
+                )
+            except Exception as e:
+                detail = _exception_diagnostic_text(e, max_len=512)
+                commit_diag = _http_evidence_commit_diagnostic(
+                    artifact=artifact,
+                    receipt_ref_eff=receipt_ref_eff,
+                    audit_ref_eff=audit_ref_eff,
+                    chain_namespace=chain_namespace,
+                    chain_id=chain_id,
+                    prev_chain_head=prev_chain_head,
+                    prev_chain_seq=prev_chain_seq,
+                    env_kwargs=env_kwargs,
+                    env_filtered_keys=env_filtered_keys,
+                    max_len=768,
+                )
+                self._error = _safe_text(
+                    f"evidence_store_commit_failed:{type(e).__name__}:{detail};commit={commit_diag}",
+                    max_len=2048,
+                )
+                _LOG.exception(
+                    "Durable evidence store commit failed type=%s detail=%s commit=%s receipt_ref=%s head=%s chain_namespace=%s chain_id=%s",
+                    type(e).__name__,
+                    detail,
+                    commit_diag,
+                    receipt_ref_eff,
+                    artifact.head,
+                    chain_namespace,
+                    chain_id,
+                )
+                return None
+
+        return None
+
+
+@dataclass
+class _DiagnoseIdempotencyRecord:
+    fingerprint: str
+    event_id: str
+    created_at_unix_ns: int
+    updated_at_unix_ns: int
+    response: Optional[Dict[str, Any]] = None
+    in_progress: bool = True
+
+
+class _DiagnoseIdempotencyStore:
+    """
+    Process-local /diagnose idempotency gate.
+
+    Scope:
+      - prevents repeated HTTP retries from re-running detector / multivar /
+        e-process / router / receipt issuance once the same idempotency identity
+        has been seen.
+      - detects same Idempotency-Key with different request fingerprint.
+      - suppresses concurrent duplicate retries by waiting briefly for the owner.
+    """
+
+    def __init__(self, *, capacity: int = 4096, ttl_s: float = 86400.0, wait_ms: float = 5000.0) -> None:
+        self.capacity = max(0, int(capacity or 0))
+        self.ttl_ns = int(max(1.0, float(ttl_s or 1.0)) * 1_000_000_000.0)
+        self.wait_ms = max(0.0, float(wait_ms or 0.0))
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+        self._items: "OrderedDict[str, _DiagnoseIdempotencyRecord]" = OrderedDict()
+
+    def _evict_locked(self, now_ns: int) -> None:
+        if self.capacity <= 0:
+            self._items.clear()
+            return
+        expired: List[str] = []
+        for key, rec in self._items.items():
+            if not rec.in_progress and (now_ns - rec.updated_at_unix_ns) > self.ttl_ns:
+                expired.append(key)
+        for key in expired:
+            self._items.pop(key, None)
+        while len(self._items) > self.capacity:
+            self._items.popitem(last=False)
+
+    def begin(self, key: str, fingerprint: str, event_id: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        if self.capacity <= 0:
+            return "owner", None
+        now_ns = time.time_ns()
+        with self._cv:
+            self._evict_locked(now_ns)
+            rec = self._items.get(key)
+            if rec is not None:
+                if rec.fingerprint != fingerprint:
+                    return "conflict", None
+                self._items.move_to_end(key, last=True)
+                if rec.response is not None:
+                    return "cached", copy.deepcopy(rec.response)
+                if rec.in_progress:
+                    return "in_progress", None
+            self._items[key] = _DiagnoseIdempotencyRecord(
+                fingerprint=fingerprint,
+                event_id=event_id,
+                created_at_unix_ns=now_ns,
+                updated_at_unix_ns=now_ns,
+                response=None,
+                in_progress=True,
+            )
+            self._evict_locked(now_ns)
+            return "owner", None
+
+    def wait(self, key: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+        if self.capacity <= 0 or self.wait_ms <= 0.0:
+            return None
+        deadline = time.monotonic() + (self.wait_ms / 1000.0)
+        with self._cv:
+            while True:
+                rec = self._items.get(key)
+                if rec is None or rec.fingerprint != fingerprint:
+                    return None
+                if rec.response is not None:
+                    self._items.move_to_end(key, last=True)
+                    return copy.deepcopy(rec.response)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._cv.wait(timeout=remaining)
+
+    def commit(self, key: str, fingerprint: str, response: Mapping[str, Any]) -> None:
+        if self.capacity <= 0:
+            return
+        now_ns = time.time_ns()
+        with self._cv:
+            rec = self._items.get(key)
+            payload = copy.deepcopy(dict(response))
+            if rec is None:
+                rec = _DiagnoseIdempotencyRecord(
+                    fingerprint=fingerprint,
+                    event_id=_safe_text(payload.get("event_id"), max_len=128) or "",
+                    created_at_unix_ns=now_ns,
+                    updated_at_unix_ns=now_ns,
+                    response=payload,
+                    in_progress=False,
+                )
+                self._items[key] = rec
+            elif rec.fingerprint == fingerprint:
+                rec.response = payload
+                rec.in_progress = False
+                rec.updated_at_unix_ns = now_ns
+                self._items.move_to_end(key, last=True)
+            self._evict_locked(now_ns)
+            self._cv.notify_all()
+
+    def abort(self, key: str, fingerprint: str) -> None:
+        if self.capacity <= 0:
+            return
+        with self._cv:
+            rec = self._items.get(key)
+            if rec is not None and rec.fingerprint == fingerprint and rec.in_progress and rec.response is None:
+                self._items.pop(key, None)
+            self._cv.notify_all()
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._items)
 
 @dataclass(frozen=True)
 class _CompatDetectRequest:
@@ -2898,6 +4226,10 @@ class RiskResponse(_Model):
     policy_ref: Optional[str] = None
     policyset_ref: Optional[str] = None
     config_fingerprint: Optional[str] = None
+    config_fingerprint_kind: Optional[str] = None
+    service_config_fingerprint: Optional[str] = None
+    route_config_fingerprint: Optional[str] = None
+    receipt_cfg_fp: Optional[str] = None
     bundle_version: Optional[int] = None
     state_domain_id: Optional[str] = None
     controller_mode: Optional[str] = None
@@ -2917,6 +4249,8 @@ class RiskResponse(_Model):
     threat_kind: Optional[str] = None
     pq_required: Optional[bool] = None
     pq_ok: Optional[bool] = None
+    pq_signature_required: Optional[bool] = None
+    pq_signature_ok: Optional[bool] = None
 
     receipt_public: Dict[str, Any] = Field(default_factory=dict)
     receipt_verification: Optional[Dict[str, Any]] = None
@@ -2942,6 +4276,10 @@ class RiskResponse(_Model):
         "policy_ref",
         "policyset_ref",
         "config_fingerprint",
+        "config_fingerprint_kind",
+        "service_config_fingerprint",
+        "route_config_fingerprint",
+        "receipt_cfg_fp",
         "state_domain_id",
         "controller_mode",
         "statistical_guarantee_scope",
@@ -2995,7 +4333,7 @@ class RiskResponse(_Model):
             return None
         return _sanitize_receipt_verification_surface(v)
 
-    @field_validator("verdict", "allowed", "pq_required", "pq_ok", mode="before")
+    @field_validator("verdict", "allowed", "pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok", mode="before")
     @classmethod
     def _bools(cls, v: Any) -> Any:
         if v is None:
@@ -3031,6 +4369,14 @@ class VerifyRequest(_Model):
     heads: Optional[List[str]] = None
     bodies: Optional[List[str]] = None
 
+    verify_storage_window: Optional[bool] = None
+    chain_namespace: Optional[str] = None
+    chain_id: Optional[str] = None
+    storage_window_limit: Optional[int] = None
+    expected_latest_chain_head: Optional[str] = None
+    expected_ledger_ref: Optional[str] = None
+    expected_commit_ref: Optional[str] = None
+
     pq_required: Optional[bool] = None
     require_signature: Optional[bool] = None
 
@@ -3038,6 +4384,9 @@ class VerifyRequest(_Model):
     expected_policyset_ref: Optional[str] = None
     expected_policy_digest: Optional[str] = None
     expected_cfg_fp: Optional[str] = None
+    expected_service_config_fingerprint: Optional[str] = None
+    expected_route_config_fingerprint: Optional[str] = None
+    expected_receipt_cfg_fp: Optional[str] = None
     expected_build_id: Optional[str] = None
     expected_image_digest: Optional[str] = None
 
@@ -3120,6 +4469,28 @@ class VerifyRequest(_Model):
             out.append(x)
         return out
 
+    @field_validator("chain_namespace", "chain_id", mode="before")
+    @classmethod
+    def _storage_chain_ids(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        return _safe_id(v, default=None, max_len=128)
+
+    @field_validator("expected_latest_chain_head", "expected_ledger_ref", "expected_commit_ref", mode="before")
+    @classmethod
+    def _storage_chain_refs(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        return _opaque_handle(v, max_len=512)
+
+    @field_validator("storage_window_limit", mode="before")
+    @classmethod
+    def _storage_window_limit(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        x = _coerce_int(v)
+        return None if x is None else int(x)
+
     @field_validator("witness_segments", mode="before")
     @classmethod
     def _wit(cls, v: Any) -> Any:
@@ -3139,6 +4510,9 @@ class VerifyRequest(_Model):
         "expected_policyset_ref",
         "expected_policy_digest",
         "expected_cfg_fp",
+        "expected_service_config_fingerprint",
+        "expected_route_config_fingerprint",
+        "expected_receipt_cfg_fp",
         "expected_build_id",
         "expected_image_digest",
         mode="before",
@@ -3573,13 +4947,56 @@ class ReceiptManager:
         artifacts: Mapping[str, Any],
         evidence_identity: Mapping[str, Any],
         pq_ok: Optional[bool],
+        build_id: Optional[str] = None,
+        image_digest: Optional[str] = None,
+        detector_policy_digest: Optional[str] = None,
+        route_policy_digest: Optional[str] = None,
+        security_policy_digest: Optional[str] = None,
     ) -> ReceiptBundle:
         if self.attestor is None:
             return ReceiptBundle(raw={}, public={}, verification=None, self_check_ok=None)
 
-        _LOG.error("RECEIPT STAGE 1 before array_digest request_id=%s", request_id)
+        policy_digest_eff = _safe_text(policy_digest, max_len=256) or None
+        detector_policy_digest_eff = _safe_text(detector_policy_digest, max_len=256) or None
+        security_policy_digest_eff = _safe_text(security_policy_digest, max_len=256) or policy_digest_eff
+        route_policy_digest_eff = _safe_text(route_policy_digest, max_len=256) or security_policy_digest_eff
+        effective_build_id = _safe_text(build_id, max_len=128) or _safe_text(req.build_id, max_len=128) or None
+        effective_image_digest = _safe_text(image_digest, max_len=256) or _safe_text(req.image_digest, max_len=256) or None
+        pq_required_eff = _coerce_optional_bool(req.pq_required)
+        pq_signature_required_eff = bool(pq_required_eff) if pq_required_eff is not None else None
+        pq_signature_ok_eff = None
+        if pq_signature_required_eff is True:
+            pq_signature_ok_eff = bool(_receipt_hmac_signer_from_env() is not None)
+        pq_ok_eff = _coerce_optional_bool(pq_ok)
+        if pq_ok_eff is None and pq_required_eff is True:
+            pq_ok_eff = bool(pq_signature_ok_eff)
+
+        _LOG.debug("RECEIPT STAGE 1 before array_digest request_id=%s", request_id)
         array_digest = _compute_array_digest(trace, spectrum, features, alg=self.hash_alg)
-        _LOG.error("RECEIPT STAGE 2 after array_digest request_id=%s", request_id)
+        _LOG.debug("RECEIPT STAGE 2 after array_digest request_id=%s", request_id)
+
+        artifacts_map = dict(artifacts) if isinstance(artifacts, Mapping) else {}
+        commit_receipt_mode = bool(_coerce_bool(artifacts_map.get("commit_receipt_mode"), default=False))
+
+        # Local fallback receipts are valid attestation receipts, but they are not
+        # durable governance-committed receipt surfaces. Keep local runtime
+        # delivery annotations out of the signed receipt body; strict verification
+        # treats placeholder values such as "local_attestation" /
+        # "ephemeral_attestation" as invalid governance paths.
+        receipt_artifacts_map = dict(artifacts_map)
+        receipt_evidence_identity_map = dict(evidence_identity) if isinstance(evidence_identity, Mapping) else {}
+        if not commit_receipt_mode:
+            for _k in (
+                "receipt_surface_kind",
+                "receipt_delivery_state",
+                "durability",
+                "evidence_durable",
+                "evidence_storage_ready",
+                "governance_terminal",
+                "receipt_governance_ready",
+            ):
+                receipt_artifacts_map.pop(_k, None)
+                receipt_evidence_identity_map.pop(_k, None)
 
         meta_v2 = build_v2_body(
             model_hash=f"unknown:{req.model_id}",
@@ -3607,6 +5024,30 @@ class ReceiptManager:
             },
         )
 
+        if commit_receipt_mode:
+            meta_v2 = build_commit_v2_body(
+                decision_receipt_ref=artifacts_map.get("decision_receipt_ref"),
+                decision_receipt_head=artifacts_map.get("decision_receipt_head"),
+                decision_receipt_body_digest=artifacts_map.get("decision_receipt_body_digest"),
+                ledger_ref=artifacts_map.get("ledger_ref"),
+                commit_ref=artifacts_map.get("commit_ref"),
+                chain_namespace=artifacts_map.get("chain_namespace"),
+                chain_id=artifacts_map.get("chain_id"),
+                chain_seq=_coerce_int(artifacts_map.get("chain_seq")),
+                audit_ref=artifacts_map.get("audit_ref") or audit_ref,
+                receipt_ref=None,
+                event_id=event_id,
+                decision_id=decision_id,
+                route_plan_id=route_plan_id,
+                evidence_durable=True,
+                evidence_storage_ready=True,
+                ledger_stage="committed",
+                receipt_delivery_state="committed",
+                receipt_surface_kind="durable_committed",
+                governance_terminal=True,
+                receipt_governance_ready=True,
+            )
+
         req_obj = {
             "ts_ns": time.time_ns(),
             "request_id": request_id,
@@ -3622,11 +5063,27 @@ class ReceiptManager:
             "route_profile": req.route_profile,
             "risk_label": req.risk_label,
             "threat_kind": req.threat_kind,
-            "pq_required": req.pq_required,
+            "pq_required": pq_required_eff,
+            "build_id": effective_build_id,
+            "image_digest": effective_image_digest,
             "context": _safe_receipt_context_subset(req.context),
             "tokens_delta": int(req.tokens_delta),
             "body_digest": body_digest,
         }
+
+        security_block_map = dict(security_block) if isinstance(security_block, Mapping) else {}
+        if effective_build_id and not _safe_text(security_block_map.get("build_id"), max_len=128):
+            security_block_map["build_id"] = effective_build_id
+        if effective_image_digest and not _safe_text(security_block_map.get("image_digest"), max_len=256):
+            security_block_map["image_digest"] = effective_image_digest
+        if pq_required_eff is not None and _coerce_optional_bool(security_block_map.get("pq_required")) is None:
+            security_block_map["pq_required"] = pq_required_eff
+        if pq_ok_eff is not None and _coerce_optional_bool(security_block_map.get("pq_ok")) is None:
+            security_block_map["pq_ok"] = pq_ok_eff
+        if pq_signature_required_eff is not None and _coerce_optional_bool(security_block_map.get("pq_signature_required")) is None:
+            security_block_map["pq_signature_required"] = pq_signature_required_eff
+        if pq_signature_ok_eff is not None and _coerce_optional_bool(security_block_map.get("pq_signature_ok")) is None:
+            security_block_map["pq_signature_ok"] = pq_signature_ok_eff
 
         comp_obj = {
             "score": float(score),
@@ -3641,15 +5098,28 @@ class ReceiptManager:
             "policy_ref": policy_ref,
             "policyset_ref": policyset_ref,
             "cfg_fp": cfg_fp,
-            "policy_digest": policy_digest,
+            "build_id": effective_build_id,
+            "image_digest": effective_image_digest,
+            "pq_required": pq_required_eff,
+            "pq_ok": pq_ok_eff,
+            "pq_signature_required": pq_signature_required_eff,
+            "pq_signature_ok": pq_signature_ok_eff,
+            "policy_digest": policy_digest_eff,
+            "security_policy_digest": security_policy_digest_eff,
+            "route_policy_digest": route_policy_digest_eff,
+            "detector_policy_digest": detector_policy_digest_eff,
             "audit_ref": audit_ref,
             "route": dict(route_info),
-            "security": dict(security_block),
-            "artifacts": dict(artifacts),
-            "evidence_identity": dict(evidence_identity),
+            "security": dict(security_block_map),
+            "artifacts": dict(receipt_artifacts_map),
+            "evidence_identity": dict(receipt_evidence_identity_map),
             "detector": _receipt_safe_detector_components(detector_components),
             "multivariate": _sanitize_json_mapping(dict(mv_info), max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
         }
+
+        if commit_receipt_mode:
+            comp_obj["receipt_kind"] = "commit_receipt"
+            comp_obj["event_type"] = "service_http.receipt_commit"
 
         e_obj = {
             "e_value": budget.e_value,
@@ -3662,6 +5132,10 @@ class ReceiptManager:
             "statistical_guarantee_scope": budget.statistical_guarantee_scope,
             "state_domain_id": budget.state_domain_id,
             "adapter_registry_fp": budget.adapter_registry_fp,
+            "pq_required": pq_required_eff,
+            "pq_ok": pq_ok_eff,
+            "pq_signature_required": pq_signature_required_eff,
+            "pq_signature_ok": pq_signature_ok_eff,
         }
 
         witness_segments = [
@@ -3682,17 +5156,57 @@ class ReceiptManager:
                 "meta": {"decision_id": decision_id, "policy_ref": policy_ref},
             },
         ]
-        if policy_digest:
+        if policy_digest_eff:
             witness_segments.append(
                 {
                     "kind": "external",
                     "id": "policy_digest",
-                    "digest": policy_digest,
+                    "digest": policy_digest_eff,
+                    "meta": {"policy_ref": policy_ref, "policyset_ref": policyset_ref},
+                }
+            )
+        if detector_policy_digest_eff:
+            witness_segments.append(
+                {
+                    "kind": "external",
+                    "id": "detector_policy_digest",
+                    "digest": detector_policy_digest_eff,
                     "meta": {"policy_ref": policy_ref, "policyset_ref": policyset_ref},
                 }
             )
 
+        if commit_receipt_mode:
+            decision_receipt_head = _first_text(artifacts_map.get("decision_receipt_head"), max_len=256)
+            if decision_receipt_head:
+                witness_segments.append(
+                    {
+                        "kind": "receipt_head",
+                        "id": "decision_receipt",
+                        "digest": decision_receipt_head,
+                        "meta": {
+                            "decision_receipt_ref": artifacts_map.get("decision_receipt_ref"),
+                            "decision_receipt_body_digest": artifacts_map.get("decision_receipt_body_digest"),
+                        },
+                    }
+                )
+            evidence_commit_head = _first_text(artifacts_map.get("commit_ref"), artifacts_map.get("ledger_ref"), max_len=256)
+            if evidence_commit_head:
+                witness_segments.append(
+                    {
+                        "kind": "audit_ledger_head",
+                        "id": "evidence_commit",
+                        "digest": evidence_commit_head,
+                        "meta": {
+                            "chain_namespace": artifacts_map.get("chain_namespace"),
+                            "chain_id": artifacts_map.get("chain_id"),
+                            "chain_seq": artifacts_map.get("chain_seq"),
+                        },
+                    }
+                )
+
         witness_tags = ["service_http", required_action, final_action]
+        if commit_receipt_mode:
+            witness_tags.append("commit_receipt")
 
         issue_fn = getattr(self.attestor, "issue", None)
         if not callable(issue_fn):
@@ -3706,21 +5220,31 @@ class ReceiptManager:
             "witness_tags": witness_tags,
             "meta": {
                 **meta_v2,
-                "event_type": "service_http.final_decision",
+                "event_type": "service_http.receipt_commit" if commit_receipt_mode else "service_http.final_decision",
+                "receipt_kind": "commit_receipt" if commit_receipt_mode else None,
                 "event_id": event_id,
                 "request_id": request_id,
                 "decision_id": decision_id,
                 "route_plan_id": route_plan_id,
                 "policy_ref": policy_ref,
                 "policyset_ref": policyset_ref,
-                "policy_digest": policy_digest,
+                "policy_digest": policy_digest_eff,
+                "security_policy_digest": security_policy_digest_eff,
+                "route_policy_digest": route_policy_digest_eff,
+                "detector_policy_digest": detector_policy_digest_eff,
                 "config_fingerprint": cfg_fp,
+                "build_id": effective_build_id,
+                "image_digest": effective_image_digest,
+                "pq_required": pq_required_eff,
+                "pq_ok": pq_ok_eff,
+                "pq_signature_required": pq_signature_required_eff,
+                "pq_signature_ok": pq_signature_ok_eff,
                 "audit_ref": audit_ref,
             },
         }
 
         issue_kwargs = _filtered_kwargs_for(issue_fn, kwargs)
-        _LOG.error(
+        _LOG.debug(
             "RECEIPT STAGE 3 before attestor.issue request_id=%s timeout_ms=%s",
             request_id,
             self.receipt_issue_timeout_ms,
@@ -3754,7 +5278,7 @@ class ReceiptManager:
                 self_check_ok=False,
             )
 
-        _LOG.error(
+        _LOG.debug(
             "RECEIPT STAGE 4 after attestor.issue request_id=%s raw_type=%s",
             request_id,
             type(raw).__name__,
@@ -3805,7 +5329,17 @@ class ReceiptManager:
         verify_key_id_raw = raw_artifact.verify_key_id
         verify_key_fp_raw = raw_artifact.verify_key_fp
         receipt_ref = raw_artifact.receipt_ref or head
+        attestation_ref = raw_artifact.attestation_ref or raw_bundle.get("attestation_ref") or (f"attest:{receipt_ref}" if receipt_ref else None)
         receipt_integrity = raw_artifact.receipt_integrity
+
+        has_policy_binding_expectation = bool(
+            _safe_text(policy_ref, max_len=512)
+            or _safe_text(policyset_ref, max_len=512)
+            or _safe_text(policy_digest_eff, max_len=512)
+        )
+        expected_policy_ref_for_check = policy_ref if has_policy_binding_expectation else None
+        expected_policyset_ref_for_check = policyset_ref if has_policy_binding_expectation else None
+        expected_policy_digest_for_check = policy_digest_eff if has_policy_binding_expectation else None
 
         self_check_ok: Optional[bool] = None
         verify_report: Any = None
@@ -3821,15 +5355,17 @@ class ReceiptManager:
                     e_obj=e_obj,
                     witness_segments=witness_segments,
                     strict=True,
-                    expected_policy_ref=policy_ref,
-                    expected_policyset_ref=policyset_ref,
-                    expected_policy_digest=policy_digest,
+                    expected_policy_ref=expected_policy_ref_for_check,
+                    expected_policyset_ref=expected_policyset_ref_for_check,
+                    expected_policy_digest=expected_policy_digest_for_check,
                     expected_cfg_fp=cfg_fp,
-                    expected_build_id=req.build_id,
-                    expected_image_digest=req.image_digest,
+                    expected_build_id=effective_build_id,
+                    expected_image_digest=effective_image_digest,
+                    verify_sig_func=_receipt_hmac_verify_from_env(),
+                    require_signature=bool(_receipt_hmac_signer_from_env() is not None),
                 )
 
-            _LOG.error(
+            _LOG.debug(
                 "RECEIPT STAGE 5 before self verify request_id=%s timeout_ms=%s",
                 request_id,
                 self.receipt_self_check_timeout_ms,
@@ -3841,7 +5377,7 @@ class ReceiptManager:
             )
             if verify_ok:
                 self_check_ok = bool(_receipt_report_get(verify_report, "ok", False))
-                _LOG.error(
+                _LOG.debug(
                     "RECEIPT STAGE 6 after self verify request_id=%s ok=%s",
                     request_id,
                     self_check_ok,
@@ -3854,7 +5390,7 @@ class ReceiptManager:
                     verify_err,
                 )
         elif head and body:
-            _LOG.error(
+            _LOG.debug(
                 "RECEIPT STAGE 5 self verify skipped request_id=%s self_check_enabled=%s",
                 request_id,
                 self.receipt_self_check_enabled,
@@ -3865,8 +5401,8 @@ class ReceiptManager:
             "schema": raw_bundle.get("schema") or "tcd.receipt.http.v1",
             "schema_version": raw_bundle.get("schema_version"),
             "canonicalization_version": raw_bundle.get("canonicalization_version"),
-            "receipt_kind": raw_bundle.get("receipt_kind") or "inference_decision",
-            "event_type": raw_bundle.get("event_type") or "service_http.final_decision",
+            "receipt_kind": raw_bundle.get("receipt_kind") or ("commit_receipt" if commit_receipt_mode else "inference_decision"),
+            "event_type": raw_bundle.get("event_type") or ("service_http.receipt_commit" if commit_receipt_mode else "service_http.final_decision"),
 
             # Legacy aliases + ReceiptView-native aliases.
             "receipt": head,
@@ -3905,23 +5441,37 @@ class ReceiptManager:
             "route_plan_id": raw_bundle.get("route_plan_id") or route_plan_id,
             "policy_ref": raw_bundle.get("policy_ref") or policy_ref,
             "policyset_ref": raw_bundle.get("policyset_ref") or policyset_ref,
-            "policy_digest": raw_bundle.get("policy_digest") or policy_digest,
+            "policy_digest": raw_bundle.get("policy_digest") or policy_digest_eff,
+            "security_policy_digest": raw_bundle.get("security_policy_digest") or security_policy_digest_eff,
+            "route_policy_digest": raw_bundle.get("route_policy_digest") or route_policy_digest_eff,
+            "detector_policy_digest": raw_bundle.get("detector_policy_digest") or detector_policy_digest_eff,
+            "expected_policy_ref": expected_policy_ref_for_check,
+            "expected_policyset_ref": expected_policyset_ref_for_check,
+            "expected_policy_digest": expected_policy_digest_for_check,
             "cfg_fp": raw_bundle.get("cfg_fp") or cfg_fp,
             "config_hash": raw_bundle.get("config_hash"),
             "state_domain_id": raw_bundle.get("state_domain_id") or state_domain_id,
             "adapter_registry_fp": raw_bundle.get("adapter_registry_fp") or adapter_registry_fp,
-            "build_id": raw_bundle.get("build_id") or req.build_id,
-            "image_digest": raw_bundle.get("image_digest") or req.image_digest,
-            "pq_required": raw_bundle.get("pq_required") if raw_bundle.get("pq_required") is not None else req.pq_required,
-            "pq_ok": raw_bundle.get("pq_ok") if raw_bundle.get("pq_ok") is not None else pq_ok,
-            "pq_signature_required": _receipt_report_get(verify_report, "pq_signature_required", raw_bundle.get("pq_signature_required")),
-            "pq_signature_ok": _receipt_report_get(verify_report, "pq_signature_ok", raw_bundle.get("pq_signature_ok")),
+            "build_id": raw_bundle.get("build_id") or effective_build_id,
+            "image_digest": raw_bundle.get("image_digest") or effective_image_digest,
+            "pq_required": raw_bundle.get("pq_required") if raw_bundle.get("pq_required") is not None else pq_required_eff,
+            "pq_ok": raw_bundle.get("pq_ok") if raw_bundle.get("pq_ok") is not None else pq_ok_eff,
+            "pq_signature_required": _receipt_report_get(
+                verify_report,
+                "pq_signature_required",
+                raw_bundle.get("pq_signature_required") if raw_bundle.get("pq_signature_required") is not None else pq_signature_required_eff,
+            ),
+            "pq_signature_ok": _receipt_report_get(
+                verify_report,
+                "pq_signature_ok",
+                raw_bundle.get("pq_signature_ok") if raw_bundle.get("pq_signature_ok") is not None else pq_signature_ok_eff,
+            ),
 
-            "receipt_surface_kind": raw_bundle.get("receipt_surface_kind") or "ephemeral_attestation",
-            "receipt_delivery_state": raw_bundle.get("receipt_delivery_state") or "issued_only",
-            "evidence_durable": bool(raw_bundle.get("evidence_durable", False)),
-            "evidence_storage_ready": bool(raw_bundle.get("evidence_storage_ready", False)),
-            "ledger_stage": raw_bundle.get("ledger_stage") or "skipped",
+            "receipt_surface_kind": raw_bundle.get("receipt_surface_kind") or ("durable_committed" if commit_receipt_mode else None),
+            "receipt_delivery_state": raw_bundle.get("receipt_delivery_state") or ("committed" if commit_receipt_mode else None),
+            "evidence_durable": bool(raw_bundle.get("evidence_durable", False)) if commit_receipt_mode else None,
+            "evidence_storage_ready": bool(raw_bundle.get("evidence_storage_ready", False)) if commit_receipt_mode else None,
+            "ledger_stage": raw_bundle.get("ledger_stage") or ("committed" if commit_receipt_mode else "skipped"),
             "outbox_status": raw_bundle.get("outbox_status") or "none",
 
             "head_verified": _receipt_report_get(verify_report, "head_verified", raw_bundle.get("head_verified")),
@@ -3929,7 +5479,12 @@ class ReceiptManager:
             "integrity_hash_verified": _receipt_report_get(verify_report, "integrity_hash_verified", raw_bundle.get("integrity_hash_verified")),
             "signature_verified": _receipt_report_get(verify_report, "signature_verified", raw_bundle.get("signature_verified")),
             "verify_key_allowed": _receipt_report_get(verify_report, "verify_key_allowed", raw_bundle.get("verify_key_allowed")),
-            "policy_binding_verified": _receipt_report_get(verify_report, "policy_binding_verified", raw_bundle.get("policy_binding_verified")),
+            "policy_binding_verified": _normalize_policy_binding_verified(
+                _receipt_report_get(verify_report, "policy_binding_verified", raw_bundle.get("policy_binding_verified")),
+                expected_policy_ref=expected_policy_ref_for_check,
+                expected_policyset_ref=expected_policyset_ref_for_check,
+                expected_policy_digest=expected_policy_digest_for_check,
+            ),
             "cfg_binding_verified": _receipt_report_get(verify_report, "cfg_binding_verified", raw_bundle.get("cfg_binding_verified")),
             "integrity_ok": bool(self_check_ok) if self_check_ok is not None else _coerce_bool(raw_bundle.get("integrity_ok"), default=True),
             "integrity_errors": _receipt_report_list(verify_report, "errors", "integrity_errors") or _normalize_text_list(raw_bundle.get("integrity_errors")),
@@ -3944,13 +5499,13 @@ class ReceiptManager:
             },
         }
 
-        _LOG.error("RECEIPT STAGE 7 before build surfaces request_id=%s", request_id)
+        _LOG.debug("RECEIPT STAGE 7 before build surfaces request_id=%s", request_id)
         public_view, verification_view = _build_receipt_surfaces(
             enriched,
             expose_verification_bundle_public=self.expose_verification_bundle_public,
             expose_verify_key_public=self.expose_verify_key_public,
         )
-        _LOG.error(
+        _LOG.debug(
             "RECEIPT STAGE 8 after build surfaces request_id=%s public_nonempty=%s verification_present=%s",
             request_id,
             bool(public_view),
@@ -4074,6 +5629,82 @@ class _AuthProjection:
         return out
 
 
+@dataclass(frozen=True)
+class _LocalAuthenticatorContext:
+    mode: str
+    principal: Optional[str] = None
+    scopes: Tuple[str, ...] = ()
+    key_id: Optional[str] = None
+    policy_digest: Optional[str] = None
+    authn_strength: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _LocalAuthenticatorResult:
+    ok: bool
+    ctx: Optional[_LocalAuthenticatorContext] = None
+    reason: Optional[str] = None
+
+
+class _LocalServiceTokenAuthenticator:
+    def __init__(self, cfg: ServiceHttpConfig, service_token: str) -> None:
+        self.cfg = cfg
+        self.service_token = service_token
+
+    def verify(self, request: Request) -> _LocalAuthenticatorResult:
+        token = _safe_text(request.headers.get("X-TCD-Service-Token"), max_len=4096)
+        principal = (
+            _safe_text(request.headers.get("X-TCD-Principal"), max_len=256)
+            or _safe_text(request.headers.get("X-TCD-Subject"), max_len=256)
+            or "service"
+        )
+        token_key_id = (
+            _safe_text(os.getenv("TCD_HTTP_SERVICE_TOKEN_KEY_ID"), max_len=128)
+            or self.cfg.service_token_env_var
+            or "service_token"
+        )
+
+        if self.service_token:
+            if token and len(token) == len(self.service_token) and hmac.compare_digest(token, self.service_token):
+                return _LocalAuthenticatorResult(
+                    ok=True,
+                    ctx=_LocalAuthenticatorContext(
+                        mode="service_token",
+                        principal=principal,
+                        scopes=("diagnose", "verify", "runtime"),
+                        key_id=token_key_id,
+                        authn_strength="shared_secret",
+                    ),
+                )
+            return _LocalAuthenticatorResult(ok=False, ctx=None, reason="service_token_required")
+
+        if self.cfg.allow_no_auth_local and _loopback_host(_client_host(request)):
+            return _LocalAuthenticatorResult(
+                ok=True,
+                ctx=_LocalAuthenticatorContext(
+                    mode="loopback_bypass",
+                    principal="loopback",
+                    scopes=("diagnose", "verify", "runtime"),
+                    key_id="loopback",
+                    authn_strength="loopback",
+                ),
+            )
+
+        if not self.cfg.require_service_token:
+            return _LocalAuthenticatorResult(
+                ok=True,
+                ctx=_LocalAuthenticatorContext(
+                    mode="disabled",
+                    principal=None,
+                    scopes=(),
+                    key_id=None,
+                    authn_strength="none",
+                ),
+            )
+
+        return _LocalAuthenticatorResult(ok=False, ctx=None, reason="authentication_required")
+
+
 class _HttpDetectorRuntime:
     def __init__(self) -> None:
         self._local = threading.local()
@@ -4115,6 +5746,8 @@ class _Runtime:
     detector_adapter: _HttpDetectorRuntime
     receipt_mgr: ReceiptManager
     receipt_store: _ReceiptArtifactStore
+    evidence_store: _ReceiptEvidenceStore
+    idempotency_store: _DiagnoseIdempotencyStore
     subject_policy_mgr: SubjectPolicyManager
     subject_limiters: SubjectLimiterPool
     edge_limiter: EdgeLimiter
@@ -4129,6 +5762,8 @@ class _Runtime:
             "schema": _SCHEMA,
             "api_version": self.bundle.config.api_version,
             "cfg_fp": self.bundle.cfg_fp,
+            "service_config_fingerprint": self.bundle.cfg_fp,
+            "config_fingerprint_kind": "service_http",
             "bundle_version": self.bundle.version,
             "bundle_updated_at_unix_ns": self.bundle.updated_at_unix_ns,
             "strict_mode": self.bundle.config.strict_mode,
@@ -4151,6 +5786,10 @@ class _Runtime:
             "receipt_ref_store_backend": self.receipt_store.backend(),
             "receipt_ref_store_memory_size": self.receipt_store.memory_size(),
             "receipt_ref_store_durable_size": self.receipt_store.durable_size(),
+            "evidence_store_enabled": self.evidence_store.enabled(),
+            "evidence_store_backend": self.evidence_store.backend(),
+            "evidence_store_durable": self.evidence_store.durable_enabled(),
+            "evidence_store_error": self.evidence_store.error(),
             "has_authenticator": self.authenticator is not None,
             "has_trust_runtime": bool(self.trust_wrapper.runtime),
             "build_id": self.bundle.config.build_id,
@@ -4242,6 +5881,12 @@ def create_http_runtime(
         with contextlib.suppress(Exception):
             authenticator = build_authenticator_from_env()
 
+    if authenticator is None and cfg_norm.enable_authenticator and _coerce_bool(os.getenv("TCD_HTTP_LOCAL_AUTHENTICATOR_FALLBACK_ENABLE"), default=True):
+        authenticator = _LocalServiceTokenAuthenticator(
+            cfg_norm,
+            (os.environ.get(cfg_norm.service_token_env_var) or "").strip(),
+        )
+
     trust_rt = trust_runtime
     if trust_rt is None and _HAS_TRUST_OS:
         with contextlib.suppress(Exception):
@@ -4289,7 +5934,10 @@ def create_http_runtime(
     sec_router = security_router
     if sec_router is None and policy_store is not None:
         compat_rate_limiter = subject_limiters._build(capacity=cfg_norm.subject_capacity, refill_per_s=cfg_norm.subject_refill_per_s)
-        security_router_attestor = attestor if _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_ATTESTOR_ENABLE"), default=False) else None
+        security_router_attestor = attestor if _coerce_bool(
+            os.getenv("TCD_SECURITY_ROUTER_ATTESTOR_ENABLE"),
+            default=_security_router_requested_from_env(cfg_norm),
+        ) else None
         sec_router = _build_security_router_compat(
             policy_store=policy_store,
             rate_limiter=compat_rate_limiter,
@@ -4297,6 +5945,8 @@ def create_http_runtime(
             detector_runtime=detector_adapter,
             strategy_router=router,
         )
+        if sec_router is None:
+            errors.append("security_router_requested_but_unavailable")
 
     return _Runtime(
         bundle=bundle,
@@ -4322,6 +5972,35 @@ def create_http_runtime(
                 os.getenv("TCD_HTTP_RECEIPT_REF_STORE_DSN")
                 or os.getenv("TCD_HTTP_RECEIPT_REF_STORE_PATH")
                 or None
+            ),
+        ),
+        evidence_store=_ReceiptEvidenceStore(
+            dsn=(
+                os.getenv("TCD_HTTP_EVIDENCE_STORE_DSN")
+                or os.getenv("TCD_HTTP_EVIDENCE_STORE_PATH")
+                or os.getenv("TCD_HTTP_RECEIPT_EVIDENCE_STORE_DSN")
+                or os.getenv("TCD_HTTP_RECEIPT_EVIDENCE_STORE_PATH")
+                or None
+            ),
+        ),
+        idempotency_store=_DiagnoseIdempotencyStore(
+            capacity=_clamp_int(
+                os.getenv("TCD_HTTP_IDEMPOTENCY_CACHE_CAPACITY"),
+                default=4096,
+                lo=0,
+                hi=100_000,
+            ),
+            ttl_s=_clamp_float(
+                os.getenv("TCD_HTTP_IDEMPOTENCY_CACHE_TTL_S"),
+                default=86400.0,
+                lo=1.0,
+                hi=7.0 * 86400.0,
+            ),
+            wait_ms=_clamp_float(
+                os.getenv("TCD_HTTP_IDEMPOTENCY_WAIT_MS"),
+                default=5000.0,
+                lo=0.0,
+                hi=60000.0,
             ),
         ),
         subject_policy_mgr=spm,
@@ -4481,6 +6160,10 @@ def create_app(
             "X-TCD-Event-Id",
             "X-TCD-Http-Version",
             "X-TCD-Config-Fingerprint",
+            "X-TCD-Service-Config-Fingerprint",
+            "X-TCD-Config-Fingerprint-Kind",
+            "X-TCD-Route-Config-Fingerprint",
+            "X-TCD-Receipt-Cfg-Fp",
             "X-TCD-Bundle-Version",
             "X-TCD-Decision-Id",
             "X-TCD-Route-Plan-Id",
@@ -4522,13 +6205,17 @@ def create_app(
                     content={
                         "detail": "headers too large",
                         "request_id": request_id,
+                        "service_config_fingerprint": rt.bundle.cfg_fp,
                         "config_fingerprint": rt.bundle.cfg_fp,
+                        "config_fingerprint_kind": "service_http",
                         "bundle_version": rt.bundle.version,
                     },
                     headers={
                         "X-Request-Id": request_id,
                         "X-TCD-Http-Version": cfgb.api_version,
+                        "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                         "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                        "X-TCD-Config-Fingerprint-Kind": "service_http",
                         "X-TCD-Bundle-Version": str(rt.bundle.version),
                     },
                 )
@@ -4549,13 +6236,17 @@ def create_app(
                         content={
                             "detail": "unsupported media type",
                             "request_id": request_id,
+                            "service_config_fingerprint": rt.bundle.cfg_fp,
                             "config_fingerprint": rt.bundle.cfg_fp,
+                            "config_fingerprint_kind": "service_http",
                             "bundle_version": rt.bundle.version,
                         },
                         headers={
                             "X-Request-Id": request_id,
                             "X-TCD-Http-Version": cfgb.api_version,
+                            "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                             "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                            "X-TCD-Config-Fingerprint-Kind": "service_http",
                             "X-TCD-Bundle-Version": str(rt.bundle.version),
                         },
                     )
@@ -4571,13 +6262,17 @@ def create_app(
                             content={
                                 "detail": "invalid content-length",
                                 "request_id": request_id,
+                                "service_config_fingerprint": rt.bundle.cfg_fp,
                                 "config_fingerprint": rt.bundle.cfg_fp,
+                                "config_fingerprint_kind": "service_http",
                                 "bundle_version": rt.bundle.version,
                             },
                             headers={
                                 "X-Request-Id": request_id,
                                 "X-TCD-Http-Version": cfgb.api_version,
+                                "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                                 "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                                "X-TCD-Config-Fingerprint-Kind": "service_http",
                                 "X-TCD-Bundle-Version": str(rt.bundle.version),
                             },
                         )
@@ -4588,13 +6283,17 @@ def create_app(
                             content={
                                 "detail": "body too large",
                                 "request_id": request_id,
+                                "service_config_fingerprint": rt.bundle.cfg_fp,
                                 "config_fingerprint": rt.bundle.cfg_fp,
+                                "config_fingerprint_kind": "service_http",
                                 "bundle_version": rt.bundle.version,
                             },
                             headers={
                                 "X-Request-Id": request_id,
                                 "X-TCD-Http-Version": cfgb.api_version,
+                                "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                                 "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                                "X-TCD-Config-Fingerprint-Kind": "service_http",
                                 "X-TCD-Bundle-Version": str(rt.bundle.version),
                             },
                         )
@@ -4607,13 +6306,17 @@ def create_app(
                         content={
                             "detail": "body too large",
                             "request_id": request_id,
+                            "service_config_fingerprint": rt.bundle.cfg_fp,
                             "config_fingerprint": rt.bundle.cfg_fp,
+                            "config_fingerprint_kind": "service_http",
                             "bundle_version": rt.bundle.version,
                         },
                         headers={
                             "X-Request-Id": request_id,
                             "X-TCD-Http-Version": cfgb.api_version,
+                            "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                             "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                            "X-TCD-Config-Fingerprint-Kind": "service_http",
                             "X-TCD-Bundle-Version": str(rt.bundle.version),
                         },
                     )
@@ -4624,13 +6327,17 @@ def create_app(
                         content={
                             "detail": "json too deep",
                             "request_id": request_id,
+                            "service_config_fingerprint": rt.bundle.cfg_fp,
                             "config_fingerprint": rt.bundle.cfg_fp,
+                            "config_fingerprint_kind": "service_http",
                             "bundle_version": rt.bundle.version,
                         },
                         headers={
                             "X-Request-Id": request_id,
                             "X-TCD-Http-Version": cfgb.api_version,
+                            "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                             "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                            "X-TCD-Config-Fingerprint-Kind": "service_http",
                             "X-TCD-Bundle-Version": str(rt.bundle.version),
                         },
                     )
@@ -4648,13 +6355,17 @@ def create_app(
                         content={
                             "detail": "rate limited",
                             "request_id": request_id,
+                            "service_config_fingerprint": rt.bundle.cfg_fp,
                             "config_fingerprint": rt.bundle.cfg_fp,
+                            "config_fingerprint_kind": "service_http",
                             "bundle_version": rt.bundle.version,
                         },
                         headers={
                             "X-Request-Id": request_id,
                             "X-TCD-Http-Version": cfgb.api_version,
+                            "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                             "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                            "X-TCD-Config-Fingerprint-Kind": "service_http",
                             "X-TCD-Bundle-Version": str(rt.bundle.version),
                         },
                     )
@@ -4663,7 +6374,15 @@ def create_app(
             status_code = int(getattr(response, "status_code", 200))
             response.headers["X-Request-Id"] = request_id
             response.headers["X-TCD-Http-Version"] = cfgb.api_version
+            response.headers["X-TCD-Service-Config-Fingerprint"] = rt.bundle.cfg_fp
             response.headers["X-TCD-Config-Fingerprint"] = rt.bundle.cfg_fp
+            response.headers["X-TCD-Config-Fingerprint-Kind"] = "service_http"
+            route_header_fp = _safe_text(getattr(request.state, "route_config_fingerprint", None), max_len=512)
+            if route_header_fp:
+                response.headers["X-TCD-Route-Config-Fingerprint"] = route_header_fp
+            receipt_header_fp = _safe_text(getattr(request.state, "receipt_cfg_fp", None), max_len=512)
+            if receipt_header_fp:
+                response.headers["X-TCD-Receipt-Cfg-Fp"] = receipt_header_fp
             response.headers["X-TCD-Bundle-Version"] = str(rt.bundle.version)
             if getattr(request.state, "event_id", None):
                 response.headers["X-TCD-Event-Id"] = str(request.state.event_id)
@@ -4685,13 +6404,17 @@ def create_app(
             content={
                 "detail": exc.detail,
                 "request_id": request_id,
+                "service_config_fingerprint": rt.bundle.cfg_fp,
                 "config_fingerprint": rt.bundle.cfg_fp,
+                "config_fingerprint_kind": "service_http",
                 "bundle_version": rt.bundle.version,
             },
             headers={
                 "X-Request-Id": request_id,
                 "X-TCD-Http-Version": cfgb.api_version,
+                "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                 "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                "X-TCD-Config-Fingerprint-Kind": "service_http",
                 "X-TCD-Bundle-Version": str(rt.bundle.version),
             },
         )
@@ -4719,14 +6442,18 @@ def create_app(
             content={
                 "detail": "request validation failed",
                 "request_id": request_id,
+                "service_config_fingerprint": rt.bundle.cfg_fp,
                 "config_fingerprint": rt.bundle.cfg_fp,
+                "config_fingerprint_kind": "service_http",
                 "bundle_version": rt.bundle.version,
                 "errors": items,
             },
             headers={
                 "X-Request-Id": request_id,
                 "X-TCD-Http-Version": cfgb.api_version,
+                "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                 "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                "X-TCD-Config-Fingerprint-Kind": "service_http",
                 "X-TCD-Bundle-Version": str(rt.bundle.version),
             },
         )
@@ -4740,13 +6467,17 @@ def create_app(
             content={
                 "detail": "internal error",
                 "request_id": request_id,
+                "service_config_fingerprint": rt.bundle.cfg_fp,
                 "config_fingerprint": rt.bundle.cfg_fp,
+                "config_fingerprint_kind": "service_http",
                 "bundle_version": rt.bundle.version,
             },
             headers={
                 "X-Request-Id": request_id,
                 "X-TCD-Http-Version": cfgb.api_version,
+                "X-TCD-Service-Config-Fingerprint": rt.bundle.cfg_fp,
                 "X-TCD-Config-Fingerprint": rt.bundle.cfg_fp,
+                "X-TCD-Config-Fingerprint-Kind": "service_http",
                 "X-TCD-Bundle-Version": str(rt.bundle.version),
             },
         )
@@ -4765,7 +6496,9 @@ def create_app(
             "ok": True,
             "schema": _SCHEMA,
             "http_version": cfgb.api_version,
+            "service_config_fingerprint": rt.bundle.cfg_fp,
             "config_fingerprint": rt.bundle.cfg_fp,
+            "config_fingerprint_kind": "service_http",
             "bundle_version": rt.bundle.version,
             "build_id": cfgb.build_id,
             "image_digest": cfgb.image_digest,
@@ -4775,6 +6508,10 @@ def create_app(
             "receipt_ref_store_backend": rt.receipt_store.backend(),
             "receipt_ref_store_memory_size": rt.receipt_store.memory_size(),
             "receipt_ref_store_durable_size": rt.receipt_store.durable_size(),
+            "evidence_store_enabled": rt.evidence_store.enabled(),
+            "evidence_store_backend": rt.evidence_store.backend(),
+            "evidence_store_durable": rt.evidence_store.durable_enabled(),
+            "evidence_store_error": rt.evidence_store.error(),
             "expose_verify_key_public": cfgb.expose_verify_key_public,
             "expose_verification_bundle_public": cfgb.expose_verification_bundle_public,
             "expose_legacy_receipt_aliases": cfgb.expose_legacy_receipt_aliases,
@@ -4792,7 +6529,9 @@ def create_app(
             "ready": True,
             "schema": _SCHEMA,
             "http_version": cfgb.api_version,
+            "service_config_fingerprint": rt.bundle.cfg_fp,
             "config_fingerprint": rt.bundle.cfg_fp,
+            "config_fingerprint_kind": "service_http",
             "bundle_version": rt.bundle.version,
         }
 
@@ -4801,7 +6540,9 @@ def create_app(
         return {
             "schema": _SCHEMA,
             "http_version": cfgb.api_version,
+            "service_config_fingerprint": rt.bundle.cfg_fp,
             "config_fingerprint": rt.bundle.cfg_fp,
+            "config_fingerprint_kind": "service_http",
             "bundle_version": rt.bundle.version,
             "config_version": getattr(rt.settings, "config_version", None),
             "settings_config_hash": getattr(rt.settings, "config_hash", lambda: None)(),
@@ -4815,7 +6556,9 @@ def create_app(
             "schema": _SCHEMA,
             "surface": "public_http_inference",
             "http_version": cfgb.api_version,
+            "service_config_fingerprint": rt.bundle.cfg_fp,
             "config_fingerprint": rt.bundle.cfg_fp,
+            "config_fingerprint_kind": "service_http",
             "bundle_version": rt.bundle.version,
             "contracts": {
                 "input_contract": "DiagnoseRequest/VerifyRequest strict",
@@ -4903,7 +6646,9 @@ def create_app(
         return {"ok": bool(ok), "loaded": bool(ok), "detector_state_supported": bool(ok)}
 
     def _request_identity(request: Request, req: DiagnoseRequest) -> Tuple[str, str, str]:
-        request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or (req.request_id or uuid.uuid4().hex[:16])
+        header_request_id = _safe_text(request.headers.get("x-request-id"), max_len=128) or None
+        state_request_id = _safe_text(getattr(request.state, "request_id", None), max_len=128) or None
+        request_id = req.request_id or header_request_id or state_request_id or uuid.uuid4().hex[:16]
         body_digest = _safe_text(getattr(request.state, "body_digest", None), max_len=128)
         if not body_digest:
             raw = getattr(request.state, "body_bytes", None)
@@ -4913,7 +6658,7 @@ def create_app(
                 body_digest = _body_digest(_canon_json_bytes(req.model_dump()), alg=cfgb.hash_alg)
         idem_key = req.idempotency_key or _safe_text(getattr(request.state, "idempotency_key", None), max_len=128) or None
         payload = {
-            "request_id": request_id,
+            "request_id": None if idem_key else request_id,
             "idempotency_key": idem_key,
             "body_digest": body_digest,
             "tenant": req.tenant,
@@ -4926,6 +6671,115 @@ def create_app(
         event_id = f"{_EVENT_ID_VERSION}:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:event', payload=payload, out_hex=32, alg='sha256')}"
         request.state.event_id = event_id
         return request_id, body_digest, event_id
+
+
+    def _diagnose_idempotency_scope(
+        *,
+        req: DiagnoseRequest,
+        request: Request,
+        request_id: str,
+        body_digest: str,
+        event_id: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        idem_key = req.idempotency_key or _safe_text(getattr(request.state, "idempotency_key", None), max_len=128) or None
+        semantic_key = idem_key or event_id
+        if not semantic_key:
+            return None, None
+
+        mode = "idempotency_key" if idem_key else "event_id"
+        path = _safe_text(request.url.path, max_len=128) or "/diagnose"
+
+        scope_payload = {
+            "mode": mode,
+            "key": semantic_key,
+            "tenant": req.tenant,
+            "user": req.user,
+            "session": req.session,
+            "model_id": req.model_id,
+            "path": path,
+            "cfg_fp": rt.bundle.cfg_fp,
+        }
+        fp_payload = {
+            "body_digest": body_digest,
+            "tenant": req.tenant,
+            "user": req.user,
+            "session": req.session,
+            "model_id": req.model_id,
+            "gpu_id": req.gpu_id,
+            "task": req.task,
+            "lang": req.lang,
+            "path": path,
+            "cfg_fp": rt.bundle.cfg_fp,
+            "idempotency_key": idem_key,
+            "event_id": event_id,
+            "request_id": None if idem_key else request_id,
+        }
+        return (
+            "diagidem:" + _hash_hex(ctx="tcd:http:diagnose_idempotency_scope", payload=scope_payload, out_hex=48, alg="sha256"),
+            "diagfp:" + _hash_hex(ctx="tcd:http:diagnose_idempotency_fingerprint", payload=fp_payload, out_hex=48, alg="sha256"),
+        )
+
+    def _risk_response_from_cached_diagnose(
+        payload: Mapping[str, Any],
+        *,
+        request: Request,
+        response: Response,
+        fallback_request_id: str,
+        fallback_event_id: str,
+    ) -> RiskResponse:
+        data = dict(payload)
+        request_id2 = _safe_text(data.get("request_id"), max_len=128) or fallback_request_id
+        event_id2 = _safe_text(data.get("event_id"), max_len=128) or fallback_event_id
+        decision_id2 = _safe_text(data.get("decision_id"), max_len=128) or None
+        route_plan_id2 = _safe_text(data.get("route_plan_id"), max_len=128) or None
+
+        request.state.event_id = event_id2
+        if decision_id2:
+            request.state.decision_id = decision_id2
+        if route_plan_id2:
+            request.state.route_plan_id = route_plan_id2
+
+        cached_evidence_identity = data.get("evidence_identity") if isinstance(data.get("evidence_identity"), Mapping) else {}
+        cached_receipt_public = data.get("receipt_public") if isinstance(data.get("receipt_public"), Mapping) else {}
+        cached_receipt_verification = data.get("receipt_verification") if isinstance(data.get("receipt_verification"), Mapping) else {}
+        cached_route_cfg_fp = _first_route_config_fingerprint(
+            data.get("route_config_fingerprint"),
+            data.get("config_fingerprint"),
+            cached_evidence_identity.get("route_config_fingerprint"),
+            cached_evidence_identity.get("config_fingerprint"),
+        )
+        cached_receipt_cfg_fp = _receipt_cfg_fp_from_sources(
+            cached_receipt_public,
+            cached_receipt_verification,
+            cached_evidence_identity,
+            route_config_fingerprint=cached_route_cfg_fp,
+        )
+        if cached_route_cfg_fp:
+            request.state.route_config_fingerprint = cached_route_cfg_fp
+        if cached_receipt_cfg_fp:
+            request.state.receipt_cfg_fp = cached_receipt_cfg_fp
+
+        response.headers["X-Request-Id"] = request_id2
+        response.headers["X-TCD-Event-Id"] = event_id2
+        response.headers["X-TCD-Http-Version"] = cfgb.api_version
+        response.headers["X-TCD-Service-Config-Fingerprint"] = rt.bundle.cfg_fp
+        response.headers["X-TCD-Config-Fingerprint"] = rt.bundle.cfg_fp
+        response.headers["X-TCD-Config-Fingerprint-Kind"] = "service_http"
+        route_header_fp = _safe_text(getattr(request.state, "route_config_fingerprint", None), max_len=512)
+        if route_header_fp:
+            response.headers["X-TCD-Route-Config-Fingerprint"] = route_header_fp
+        receipt_header_fp = _safe_text(getattr(request.state, "receipt_cfg_fp", None), max_len=512)
+        if receipt_header_fp:
+            response.headers["X-TCD-Receipt-Cfg-Fp"] = receipt_header_fp
+        response.headers["X-TCD-Bundle-Version"] = str(rt.bundle.version)
+        if decision_id2:
+            response.headers["X-TCD-Decision-Id"] = decision_id2
+        if route_plan_id2:
+            response.headers["X-TCD-Route-Plan-Id"] = route_plan_id2
+
+        if hasattr(RiskResponse, "model_validate"):
+            return RiskResponse.model_validate(data)
+        return RiskResponse(**data)
 
     def _alpha_budget_or_fail(av_out: Dict[str, Any], tenant: str, user: str, session: str) -> RiskBudgetEnvelope:
         budget = RiskBudgetEnvelope.from_av_out(av_out)
@@ -5513,11 +7367,14 @@ def create_app(
         ) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
         local_reason = "detector_block" if detector_block else "local_route_fallback"
         local_reason_code = "DETECTOR_BLOCK" if detector_block else "LOCAL_ROUTE_FALLBACK"
+        local_route_config_fingerprint = f"cfg1:sha256:{_hash_hex(ctx='tcd:http:local_route_cfg', payload={'schema': 'tcd.route.local.v1', 'router': 'tcd.service_http.local', 'version': '1.0.0', 'api_version': cfgb.api_version, 'strict_mode': bool(cfgb.strict_mode), 'trust_zone': req.trust_zone, 'route_profile': req.route_profile, 'reason': local_reason}, out_hex=64, alg='sha256')}"
         return {
             "schema": "tcd.route.local.v1",
             "router": "tcd.service_http.local",
             "version": "1.0.0",
-            "config_fingerprint": rt.bundle.cfg_fp,
+            "route_config_fingerprint": local_route_config_fingerprint,
+            "config_fingerprint": local_route_config_fingerprint,
+            "config_fingerprint_kind": "route",
             "bundle_version": rt.bundle.version,
             "router_mode": "local_fallback",
             "route_id_kind": "plan",
@@ -5719,6 +7576,42 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="security router failure") from e
             return None
 
+
+    def _policy_store_binding_for_request(req: DiagnoseRequest) -> Dict[str, Any]:
+        if rt.policy_store is None:
+            return {}
+        bind_fn = getattr(rt.policy_store, "bind", None)
+        if not callable(bind_fn):
+            return {}
+        ctx = req.context if isinstance(req.context, Mapping) else {}
+        ctx_map = {
+            "tenant": req.tenant,
+            "user": req.user,
+            "session": req.session,
+            "model_id": req.model_id,
+            "gpu_id": req.gpu_id,
+            "task": req.task,
+            "lang": req.lang,
+            "env": _safe_label(ctx.get("env", ""), default="") if isinstance(ctx, Mapping) else "",
+            "trust_zone": req.trust_zone,
+            "route": req.route_profile,
+            "data_class": _safe_label(ctx.get("data_class", ""), default="") if isinstance(ctx, Mapping) else "",
+            "workload": _safe_label(ctx.get("workload", ""), default="") if isinstance(ctx, Mapping) else "",
+            "jurisdiction": _safe_label(ctx.get("jurisdiction", ""), default="") if isinstance(ctx, Mapping) else "",
+            "regulation": _safe_label(ctx.get("regulation", ""), default="") if isinstance(ctx, Mapping) else "",
+            "client_app": "http",
+            "access_channel": "http",
+        }
+        try:
+            bp = bind_fn(ctx_map)
+        except Exception:
+            return {}
+        return {
+            "policy_ref": _safe_text(getattr(bp, "policy_ref", None), max_len=128) or None,
+            "policyset_ref": _safe_text(getattr(bp, "policyset_ref", None), max_len=128) or None,
+            "policy_digest": _safe_text(getattr(bp, "policy_digest", None), max_len=256) or None,
+        }
+
     def _verify_pq_from_body_and_request(req: VerifyRequest, receipt_body_json: Optional[str] = None) -> None:
         body_text = receipt_body_json if receipt_body_json is not None else req.receipt_body_json
         if not body_text:
@@ -5781,6 +7674,113 @@ def create_app(
         if pq_sig_required_eff and not _coerce_bool(pq_sig_ok_val, default=False):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="pq_signature_violation")
 
+    def _receipt_body_pq_value(receipt_body_json: Optional[str], field: str) -> Optional[bool]:
+        if field not in {"pq_required", "pq_ok", "pq_signature_required", "pq_signature_ok"}:
+            return None
+        if not receipt_body_json:
+            return None
+        try:
+            body_obj = json.loads(receipt_body_json)
+        except Exception:
+            return None
+        if not isinstance(body_obj, Mapping):
+            return None
+
+        def _map(v: Any) -> Dict[str, Any]:
+            return dict(v) if isinstance(v, Mapping) else {}
+
+        claims = _map(body_obj.get("claims"))
+        comp = _map(body_obj.get("comp"))
+        req_block = _map(body_obj.get("req"))
+        meta = _map(body_obj.get("meta"))
+        security = _map(comp.get("security"))
+        artifacts = _map(comp.get("artifacts"))
+        evidence_identity = _map(comp.get("evidence_identity"))
+
+        for src in (claims, security, artifacts, evidence_identity, comp, req_block, meta, body_obj):
+            if field not in src:
+                continue
+            b = _coerce_optional_bool(src.get(field))
+            if b is not None:
+                return b
+        return None
+
+    def _receipt_body_binding_value(receipt_body_json: Optional[str], field: str) -> Optional[str]:
+        """
+        Extract supply-chain binding claims from the signed receipt body.
+
+        This is intentionally local to service_http's /verify surface because
+        some verify backends may verify the binding but not expose the boolean
+        in their public report object.
+        """
+        if not receipt_body_json:
+            return None
+        try:
+            body_obj = json.loads(receipt_body_json)
+        except Exception:
+            return None
+        if not isinstance(body_obj, Mapping):
+            return None
+
+        def _map(v: Any) -> Dict[str, Any]:
+            return dict(v) if isinstance(v, Mapping) else {}
+
+        claims = _map(body_obj.get("claims"))
+        comp = _map(body_obj.get("comp"))
+        meta = _map(body_obj.get("meta"))
+        req_block = _map(body_obj.get("req"))
+        meta_commit = _map(meta.get("commit"))
+        req_meta = _map(req_block.get("meta"))
+        req_runtime = _map(req_block.get("runtime"))
+        req_security = _map(req_block.get("security"))
+        security = _map(comp.get("security"))
+        artifacts = _map(comp.get("artifacts"))
+        evidence_identity = _map(comp.get("evidence_identity"))
+        comp_meta = _map(comp.get("meta"))
+        meta_supply = _map(meta.get("supply_chain"))
+        comp_supply = _map(comp.get("supply_chain"))
+        security_supply = _map(security.get("supply_chain"))
+        artifacts_supply = _map(artifacts.get("supply_chain"))
+        evidence_supply = _map(evidence_identity.get("supply_chain"))
+
+        max_len = 256 if field == "image_digest" else 128
+        for src in (
+            claims,
+            meta,
+            meta_commit,
+            meta_supply,
+            req_block,
+            req_meta,
+            req_runtime,
+            req_security,
+            security,
+            security_supply,
+            artifacts,
+            artifacts_supply,
+            evidence_identity,
+            evidence_supply,
+            comp_meta,
+            comp_supply,
+            comp,
+            body_obj,
+        ):
+            if field not in src:
+                continue
+            val = _safe_text(src.get(field), max_len=max_len)
+            if val:
+                return val
+        return None
+
+    def _receipt_binding_verified_from_body(receipt_body_json: Optional[str], field: str, expected: Any) -> Optional[bool]:
+        max_len = 256 if field == "image_digest" else 128
+        expected_s = _safe_text(expected, max_len=max_len) or None
+        if expected_s is None:
+            return None
+        actual_s = _receipt_body_binding_value(receipt_body_json, field)
+        if actual_s is None:
+            return False
+        return hmac.compare_digest(actual_s, expected_s)
+
     @app.post("/diagnose", response_model=RiskResponse)
     def diagnose(
         req: DiagnoseRequest,
@@ -5790,11 +7790,13 @@ def create_app(
     ) -> RiskResponse:
         t_start = time.perf_counter()
         request_id, body_digest, event_id = _request_identity(request, req)
-        _LOG.error(
+        _LOG.debug(
             "DIAG STAGE 1 after _request_identity request_id=%s event_id=%s",
             request_id,
             event_id,
         )
+        effective_build_id = _safe_text(req.build_id, max_len=128) or cfgb.build_id
+        effective_image_digest = _safe_text(req.image_digest, max_len=256) or cfgb.image_digest
 
         if cfgb.strict_mode and (req.tenant == "tenant0" or req.user == "user0" or req.session == "sess0"):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="subject identity required")
@@ -5802,463 +7804,324 @@ def create_app(
         response.headers["X-Request-Id"] = request_id
         response.headers["X-TCD-Event-Id"] = event_id
         response.headers["X-TCD-Http-Version"] = cfgb.api_version
+        response.headers["X-TCD-Service-Config-Fingerprint"] = rt.bundle.cfg_fp
         response.headers["X-TCD-Config-Fingerprint"] = rt.bundle.cfg_fp
+        response.headers["X-TCD-Config-Fingerprint-Kind"] = "service_http"
+        route_header_fp = _safe_text(getattr(request.state, "route_config_fingerprint", None), max_len=512)
+        if route_header_fp:
+            response.headers["X-TCD-Route-Config-Fingerprint"] = route_header_fp
+        receipt_header_fp = _safe_text(getattr(request.state, "receipt_cfg_fp", None), max_len=512)
+        if receipt_header_fp:
+            response.headers["X-TCD-Receipt-Cfg-Fp"] = receipt_header_fp
         response.headers["X-TCD-Bundle-Version"] = str(rt.bundle.version)
 
-        if _HAS_LOG and bind_request_meta is not None:
-            with contextlib.suppress(Exception):
-                bind_request_meta(
-                    tenant=req.tenant,
-                    user=req.user,
-                    session=req.session,
-                    model_id=req.model_id,
-                    gpu_id=req.gpu_id,
-                    task=req.task,
-                    lang=req.lang,
-                    path="/diagnose",
-                    method="POST",
-                )
-
-        subject = (req.tenant, req.user, req.session)
-        _subject_cost, rate_decision = _apply_subject_policy_and_charge(req)
-        _LOG.error(
-            "DIAG STAGE 2 after _apply_subject_policy_and_charge request_id=%s",
-            request_id,
-        )
-
-        if rt.gpu_sampler is not None:
-            with contextlib.suppress(Exception):
-                req.context.update(rt.gpu_sampler.sample())
-
-        trace_vec = _sanitize_numeric_array(req.trace_vector, max_len=_MAX_TRACE)
-        spectrum = _sanitize_numeric_array(req.spectrum, max_len=_MAX_SPECT)
-        features = _sanitize_numeric_array(req.features, max_len=_MAX_FEATS)
-
-        det_key = (req.model_id, req.gpu_id, req.task, req.lang)
-        det = rt.detector_registry.get_detector_runtime(det_key)
-        _LOG.error(
-            "DIAG STAGE 3 before _run_detector_runtime request_id=%s",
-            request_id,
-        )
-        verdict_pack = _run_detector_runtime(det, req=req, trace_vec=trace_vec, spectrum=spectrum, features=features)
-        _LOG.error(
-            "DIAG STAGE 4 after _run_detector_runtime request_id=%s",
-            request_id,
-        )
-
-        if not isinstance(verdict_pack, Mapping):
-            verdict_pack = {
-                "verdict": True,
-                "score": 1.0,
-                "p_value": 1e-12,
-                "decision": "block",
-                "action": "block",
-                "components": {"reason": "detector_runtime_invalid"},
-                "step": int(req.step_id or 0),
-            }
-        verdict_pack = dict(verdict_pack)
-        det_signal = _extract_detector_signal(verdict_pack)
-
-        mv_info: Dict[str, Any] = {}
-        if features:
-            with contextlib.suppress(Exception):
-                mv = rt.detector_registry.get_multivar_detector(req.model_id)
-                mv_info = mv.decision(np.asarray(features, dtype=float))  # type: ignore[assignment]
-                if not isinstance(mv_info, Mapping):
-                    mv_info = {}
-
-        score = float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else 0.0)
-        p_final = float(
-            det_signal.get("p_value")
-            if det_signal.get("p_value") is not None
-            else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score))))
-        )
-        drift_w = max(0.0, min(2.0, 1.0 + 0.5 * float(req.drift_score or 0.0)))
-
-        av = rt.detector_registry.get_alpha_controller(subject)
-        av_out = _av_step_compat(
-            av,
-            req=req,
-            subject=subject,
-            model_id=req.model_id,
-            gpu_id=req.gpu_id,
-            task=req.task,
-            lang=req.lang,
-            score=score,
-            p_value=p_final,
-            drift_weight=drift_w,
-            meta={
-                "trust_zone": req.trust_zone,
-                "route_profile": req.route_profile,
-                "risk_label": req.risk_label,
-                "threat_kind": req.threat_kind,
-                "pq_required": req.pq_required,
-                "request_id": request_id,
-                "event_id": event_id,
-                "body_digest": body_digest,
-            },
-        )
-        budget = _alpha_budget_or_fail(av_out, tenant=req.tenant, user=req.user, session=req.session)
-        _LOG.error(
-            "DIAG STAGE 5 after _av_step_compat/_alpha_budget_or_fail request_id=%s",
-            request_id,
-        )
-
-        decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
-
-        e_state_block = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
-        process_block = e_state_block.get("process") if isinstance(e_state_block.get("process"), Mapping) else {}
-        selected_source = _first_text(process_block.get("selected_source"), max_len=128)
-
-        route = _route_decide_compat(
-            rt.router,
-            decision_fail=decision_fail,
-            score=score,
-            base_temp=req.base_temp,
-            base_top_p=req.base_top_p,
-            base_max_tokens=req.base_max_tokens,
-            risk_label=req.risk_label,
-            route_profile=req.route_profile,
-            trust_zone=req.trust_zone,
-            threat_kind=req.threat_kind,
-            threat_confidence=req.threat_confidence,
-            pq_required=bool(req.pq_required),
-            pq_unhealthy=False,
-            av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
-            av_trigger=budget.triggered,
-            controller_mode=budget.controller_mode,
-            guarantee_scope=budget.statistical_guarantee_scope,
-            request_id=request_id,
-            trace_id=req.trace_id,
-            tenant_id=req.tenant,
-            principal_id=_safe_text(getattr(request.state, "auth_principal", None), max_len=128) or req.user,
-            meta={
-                "event_id": event_id,
-                "request_id": request_id,
-                "body_digest": body_digest,
-                "build_id": req.build_id,
-                "image_digest": req.image_digest,
-                "compliance_tags": list(req.compliance_tags),
-                "rate_reason": getattr(rate_decision, "reason", None) if rate_decision is not None else None,
-                "auth_mode": _safe_text(getattr(request.state, "auth_mode", None), max_len=64) or None,
-            },
-        )
-        _LOG.error(
-            "DIAG STAGE 6 after _route_decide_compat request_id=%s",
-            request_id,
-        )
-
-        security_decision = _security_router_decision(
+        idem_scope_key, idem_fingerprint = _diagnose_idempotency_scope(
             req=req,
             request=request,
-            body_digest=body_digest,
             request_id=request_id,
+            body_digest=body_digest,
             event_id=event_id,
-            score=score,
-            decision_fail=decision_fail,
-            verdict_pack=verdict_pack,
-            av_out=av_out,
-            threat_kind=req.threat_kind,
         )
-        _LOG.error(
-            "DIAG STAGE 7 after _security_router_decision request_id=%s has_security_decision=%s",
-            request_id,
-            security_decision is not None,
-        )
+        idem_owner = False
+        if idem_scope_key and idem_fingerprint:
+            idem_status, idem_payload = rt.idempotency_store.begin(idem_scope_key, idem_fingerprint, event_id)
+            if idem_status == "cached" and idem_payload is not None:
+                return _risk_response_from_cached_diagnose(
+                    idem_payload,
+                    request=request,
+                    response=response,
+                    fallback_request_id=request_id,
+                    fallback_event_id=event_id,
+                )
+            if idem_status == "conflict":
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="idempotency key conflict")
+            if idem_status == "in_progress":
+                idem_payload = rt.idempotency_store.wait(idem_scope_key, idem_fingerprint)
+                if idem_payload is not None:
+                    return _risk_response_from_cached_diagnose(
+                        idem_payload,
+                        request=request,
+                        response=response,
+                        fallback_request_id=request_id,
+                        fallback_event_id=event_id,
+                    )
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="idempotency key in progress")
+            idem_owner = idem_status == "owner"
 
-        route_info = _extract_route_dict(route)
-        if not route_info:
-            route_info = _build_synthetic_route_contract(
+        try:
+            if _HAS_LOG and bind_request_meta is not None:
+                with contextlib.suppress(Exception):
+                    bind_request_meta(
+                        tenant=req.tenant,
+                        user=req.user,
+                        session=req.session,
+                        model_id=req.model_id,
+                        gpu_id=req.gpu_id,
+                        task=req.task,
+                        lang=req.lang,
+                        path="/diagnose",
+                        method="POST",
+                    )
+
+            subject = (req.tenant, req.user, req.session)
+            _subject_cost, rate_decision = _apply_subject_policy_and_charge(req)
+            _LOG.debug(
+                "DIAG STAGE 2 after _apply_subject_policy_and_charge request_id=%s",
+                request_id,
+            )
+
+            if rt.gpu_sampler is not None:
+                with contextlib.suppress(Exception):
+                    req.context.update(rt.gpu_sampler.sample())
+
+            trace_vec = _sanitize_numeric_array(req.trace_vector, max_len=_MAX_TRACE)
+            spectrum = _sanitize_numeric_array(req.spectrum, max_len=_MAX_SPECT)
+            features = _sanitize_numeric_array(req.features, max_len=_MAX_FEATS)
+
+            det_key = (req.model_id, req.gpu_id, req.task, req.lang)
+            det = rt.detector_registry.get_detector_runtime(det_key)
+            _LOG.debug(
+                "DIAG STAGE 3 before _run_detector_runtime request_id=%s",
+                request_id,
+            )
+            verdict_pack = _run_detector_runtime(det, req=req, trace_vec=trace_vec, spectrum=spectrum, features=features)
+            _LOG.debug(
+                "DIAG STAGE 4 after _run_detector_runtime request_id=%s",
+                request_id,
+            )
+
+            if not isinstance(verdict_pack, Mapping):
+                verdict_pack = {
+                    "verdict": True,
+                    "score": 1.0,
+                    "p_value": 1e-12,
+                    "decision": "block",
+                    "action": "block",
+                    "components": {"reason": "detector_runtime_invalid"},
+                    "step": int(req.step_id or 0),
+                }
+            verdict_pack = dict(verdict_pack)
+            det_signal = _extract_detector_signal(verdict_pack)
+
+            mv_info: Dict[str, Any] = {}
+            if features:
+                with contextlib.suppress(Exception):
+                    mv = rt.detector_registry.get_multivar_detector(req.model_id)
+                    mv_info = mv.decision(np.asarray(features, dtype=float))  # type: ignore[assignment]
+                    if not isinstance(mv_info, Mapping):
+                        mv_info = {}
+
+            score = float(det_signal.get("risk_score") if det_signal.get("risk_score") is not None else 0.0)
+            p_final = float(
+                det_signal.get("p_value")
+                if det_signal.get("p_value") is not None
+                else max(1e-12, min(1.0, 1.0 - max(0.0, min(1.0, score))))
+            )
+            drift_w = max(0.0, min(2.0, 1.0 + 0.5 * float(req.drift_score or 0.0)))
+
+            av = rt.detector_registry.get_alpha_controller(subject)
+            av_out = _av_step_compat(
+                av,
                 req=req,
+                subject=subject,
+                model_id=req.model_id,
+                gpu_id=req.gpu_id,
+                task=req.task,
+                lang=req.lang,
+                score=score,
+                p_value=p_final,
+                drift_weight=drift_w,
+                meta={
+                    "trust_zone": req.trust_zone,
+                    "route_profile": req.route_profile,
+                    "risk_label": req.risk_label,
+                    "threat_kind": req.threat_kind,
+                    "pq_required": req.pq_required,
+                    "request_id": request_id,
+                    "event_id": event_id,
+                    "body_digest": body_digest,
+                },
+            )
+            budget = _alpha_budget_or_fail(av_out, tenant=req.tenant, user=req.user, session=req.session)
+            _LOG.debug(
+                "DIAG STAGE 5 after _av_step_compat/_alpha_budget_or_fail request_id=%s",
+                request_id,
+            )
+
+            decision_fail = bool(det_signal.get("decision_fail") or budget.triggered)
+
+            e_state_block = av_out.get("e_state") if isinstance(av_out.get("e_state"), Mapping) else {}
+            process_block = e_state_block.get("process") if isinstance(e_state_block.get("process"), Mapping) else {}
+            selected_source = _first_text(process_block.get("selected_source"), max_len=128)
+
+            route = _route_decide_compat(
+                rt.router,
+                decision_fail=decision_fail,
+                score=score,
+                base_temp=req.base_temp,
+                base_top_p=req.base_top_p,
+                base_max_tokens=req.base_max_tokens,
+                risk_label=req.risk_label,
+                route_profile=req.route_profile,
+                trust_zone=req.trust_zone,
+                threat_kind=req.threat_kind,
+                threat_confidence=req.threat_confidence,
+                pq_required=bool(req.pq_required),
+                pq_unhealthy=False,
+                av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                av_trigger=budget.triggered,
+                controller_mode=budget.controller_mode,
+                guarantee_scope=budget.statistical_guarantee_scope,
+                request_id=request_id,
+                trace_id=req.trace_id,
+                tenant_id=req.tenant,
+                principal_id=_safe_text(getattr(request.state, "auth_principal", None), max_len=128) or req.user,
+                meta={
+                    "event_id": event_id,
+                    "request_id": request_id,
+                    "body_digest": body_digest,
+                    "build_id": effective_build_id,
+                    "image_digest": effective_image_digest,
+                    "compliance_tags": list(req.compliance_tags),
+                    "rate_reason": getattr(rate_decision, "reason", None) if rate_decision is not None else None,
+                    "auth_mode": _safe_text(getattr(request.state, "auth_mode", None), max_len=64) or None,
+                },
+            )
+            _LOG.debug(
+                "DIAG STAGE 6 after _route_decide_compat request_id=%s",
+                request_id,
+            )
+
+            security_decision = _security_router_decision(
+                req=req,
+                request=request,
+                body_digest=body_digest,
                 request_id=request_id,
                 event_id=event_id,
                 score=score,
                 decision_fail=decision_fail,
-                av_trigger=budget.triggered,
-                controller_mode=budget.controller_mode,
-                guarantee_scope=budget.statistical_guarantee_scope,
-                av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                verdict_pack=verdict_pack,
+                av_out=av_out,
                 threat_kind=req.threat_kind,
-                detector_action=_safe_text(det_signal.get("action"), max_len=32) or None,
-                detector_hard_block=bool(det_signal.get("hard_block")),
             )
-
-        allowed = True
-        required_action = _route_required_action(route_info)
-        enforcement_mode = _route_enforcement_mode(route_info)
-        action_str = "none"
-        cause = (
-            _safe_text(
-                det_signal.get("reason_code")
-                or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")),
-                max_len=128,
-            )
-            or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
-        )
-        policy_ref: Optional[str] = _safe_text(route_info.get("policy_ref"), max_len=128) or None
-        policyset_ref: Optional[str] = _safe_text(route_info.get("policyset_ref"), max_len=128) or None
-        config_fingerprint: Optional[str] = _safe_text(route_info.get("config_fingerprint"), max_len=128) or None
-        bundle_version: Optional[int] = _coerce_int(route_info.get("bundle_version"))
-        state_domain_id: Optional[str] = budget.state_domain_id
-        controller_mode: Optional[str] = budget.controller_mode
-        guarantee_scope: Optional[str] = budget.statistical_guarantee_scope
-        decision_id: Optional[str] = _safe_text(route_info.get("decision_id"), max_len=128) or None
-        route_plan_id: Optional[str] = _safe_text(route_info.get("route_plan_id") or route_info.get("route_id"), max_len=128) or None
-        security_block: Dict[str, Any] = {}
-        security_public: Dict[str, Any] = {}
-        evidence_identity: Dict[str, Any] = {}
-        artifacts: Dict[str, Any] = {}
-        audit_ref: Optional[str] = None
-        receipt_ref: Optional[str] = None
-
-        raw_receipt_payload: Dict[str, Any] = {}
-        receipt_public_explicit: Dict[str, Any] = {}
-        receipt_verification_explicit: Optional[Dict[str, Any]] = None
-        receipt_private_payload: Dict[str, Any] = {}
-
-        if security_decision is not None:
-            security_public = _extract_security_public(security_decision)
-            allowed = bool(getattr(security_decision, "allowed", True))
-            required_action = _safe_text(getattr(security_decision, "required_action", required_action), max_len=32).lower() or required_action
-            action_taken = _safe_text(getattr(security_decision, "action", ""), max_len=32).lower()
-            if action_taken in {"allow", "degrade", "block", "deny"}:
-                action_str = "block" if action_taken == "deny" else action_taken
-            else:
-                action_str = "block" if required_action == "block" else ("degrade" if required_action == "degrade" else "none")
-            enforcement_mode = _safe_text(getattr(security_decision, "enforcement_mode", enforcement_mode), max_len=32).lower() or enforcement_mode
-            cause = _safe_text(getattr(security_decision, "primary_reason_code", cause), max_len=128) or cause
-
-            route_obj = getattr(security_decision, "route", None)
-            route_info = _extract_route_dict(route_obj) if route_obj is not None else route_info
-
-            policy_ref = _safe_text(getattr(security_decision, "policy_ref", policy_ref), max_len=128) or policy_ref
-            policyset_ref = _safe_text(getattr(security_decision, "policyset_ref", policyset_ref), max_len=128) or policyset_ref
-            config_fingerprint = _safe_text(getattr(security_decision, "config_fingerprint", config_fingerprint), max_len=128) or config_fingerprint
-            bundle_version = _coerce_int(getattr(security_decision, "bundle_version", bundle_version)) or bundle_version
-            state_domain_id = _safe_text(getattr(security_decision, "state_domain_id", state_domain_id), max_len=128) or state_domain_id
-            controller_mode = _safe_text(getattr(security_decision, "controller_mode", controller_mode), max_len=64) or controller_mode
-            guarantee_scope = _safe_text(getattr(security_decision, "guarantee_scope", guarantee_scope), max_len=128) or guarantee_scope
-            decision_id = _safe_text(getattr(security_decision, "decision_id", decision_id), max_len=128) or decision_id
-            route_plan_id = _safe_text(getattr(security_decision, "route_plan_id", route_plan_id), max_len=128) or route_plan_id
-
-            audit_ref = _safe_text(getattr(security_decision, "audit_ref", None), max_len=256) or None
-            receipt_ref = _safe_text(getattr(security_decision, "receipt_ref", None), max_len=256) or None
-
-            raw_receipt_payload = _extract_receipt_like(getattr(security_decision, "receipt", None))
-            receipt_public_explicit = _sanitize_receipt_public_surface(getattr(security_decision, "receipt_public", None))
-            receipt_verification_explicit = _sanitize_receipt_verification_surface(getattr(security_decision, "receipt_verification", None))
-            receipt_private_payload = _extract_receipt_like(getattr(security_decision, "receipt_private", None))
-
-            audit_ref = _derive_audit_ref(
-                receipt_public=receipt_public_explicit,
-                receipt_private=receipt_private_payload,
-                raw_receipt=raw_receipt_payload,
-                fallback=audit_ref,
-            )
-            receipt_ref = _derive_receipt_ref(
-                receipt_public=receipt_public_explicit,
-                receipt_verification=receipt_verification_explicit,
-                receipt_private=receipt_private_payload,
-                raw_receipt=raw_receipt_payload,
-                fallback=receipt_ref,
-            )
-
-            security_block = _sanitize_json_mapping(
-                getattr(security_decision, "security", {}),
-                max_depth=5,
-                max_items=64,
-                max_str_len=512,
-                max_total_bytes=64_000,
-            )
-            evidence_identity = _sanitize_json_mapping(
-                getattr(security_decision, "evidence_identity", {}),
-                max_depth=4,
-                max_items=32,
-                max_str_len=256,
-                max_total_bytes=16_000,
-            )
-            artifacts = _sanitize_json_mapping(
-                getattr(security_decision, "artifacts", {}),
-                max_depth=4,
-                max_items=64,
-                max_str_len=512,
-                max_total_bytes=32_000,
-            )
-        else:
-            required_action = required_action if required_action in {"allow", "degrade", "block"} else (
-                "block" if (cfgb.strict_mode and req.risk_label == "critical" and decision_fail) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
-            )
-            action_str = _manual_route_action(
-                route,
-                decision_fail,
-                threat_kind=req.threat_kind,
-                threat_conf=req.threat_confidence,
-                pq_required=bool(req.pq_required),
-                pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
-            )
-            detector_action_norm = _safe_text(det_signal.get("action"), max_len=32).lower()
-            if bool(det_signal.get("hard_block")) or detector_action_norm in {"block", "deny", "reject"}:
-                required_action = "block"
-                action_str = "block"
-                allowed = False
-
-            if action_str not in _ALLOWED_ACTIONS:
-                action_str = "degrade" if (decision_fail or cfgb.strict_mode) else "none"
-            if required_action == "block":
-                action_str = "block"
-                allowed = False
-            elif required_action == "degrade":
-                if action_str in {"allow", "none"}:
-                    action_str = "degrade"
-                allowed = True
-            else:
-                if action_str == "allow":
-                    action_str = "none"
-                allowed = action_str != "block"
-
-            enforcement_mode = _safe_text(route_info.get("enforcement_mode"), max_len=32).lower() or (
-                "fail_closed" if (required_action == "block" and cfgb.strict_mode) else ("must_enforce" if (required_action != "allow" and cfgb.strict_mode) else "advisory")
-            )
-
-            security_block = {
-                "trust_zone": req.trust_zone,
-                "route_profile": req.route_profile,
-                "risk_label": req.risk_label,
-                "threat_kind": req.threat_kind,
-                "threat_confidence": req.threat_confidence,
-                "pq_required": req.pq_required,
-                "pq_ok": route_info.get("pq_ok"),
-                "policy_ref": policy_ref,
-                "route_id": route_plan_id,
-                "build_id": req.build_id,
-                "image_digest": req.image_digest,
-                "compliance_tags": list(req.compliance_tags),
-                "request_id": request_id,
-                "event_id": event_id,
-                "body_digest": body_digest,
-                "surface_kind": "local_http_fallback",
-            }
-            artifacts = {
-                "receipt_required": bool(
-                    cfgb.receipts_enable_default
-                    or (cfgb.require_receipts_on_fail and required_action == "block")
-                    or (cfgb.require_receipts_when_pq and bool(req.pq_required))
-                ),
-                "ledger_required": False,
-                "attestation_required": bool(cfgb.require_attestor_when_receipt_required),
-                "ledger_stage": "skipped",
-                "outbox_status": "none",
-                "receipt_surface_kind": "local_attestation",
-                "durability": "ephemeral_local_only",
-            }
-            evidence_identity = {
-                "request_id": request_id,
-                "event_id": event_id,
-                "decision_id": decision_id,
-                "route_plan_id": route_plan_id,
-                "config_fingerprint": config_fingerprint or rt.bundle.cfg_fp,
-                "policy_ref": policy_ref,
-                "policyset_ref": policyset_ref,
-                "state_domain_id": state_domain_id,
-                "controller_mode": controller_mode,
-                "statistical_guarantee_scope": guarantee_scope,
-                "receipt_ref": receipt_ref,
-                "audit_ref": audit_ref,
-                "produced_by": "service_http.local",
-            }
-
-        terminal_contract = _resolve_terminal_contract(
-            required_action=required_action,
-            action=action_str,
-            allowed=allowed,
-            enforcement_mode=enforcement_mode,
-        )
-        required_action = terminal_contract["required_action"]
-        action_str = terminal_contract["action"]
-        allowed = terminal_contract["allowed"]
-        enforcement_mode = terminal_contract["enforcement_mode"]
-        final_verdict = bool(terminal_contract["verdict"])
-        decision_label = str(terminal_contract["decision"])
-        receipt_required = bool(
-            _receipt_required_for_request(req, decision=decision_label)
-            or (cfgb.strict_mode and cfgb.require_finalized_receipt_surface_when_strict)
-        )
-
-        receipt_surface_available = (
-            _receipt_required_artifact_available(
-                receipt_public=receipt_public_explicit,
-                receipt_verification=receipt_verification_explicit,
-                receipt_private=receipt_private_payload,
-                raw_receipt=raw_receipt_payload,
-            )
-            if receipt_required
-            else _receipt_surface_available(
-                receipt_public=receipt_public_explicit,
-                receipt_verification=receipt_verification_explicit,
-                receipt_private=receipt_private_payload,
-                raw_receipt=raw_receipt_payload,
-            )
-        )
-
-        if not receipt_surface_available:
-            need_local_receipt = bool(receipt_required and rt.receipt_mgr.attestor is not None)
-            _LOG.error(
-                "DIAG STAGE 8 before issue_local_final request_id=%s receipt_required=%s need_local_receipt=%s",
+            _LOG.debug(
+                "DIAG STAGE 7 after _security_router_decision request_id=%s has_security_decision=%s",
                 request_id,
-                receipt_required,
-                need_local_receipt,
+                security_decision is not None,
             )
-            if need_local_receipt:
-                rb = rt.receipt_mgr.issue_local_final(
-                    trace=trace_vec,
-                    spectrum=spectrum,
-                    features=features,
+
+            route_info = _extract_route_dict(route)
+            if not route_info:
+                route_info = _build_synthetic_route_contract(
                     req=req,
                     request_id=request_id,
                     event_id=event_id,
-                    body_digest=body_digest,
                     score=score,
-                    p_final=p_final,
-                    route_info=route_info,
-                    final_action=action_str,
-                    required_action=required_action,
-                    enforcement_mode=enforcement_mode,
-                    allowed=allowed,
-                    cause=cause,
-                    policy_ref=policy_ref,
-                    policyset_ref=policyset_ref,
-                    policy_digest=det_signal.get("policy_digest"),
-                    cfg_fp=config_fingerprint or rt.bundle.cfg_fp,
-                    decision_id=decision_id or "",
-                    route_plan_id=route_plan_id or "",
-                    audit_ref=audit_ref,
-                    state_domain_id=state_domain_id,
-                    adapter_registry_fp=budget.adapter_registry_fp,
-                    budget=budget,
-                    detector_components=dict(verdict_pack.get("components", {}))
-                    if isinstance(verdict_pack.get("components"), Mapping)
-                    else {},
-                    mv_info=mv_info,
-                    security_block=security_block,
-                    artifacts=artifacts,
-                    evidence_identity=evidence_identity,
-                    pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False)
-                    if route_info.get("pq_ok") is not None
-                    else None,
+                    decision_fail=decision_fail,
+                    av_trigger=budget.triggered,
+                    controller_mode=budget.controller_mode,
+                    guarantee_scope=budget.statistical_guarantee_scope,
+                    av_label=_safe_text(getattr(getattr(av, "config", None), "label", None), max_len=64) or None,
+                    threat_kind=req.threat_kind,
+                    detector_action=_safe_text(det_signal.get("action"), max_len=32) or None,
+                    detector_hard_block=bool(det_signal.get("hard_block")),
                 )
-                _LOG.error(
-                    "DIAG STAGE 9 after issue_local_final request_id=%s raw_nonempty=%s public_nonempty=%s verification_present=%s",
-                    request_id,
-                    bool(rb.raw),
-                    bool(rb.public),
-                    rb.verification is not None,
-                )
-                raw_receipt_payload = dict(rb.raw or {})
-                receipt_public_explicit = dict(rb.public or {})
-                receipt_verification_explicit = dict(rb.verification or {}) if rb.verification is not None else None
-                if not receipt_private_payload and raw_receipt_payload:
-                    receipt_private_payload = dict(raw_receipt_payload)
 
+            allowed = True
+            required_action = _route_required_action(route_info)
+            enforcement_mode = _route_enforcement_mode(route_info)
+            action_str = "none"
+            cause = (
+                _safe_text(
+                    det_signal.get("reason_code")
+                    or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else "")),
+                    max_len=128,
+                )
+                or ("detector" if det_signal.get("decision_fail") else ("av" if budget.triggered else ""))
+            )
+            policy_binding_fallback = _policy_store_binding_for_request(req)
+            policy_ref: Optional[str] = _safe_text(route_info.get("policy_ref"), max_len=128) or _safe_text(policy_binding_fallback.get("policy_ref"), max_len=128) or None
+            policyset_ref: Optional[str] = _safe_text(route_info.get("policyset_ref"), max_len=128) or _safe_text(policy_binding_fallback.get("policyset_ref"), max_len=128) or None
+            policy_digest: Optional[str] = _safe_text(route_info.get("policy_digest"), max_len=256) or _safe_text(policy_binding_fallback.get("policy_digest"), max_len=256) or None
+            detector_policy_digest: Optional[str] = _safe_text(det_signal.get("policy_digest"), max_len=256) or None
+            service_config_fingerprint: str = rt.bundle.cfg_fp
+            route_config_fingerprint: str = _derive_route_config_fingerprint(
+                route_info=route_info,
+                policy_ref=policy_ref,
+                policyset_ref=policyset_ref,
+                policy_digest=policy_digest,
+                fallback_seed=None,
+            )
+            config_fingerprint: Optional[str] = route_config_fingerprint
+            receipt_cfg_fp: Optional[str] = route_config_fingerprint
+            bundle_version: Optional[int] = _coerce_int(route_info.get("bundle_version"))
+            state_domain_id: Optional[str] = budget.state_domain_id
+            controller_mode: Optional[str] = budget.controller_mode
+            guarantee_scope: Optional[str] = budget.statistical_guarantee_scope
+            decision_id: Optional[str] = _safe_text(route_info.get("decision_id"), max_len=128) or None
+            route_plan_id: Optional[str] = _safe_text(route_info.get("route_plan_id") or route_info.get("route_id"), max_len=128) or None
+            security_block: Dict[str, Any] = {}
+            security_public: Dict[str, Any] = {}
+            evidence_identity: Dict[str, Any] = {}
+            artifacts: Dict[str, Any] = {}
+            audit_ref: Optional[str] = None
+            receipt_ref: Optional[str] = None
+
+            raw_receipt_payload: Dict[str, Any] = {}
+            receipt_public_explicit: Dict[str, Any] = {}
+            receipt_verification_explicit: Optional[Dict[str, Any]] = None
+            receipt_private_payload: Dict[str, Any] = {}
+
+            if security_decision is not None:
+                security_public = _extract_security_public(security_decision)
+                allowed = bool(getattr(security_decision, "allowed", True))
+                required_action = _safe_text(getattr(security_decision, "required_action", required_action), max_len=32).lower() or required_action
+                action_taken = _safe_text(getattr(security_decision, "action", ""), max_len=32).lower()
+                if action_taken in {"allow", "degrade", "block", "deny"}:
+                    action_str = "block" if action_taken == "deny" else action_taken
+                else:
+                    action_str = "block" if required_action == "block" else ("degrade" if required_action == "degrade" else "none")
+                enforcement_mode = _safe_text(getattr(security_decision, "enforcement_mode", enforcement_mode), max_len=32).lower() or enforcement_mode
+                cause = _safe_text(getattr(security_decision, "primary_reason_code", cause), max_len=128) or cause
+
+                route_obj = getattr(security_decision, "route", None)
+                route_info = _extract_route_dict(route_obj) if route_obj is not None else route_info
+
+                policy_ref = _safe_text(getattr(security_decision, "policy_ref", policy_ref), max_len=128) or policy_ref
+                policyset_ref = _safe_text(getattr(security_decision, "policyset_ref", policyset_ref), max_len=128) or policyset_ref
+                policy_digest = _safe_text(getattr(security_decision, "policy_digest", policy_digest), max_len=256) or policy_digest
+                security_cfg_candidate = _first_route_config_fingerprint(
+                    getattr(security_decision, "route_config_fingerprint", None),
+                    getattr(security_decision, "config_fingerprint", None),
+                    route_info.get("route_config_fingerprint") if isinstance(route_info, Mapping) else None,
+                    route_info.get("config_fingerprint") if isinstance(route_info, Mapping) else None,
+                    route_info.get("cfg_fp") if isinstance(route_info, Mapping) else None,
+                    config_fingerprint,
+                )
+                if security_cfg_candidate:
+                    route_config_fingerprint = security_cfg_candidate
+                    config_fingerprint = security_cfg_candidate
+                bundle_version = _coerce_int(getattr(security_decision, "bundle_version", bundle_version)) or bundle_version
+                state_domain_id = _safe_text(getattr(security_decision, "state_domain_id", state_domain_id), max_len=128) or state_domain_id
+                controller_mode = _safe_text(getattr(security_decision, "controller_mode", controller_mode), max_len=64) or controller_mode
+                guarantee_scope = _safe_text(getattr(security_decision, "guarantee_scope", guarantee_scope), max_len=128) or guarantee_scope
+                decision_id = _safe_text(getattr(security_decision, "decision_id", decision_id), max_len=128) or decision_id
+                route_plan_id = _safe_text(getattr(security_decision, "route_plan_id", route_plan_id), max_len=128) or route_plan_id
+
+                audit_ref = _safe_text(getattr(security_decision, "audit_ref", None), max_len=256) or None
+                receipt_ref = _safe_text(getattr(security_decision, "receipt_ref", None), max_len=256) or None
+
+                raw_receipt_payload = _extract_receipt_like(getattr(security_decision, "receipt", None))
+                receipt_public_explicit = _sanitize_receipt_public_surface(getattr(security_decision, "receipt_public", None))
+                receipt_verification_explicit = _sanitize_receipt_verification_surface(getattr(security_decision, "receipt_verification", None))
+                receipt_private_payload = _extract_receipt_like(getattr(security_decision, "receipt_private", None))
+
+                audit_ref = _derive_audit_ref(
+                    receipt_public=receipt_public_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                    fallback=audit_ref,
+                )
                 receipt_ref = _derive_receipt_ref(
                     receipt_public=receipt_public_explicit,
                     receipt_verification=receipt_verification_explicit,
@@ -6266,381 +8129,1145 @@ def create_app(
                     raw_receipt=raw_receipt_payload,
                     fallback=receipt_ref,
                 )
-                audit_ref = _derive_audit_ref(
+
+                security_block = _sanitize_json_mapping(
+                    getattr(security_decision, "security", {}),
+                    max_depth=5,
+                    max_items=64,
+                    max_str_len=512,
+                    max_total_bytes=64_000,
+                )
+                evidence_identity = _sanitize_json_mapping(
+                    getattr(security_decision, "evidence_identity", {}),
+                    max_depth=4,
+                    max_items=32,
+                    max_str_len=256,
+                    max_total_bytes=16_000,
+                )
+                artifacts = _sanitize_json_mapping(
+                    getattr(security_decision, "artifacts", {}),
+                    max_depth=4,
+                    max_items=64,
+                    max_str_len=512,
+                    max_total_bytes=32_000,
+                )
+                if not policy_digest:
+                    policy_digest = _safe_text(
+                        evidence_identity.get("security_policy_digest")
+                        or evidence_identity.get("policy_digest")
+                        or security_block.get("security_policy_digest")
+                        or security_public.get("policy_digest"),
+                        max_len=256,
+                    ) or None
+
+                security_block["surface_kind"] = "security_router"
+                security_block["produced_by"] = "tcd.security_router"
+                artifacts["surface_kind"] = "security_router"
+                artifacts["produced_by"] = "tcd.security_router"
+                evidence_identity["produced_by"] = "tcd.security_router"
+            else:
+                required_action = required_action if required_action in {"allow", "degrade", "block"} else (
+                    "block" if (cfgb.strict_mode and req.risk_label == "critical" and decision_fail) else ("degrade" if (decision_fail or cfgb.strict_mode) else "allow")
+                )
+                action_str = _manual_route_action(
+                    route,
+                    decision_fail,
+                    threat_kind=req.threat_kind,
+                    threat_conf=req.threat_confidence,
+                    pq_required=bool(req.pq_required),
+                    pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
+                )
+                detector_action_norm = _safe_text(det_signal.get("action"), max_len=32).lower()
+                if bool(det_signal.get("hard_block")) or detector_action_norm in {"block", "deny", "reject"}:
+                    required_action = "block"
+                    action_str = "block"
+                    allowed = False
+
+                if action_str not in _ALLOWED_ACTIONS:
+                    action_str = "degrade" if (decision_fail or cfgb.strict_mode) else "none"
+                if required_action == "block":
+                    action_str = "block"
+                    allowed = False
+                elif required_action == "degrade":
+                    if action_str in {"allow", "none"}:
+                        action_str = "degrade"
+                    allowed = True
+                else:
+                    if action_str == "allow":
+                        action_str = "none"
+                    allowed = action_str != "block"
+
+                enforcement_mode = _safe_text(route_info.get("enforcement_mode"), max_len=32).lower() or (
+                    "fail_closed" if (required_action == "block" and cfgb.strict_mode) else ("must_enforce" if (required_action != "allow" and cfgb.strict_mode) else "advisory")
+                )
+
+                security_block = {
+                    "trust_zone": req.trust_zone,
+                    "route_profile": req.route_profile,
+                    "risk_label": req.risk_label,
+                    "threat_kind": req.threat_kind,
+                    "threat_confidence": req.threat_confidence,
+                    "pq_required": req.pq_required,
+                    "pq_ok": route_info.get("pq_ok"),
+                    "policy_ref": policy_ref,
+                    "policyset_ref": policyset_ref,
+                    "policy_digest": policy_digest,
+                    "security_policy_digest": policy_digest,
+                    "route_policy_digest": policy_digest,
+                    "detector_policy_digest": detector_policy_digest,
+                    "route_id": route_plan_id,
+                    "build_id": effective_build_id,
+                    "image_digest": effective_image_digest,
+                    "compliance_tags": list(req.compliance_tags),
+                    "request_id": request_id,
+                    "event_id": event_id,
+                    "body_digest": body_digest,
+                    "surface_kind": "local_http_fallback",
+                }
+                durable_governance_requested = bool(
+                    _coerce_bool(os.getenv("TCD_HTTP_REQUIRE_DURABLE_EVIDENCE"), default=False)
+                    or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_DURABLE_RECEIPTS"), default=False)
+                    or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_LEDGER_WHEN_REQUIRED"), default=False)
+                    or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_TERMINAL_GOVERNANCE_FOR_RECEIPT"), default=False)
+                    or _coerce_bool(os.getenv("TCD_SECURITY_ROUTER_REQUIRE_STORAGE_READY_FOR_RECEIPT"), default=False)
+                    or bool(os.getenv("TCD_HTTP_EVIDENCE_STORE_DSN") or os.getenv("TCD_HTTP_EVIDENCE_STORE_PATH"))
+                )
+                local_ledger_required = bool(
+                    _coerce_bool(route_info.get("ledger_required"), default=False)
+                    or durable_governance_requested
+                )
+                local_attestation_required = bool(
+                    _coerce_bool(route_info.get("attestation_required"), default=False)
+                    or bool(cfgb.require_attestor_when_receipt_required)
+                    or durable_governance_requested
+                )
+                artifacts = {
+                    "receipt_required": bool(
+                        cfgb.receipts_enable_default
+                        or (cfgb.require_receipts_on_fail and required_action == "block")
+                        or (cfgb.require_receipts_when_pq and bool(req.pq_required))
+                    ),
+                    "ledger_required": bool(local_ledger_required),
+                    "attestation_required": bool(local_attestation_required),
+                    "ledger_stage": "skipped",
+                    "outbox_status": "none",
+                    "receipt_surface_kind": "local_attestation",
+                    "durability": "ephemeral_local_only",
+                }
+                evidence_identity = {
+                    "request_id": request_id,
+                    "event_id": event_id,
+                    "decision_id": decision_id,
+                    "route_plan_id": route_plan_id,
+                    "route_config_fingerprint": route_config_fingerprint,
+                    "config_fingerprint": route_config_fingerprint,
+                    "config_fingerprint_kind": "route",
+                    "policy_ref": policy_ref,
+                    "policyset_ref": policyset_ref,
+                    "policy_digest": policy_digest,
+                    "security_policy_digest": policy_digest,
+                    "route_policy_digest": policy_digest,
+                    "detector_policy_digest": detector_policy_digest,
+                    "state_domain_id": state_domain_id,
+                    "controller_mode": controller_mode,
+                    "statistical_guarantee_scope": guarantee_scope,
+                    "receipt_ref": receipt_ref,
+                    "audit_ref": audit_ref,
+                    "produced_by": "service_http.local",
+                }
+
+            route_config_fingerprint = (
+                _first_route_config_fingerprint(
+                    route_config_fingerprint,
+                    config_fingerprint,
+                    route_info.get("route_config_fingerprint") if isinstance(route_info, Mapping) else None,
+                    route_info.get("config_fingerprint") if isinstance(route_info, Mapping) else None,
+                    route_info.get("cfg_fp") if isinstance(route_info, Mapping) else None,
+                    evidence_identity.get("route_config_fingerprint") if isinstance(evidence_identity, Mapping) else None,
+                    evidence_identity.get("config_fingerprint") if isinstance(evidence_identity, Mapping) else None,
+                    security_public.get("route_config_fingerprint") if isinstance(security_public, Mapping) else None,
+                    security_public.get("config_fingerprint") if isinstance(security_public, Mapping) else None,
+                    security_block.get("route_config_fingerprint") if isinstance(security_block, Mapping) else None,
+                    security_block.get("config_fingerprint") if isinstance(security_block, Mapping) else None,
+                )
+                or _derive_route_config_fingerprint(
+                    route_info=route_info,
+                    policy_ref=policy_ref,
+                    policyset_ref=policyset_ref,
+                    policy_digest=policy_digest,
+                    fallback_seed=None,
+                )
+            )
+            config_fingerprint = route_config_fingerprint
+            receipt_cfg_fp = _first_route_config_fingerprint(receipt_cfg_fp, route_config_fingerprint) or route_config_fingerprint
+            if isinstance(route_info, dict):
+                route_info["route_config_fingerprint"] = route_config_fingerprint
+                route_info["config_fingerprint"] = route_config_fingerprint
+                route_info["config_fingerprint_kind"] = "route"
+            evidence_identity["route_config_fingerprint"] = route_config_fingerprint
+            evidence_identity["config_fingerprint"] = route_config_fingerprint
+            evidence_identity["config_fingerprint_kind"] = "route"
+
+            terminal_contract = _resolve_terminal_contract(
+                required_action=required_action,
+                action=action_str,
+                allowed=allowed,
+                enforcement_mode=enforcement_mode,
+            )
+            required_action = terminal_contract["required_action"]
+            action_str = terminal_contract["action"]
+            allowed = terminal_contract["allowed"]
+            enforcement_mode = terminal_contract["enforcement_mode"]
+            final_verdict = bool(terminal_contract["verdict"])
+            decision_label = str(terminal_contract["decision"])
+            service_receipt_required = bool(
+                _receipt_required_for_request(req, decision=decision_label)
+                or (cfgb.strict_mode and cfgb.require_finalized_receipt_surface_when_strict)
+            )
+            route_receipt_required = (
+                _coerce_bool(route_info.get("route_receipt_required"), default=False)
+                if route_info.get("route_receipt_required") is not None
+                else (
+                    _coerce_bool(route_info.get("receipt_required"), default=False)
+                    if route_info.get("receipt_required") is not None
+                    else False
+                )
+            )
+            effective_receipt_required = bool(route_receipt_required or service_receipt_required)
+            receipt_required = bool(effective_receipt_required)
+            if isinstance(route_info, dict):
+                route_info.pop("receipt_required", None)
+                route_info["route_receipt_required"] = bool(route_receipt_required)
+                route_info["service_receipt_required"] = bool(service_receipt_required)
+                route_info["effective_receipt_required"] = bool(effective_receipt_required)
+            artifacts["route_receipt_required"] = bool(route_receipt_required)
+            artifacts["service_receipt_required"] = bool(service_receipt_required)
+            artifacts["effective_receipt_required"] = bool(effective_receipt_required)
+            artifacts["receipt_required"] = bool(effective_receipt_required)
+
+            receipt_surface_available = (
+                _receipt_required_artifact_available(
                     receipt_public=receipt_public_explicit,
+                    receipt_verification=receipt_verification_explicit,
                     receipt_private=receipt_private_payload,
                     raw_receipt=raw_receipt_payload,
-                    fallback=audit_ref,
                 )
-                evidence_identity["receipt_ref"] = receipt_ref
-                evidence_identity["audit_ref"] = audit_ref
+                if receipt_required
+                else _receipt_surface_available(
+                    receipt_public=receipt_public_explicit,
+                    receipt_verification=receipt_verification_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                )
+            )
 
-        receipt_surface_available = (
-            _receipt_required_artifact_available(
-                receipt_public=receipt_public_explicit,
-                receipt_verification=receipt_verification_explicit,
+            if not receipt_surface_available:
+                need_local_receipt = bool(receipt_required and rt.receipt_mgr.attestor is not None)
+                _LOG.debug(
+                    "DIAG STAGE 8 before issue_local_final request_id=%s receipt_required=%s need_local_receipt=%s",
+                    request_id,
+                    receipt_required,
+                    need_local_receipt,
+                )
+                if need_local_receipt:
+                    rb = rt.receipt_mgr.issue_local_final(
+                        trace=trace_vec,
+                        spectrum=spectrum,
+                        features=features,
+                        req=req,
+                        request_id=request_id,
+                        event_id=event_id,
+                        body_digest=body_digest,
+                        score=score,
+                        p_final=p_final,
+                        route_info=route_info,
+                        final_action=action_str,
+                        required_action=required_action,
+                        enforcement_mode=enforcement_mode,
+                        allowed=allowed,
+                        cause=cause,
+                        policy_ref=policy_ref,
+                        policyset_ref=policyset_ref,
+                        policy_digest=policy_digest,
+                        cfg_fp=route_config_fingerprint,
+                        decision_id=decision_id or "",
+                        route_plan_id=route_plan_id or "",
+                        audit_ref=audit_ref,
+                        state_domain_id=state_domain_id,
+                        adapter_registry_fp=budget.adapter_registry_fp,
+                        budget=budget,
+                        detector_components=dict(verdict_pack.get("components", {}))
+                        if isinstance(verdict_pack.get("components"), Mapping)
+                        else {},
+                        mv_info=mv_info,
+                        security_block=security_block,
+                        artifacts=artifacts,
+                        evidence_identity=evidence_identity,
+                        pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False)
+                        if route_info.get("pq_ok") is not None
+                        else None,
+                        build_id=effective_build_id,
+                        image_digest=effective_image_digest,
+                        detector_policy_digest=detector_policy_digest,
+                        route_policy_digest=_safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                        security_policy_digest=policy_digest,
+                    )
+                    _LOG.debug(
+                        "DIAG STAGE 9 after issue_local_final request_id=%s raw_nonempty=%s public_nonempty=%s verification_present=%s",
+                        request_id,
+                        bool(rb.raw),
+                        bool(rb.public),
+                        rb.verification is not None,
+                    )
+                    raw_receipt_payload = dict(rb.raw or {})
+                    receipt_public_explicit = dict(rb.public or {})
+                    receipt_verification_explicit = dict(rb.verification or {}) if rb.verification is not None else None
+                    if not receipt_private_payload and raw_receipt_payload:
+                        receipt_private_payload = dict(raw_receipt_payload)
+
+                    receipt_ref = _derive_receipt_ref(
+                        receipt_public=receipt_public_explicit,
+                        receipt_verification=receipt_verification_explicit,
+                        receipt_private=receipt_private_payload,
+                        raw_receipt=raw_receipt_payload,
+                        fallback=receipt_ref,
+                    )
+                    audit_ref = _derive_audit_ref(
+                        receipt_public=receipt_public_explicit,
+                        receipt_private=receipt_private_payload,
+                        raw_receipt=raw_receipt_payload,
+                        fallback=audit_ref,
+                    )
+                    attestation_ref = _derive_attestation_ref(
+                        receipt_public=receipt_public_explicit,
+                        receipt_verification=receipt_verification_explicit,
+                        receipt_private=receipt_private_payload,
+                        raw_receipt=raw_receipt_payload,
+                        fallback=artifacts.get("attestation_ref"),
+                    )
+                    if attestation_ref:
+                        artifacts["attestation_ref"] = attestation_ref
+                        evidence_identity["attestation_ref"] = attestation_ref
+                    evidence_identity["receipt_ref"] = receipt_ref
+                    evidence_identity["audit_ref"] = audit_ref
+
+            receipt_surface_available = (
+                _receipt_required_artifact_available(
+                    receipt_public=receipt_public_explicit,
+                    receipt_verification=receipt_verification_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                )
+                if receipt_required
+                else _receipt_surface_available(
+                    receipt_public=receipt_public_explicit,
+                    receipt_verification=receipt_verification_explicit,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                )
+            )
+
+            if receipt_required and not receipt_surface_available:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
+
+            decision_id = decision_id or f"hd1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:decision', payload={'event_id': event_id, 'request_id': request_id, 'required_action': required_action, 'route_plan_id': route_plan_id, 'subject': [req.tenant, req.user, req.session]}, out_hex=32)}"
+            route_plan_id = route_plan_id or f"hr1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:route_plan', payload={'risk_label': req.risk_label, 'trust_zone': req.trust_zone, 'route_profile': req.route_profile, 'score': _stable_float(score), 'required_action': required_action}, out_hex=32)}"
+            request.state.decision_id = decision_id
+            request.state.route_plan_id = route_plan_id
+
+            if receipt_public_explicit:
+                receipt_public_explicit = {
+                    **receipt_public_explicit,
+                    "receipt_ref": receipt_public_explicit.get("receipt_ref") or receipt_ref or receipt_public_explicit.get("head"),
+                    "audit_ref": receipt_public_explicit.get("audit_ref") or audit_ref,
+                    "event_id": receipt_public_explicit.get("event_id") or event_id,
+                    "decision_id": receipt_public_explicit.get("decision_id") or decision_id,
+                    "route_plan_id": receipt_public_explicit.get("route_plan_id") or route_plan_id,
+                    "policy_ref": receipt_public_explicit.get("policy_ref") or policy_ref,
+                    "policyset_ref": receipt_public_explicit.get("policyset_ref") or policyset_ref,
+                    "policy_digest": receipt_public_explicit.get("policy_digest") or policy_digest,
+                    "security_policy_digest": receipt_public_explicit.get("security_policy_digest") or policy_digest,
+                    "route_policy_digest": receipt_public_explicit.get("route_policy_digest") or _safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                    "detector_policy_digest": receipt_public_explicit.get("detector_policy_digest") or detector_policy_digest,
+                    "cfg_fp": receipt_public_explicit.get("cfg_fp") or receipt_cfg_fp or route_config_fingerprint,
+                }
+
+            if raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload):
+                raw_receipt_payload = {
+                    **raw_receipt_payload,
+                    "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
+                    "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
+                    "event_id": raw_receipt_payload.get("event_id") or event_id,
+                    "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
+                    "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
+                    "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
+                    "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
+                    "policy_digest": raw_receipt_payload.get("policy_digest") or policy_digest,
+                    "security_policy_digest": raw_receipt_payload.get("security_policy_digest") or policy_digest,
+                    "route_policy_digest": raw_receipt_payload.get("route_policy_digest") or _safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                    "detector_policy_digest": raw_receipt_payload.get("detector_policy_digest") or detector_policy_digest,
+                    "cfg_fp": raw_receipt_payload.get("cfg_fp") or receipt_cfg_fp or route_config_fingerprint,
+                    "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
+                    "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+                    "build_id": raw_receipt_payload.get("build_id") or effective_build_id,
+                    "image_digest": raw_receipt_payload.get("image_digest") or effective_image_digest,
+                    "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
+                    "pq_ok": raw_receipt_payload.get("pq_ok")
+                    if raw_receipt_payload.get("pq_ok") is not None
+                    else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+                }
+
+            if receipt_private_payload and _receipt_payload_has_material(receipt_private_payload):
+                receipt_private_payload = {
+                    **receipt_private_payload,
+                    "receipt_ref": receipt_private_payload.get("receipt_ref") or receipt_ref or receipt_private_payload.get("receipt"),
+                    "audit_ref": receipt_private_payload.get("audit_ref") or audit_ref,
+                    "event_id": receipt_private_payload.get("event_id") or event_id,
+                    "decision_id": receipt_private_payload.get("decision_id") or decision_id,
+                    "route_plan_id": receipt_private_payload.get("route_plan_id") or route_plan_id,
+                    "policy_ref": receipt_private_payload.get("policy_ref") or policy_ref,
+                    "policyset_ref": receipt_private_payload.get("policyset_ref") or policyset_ref,
+                    "policy_digest": receipt_private_payload.get("policy_digest") or policy_digest,
+                    "security_policy_digest": receipt_private_payload.get("security_policy_digest") or policy_digest,
+                    "route_policy_digest": receipt_private_payload.get("route_policy_digest") or _safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                    "detector_policy_digest": receipt_private_payload.get("detector_policy_digest") or detector_policy_digest,
+                    "cfg_fp": receipt_private_payload.get("cfg_fp") or receipt_cfg_fp or route_config_fingerprint,
+                    "state_domain_id": receipt_private_payload.get("state_domain_id") or state_domain_id,
+                    "adapter_registry_fp": receipt_private_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
+                    "build_id": receipt_private_payload.get("build_id") or effective_build_id,
+                    "image_digest": receipt_private_payload.get("image_digest") or effective_image_digest,
+                    "pq_required": receipt_private_payload.get("pq_required") if receipt_private_payload.get("pq_required") is not None else req.pq_required,
+                    "pq_ok": receipt_private_payload.get("pq_ok")
+                    if receipt_private_payload.get("pq_ok") is not None
+                    else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+                }
+
+            receipt_public, receipt_verification, receipt_private_payload = _receipt_surfaces_from_sources(
+                explicit_public=receipt_public_explicit,
+                explicit_verification=receipt_verification_explicit,
+                explicit_private=receipt_private_payload,
+                raw_payload=raw_receipt_payload,
+                expose_verification_bundle_public=(cfgb.expose_verification_bundle_public or cfgb.expose_legacy_receipt_aliases),
+                expose_verify_key_public=cfgb.expose_verify_key_public,
+            )
+
+            receipt_ref = _derive_receipt_ref(
+                receipt_public=receipt_public,
+                receipt_verification=receipt_verification,
+                receipt_private=receipt_private_payload,
+                raw_receipt=raw_receipt_payload,
+                fallback=receipt_ref,
+            )
+            audit_ref = _derive_audit_ref(
+                receipt_public=receipt_public,
+                receipt_private=receipt_private_payload,
+                raw_receipt=raw_receipt_payload,
+                fallback=audit_ref,
+            )
+
+            receipt_cfg_fp = (
+                _receipt_cfg_fp_from_sources(
+                    receipt_public,
+                    receipt_verification,
+                    receipt_private_payload,
+                    raw_receipt_payload,
+                    route_config_fingerprint=route_config_fingerprint,
+                )
+                or route_config_fingerprint
+            )
+            for receipt_cfg_obj in (receipt_public, receipt_verification, receipt_private_payload, raw_receipt_payload):
+                if isinstance(receipt_cfg_obj, dict) and receipt_cfg_obj:
+                    receipt_cfg_obj["route_config_fingerprint"] = route_config_fingerprint
+                    receipt_cfg_obj["cfg_fp"] = receipt_cfg_obj.get("cfg_fp") or receipt_cfg_fp
+            evidence_identity["route_config_fingerprint"] = route_config_fingerprint
+            evidence_identity["config_fingerprint"] = route_config_fingerprint
+            evidence_identity["config_fingerprint_kind"] = "route"
+            evidence_identity["receipt_cfg_fp"] = receipt_cfg_fp
+            request.state.route_config_fingerprint = route_config_fingerprint
+            request.state.receipt_cfg_fp = receipt_cfg_fp
+
+            stored_receipt_ref = rt.receipt_store.put_from_sources(
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+            )
+            if stored_receipt_ref:
+                receipt_ref = stored_receipt_ref
+                if receipt_public:
+                    receipt_public["receipt_ref"] = stored_receipt_ref
+                if receipt_verification:
+                    receipt_verification["receipt_ref"] = stored_receipt_ref
+                if receipt_private_payload:
+                    receipt_private_payload["receipt_ref"] = stored_receipt_ref
+                if raw_receipt_payload:
+                    raw_receipt_payload["receipt_ref"] = stored_receipt_ref
+                artifacts["receipt_ref"] = stored_receipt_ref
+                evidence_identity["receipt_ref"] = stored_receipt_ref
+                artifacts["receipt_ref_lookup_available"] = True
+                artifacts["receipt_ref_lookup_store"] = rt.receipt_store.backend()
+                artifacts["receipt_ref_lookup_durable"] = rt.receipt_store.durable_enabled()
+
+            evidence_commit = rt.evidence_store.put_from_sources(
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+                receipt_public,
+                event_id=event_id,
+                decision_id=decision_id,
+                route_plan_id=route_plan_id,
+                policy_ref=policy_ref,
+                policyset_ref=policyset_ref,
+                cfg_fp=route_config_fingerprint,
+                audit_ref=audit_ref,
+                receipt_ref=receipt_ref,
+            )
+            if evidence_commit is not None and rt.evidence_store.durable_enabled():
+                receipt_ref = evidence_commit.receipt_ref or receipt_ref
+                audit_ref = evidence_commit.audit_ref or audit_ref
+                attestation_ref = artifacts.get("attestation_ref") or _derive_attestation_ref(
+                    receipt_public=receipt_public,
+                    receipt_verification=receipt_verification,
+                    receipt_private=receipt_private_payload,
+                    raw_receipt=raw_receipt_payload,
+                    fallback=None,
+                )
+                if attestation_ref:
+                    artifacts["attestation_ref"] = attestation_ref
+                    evidence_identity["attestation_ref"] = attestation_ref
+                artifacts.update(
+                    {
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_ref,
+                        "ledger_ref": evidence_commit.ledger_ref,
+                        "commit_ref": evidence_commit.commit_ref,
+                        "ledger_stage": "committed",
+                        "outbox_status": artifacts.get("outbox_status") or "none",
+                        "receipt_surface_kind": "durable_committed",
+                        "receipt_delivery_state": "committed",
+                        "evidence_durable": True,
+                        "evidence_storage_ready": True,
+                        "governance_terminal": True,
+                        "receipt_governance_ready": True,
+                        "durability": "durable_local_sqlite",
+                        "evidence_store_backend": evidence_commit.store_backend,
+                        "evidence_store_chain_id": evidence_commit.chain_id,
+                        "evidence_store_chain_head": evidence_commit.chain_head,
+                        "chain_id": evidence_commit.chain_id,
+                        "chain_head": evidence_commit.chain_head,
+                        "produced_by": [
+                            "service_http.local",
+                            "tcd.attest",
+                            "service_http.local_evidence_store",
+                            "tcd.storage",
+                        ],
+                        "evidence_store_stored": evidence_commit.stored,
+                        "evidence_store_idempotent": evidence_commit.idempotent,
+                    }
+                )
+                evidence_identity.update(
+                    {
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_ref,
+                        "ledger_ref": evidence_commit.ledger_ref,
+                        "commit_ref": evidence_commit.commit_ref,
+                        "ledger_stage": "committed",
+                        "outbox_status": artifacts.get("outbox_status") or "none",
+                        "receipt_surface_kind": "durable_committed",
+                        "receipt_delivery_state": "committed",
+                        "evidence_durable": True,
+                        "evidence_storage_ready": True,
+                        "governance_terminal": True,
+                    }
+                )
+                for obj in (receipt_public, receipt_verification, receipt_private_payload, raw_receipt_payload):
+                    if isinstance(obj, dict) and obj:
+                        obj["audit_ref"] = obj.get("audit_ref") or audit_ref
+                        obj["receipt_ref"] = obj.get("receipt_ref") or receipt_ref
+                        obj["attestation_ref"] = obj.get("attestation_ref") or artifacts.get("attestation_ref")
+                        obj["ledger_ref"] = evidence_commit.ledger_ref
+                        obj["commit_ref"] = evidence_commit.commit_ref
+                        obj["ledger_stage"] = "committed"
+                        obj["outbox_status"] = artifacts.get("outbox_status") or "none"
+                        obj["receipt_surface_kind"] = "durable_committed"
+                        obj["receipt_delivery_state"] = "committed"
+                        obj["evidence_durable"] = True
+                        obj["evidence_storage_ready"] = True
+                        obj["governance_terminal"] = True
+                        obj["receipt_governance_ready"] = True
+
+                commit_receipt_finalized = False
+                decision_receipt_payload_for_commit = dict(receipt_private_payload or raw_receipt_payload or receipt_verification or {})
+                decision_artifact_for_commit = _receipt_artifact_from_mapping(decision_receipt_payload_for_commit, include_verify_key=True)
+                decision_receipt_ref_for_commit = _first_text(decision_artifact_for_commit.receipt_ref, decision_artifact_for_commit.head, max_len=512)
+                if decision_receipt_ref_for_commit and decision_artifact_for_commit.head and rt.receipt_mgr.attestor is not None:
+                    commit_artifacts = {
+                        **dict(artifacts),
+                        "commit_receipt_mode": True,
+                        "receipt_kind": "commit_receipt",
+                        "event_type": "service_http.receipt_commit",
+                        "decision_receipt_ref": decision_receipt_ref_for_commit,
+                        "decision_receipt_head": decision_artifact_for_commit.head,
+                        "decision_receipt_body_digest": decision_artifact_for_commit.body_digest,
+                        "ledger_ref": evidence_commit.ledger_ref,
+                        "commit_ref": evidence_commit.commit_ref,
+                        "chain_namespace": evidence_commit.chain_namespace,
+                        "chain_id": evidence_commit.chain_id,
+                        "chain_seq": evidence_commit.chain_seq,
+                        "ledger_stage": "committed",
+                        "outbox_status": artifacts.get("outbox_status") or "none",
+                        "receipt_surface_kind": "durable_committed",
+                        "receipt_delivery_state": "committed",
+                        "evidence_durable": True,
+                        "evidence_storage_ready": True,
+                        "governance_terminal": True,
+                        "receipt_governance_ready": True,
+                        "durability": "durable_local_sqlite",
+                    }
+                    commit_evidence_identity = {
+                        **dict(evidence_identity),
+                        "audit_ref": audit_ref,
+                        "receipt_ref": receipt_ref,
+                        "decision_receipt_ref": decision_receipt_ref_for_commit,
+                        "decision_receipt_head": decision_artifact_for_commit.head,
+                        "ledger_ref": evidence_commit.ledger_ref,
+                        "commit_ref": evidence_commit.commit_ref,
+                        "ledger_stage": "committed",
+                        "outbox_status": artifacts.get("outbox_status") or "none",
+                        "receipt_surface_kind": "durable_committed",
+                        "receipt_delivery_state": "committed",
+                        "evidence_durable": True,
+                        "evidence_storage_ready": True,
+                        "governance_terminal": True,
+                    }
+                    rb_commit = rt.receipt_mgr.issue_local_final(
+                        trace=trace_vec,
+                        spectrum=spectrum,
+                        features=features,
+                        req=req,
+                        request_id=request_id,
+                        event_id=event_id,
+                        body_digest=body_digest,
+                        score=score,
+                        p_final=p_final,
+                        route_info=route_info,
+                        final_action=action_str,
+                        required_action=required_action,
+                        enforcement_mode=enforcement_mode,
+                        allowed=allowed,
+                        cause=cause,
+                        policy_ref=policy_ref,
+                        policyset_ref=policyset_ref,
+                        policy_digest=policy_digest,
+                        cfg_fp=route_config_fingerprint,
+                        decision_id=decision_id or "",
+                        route_plan_id=route_plan_id or "",
+                        audit_ref=audit_ref,
+                        state_domain_id=state_domain_id,
+                        adapter_registry_fp=budget.adapter_registry_fp,
+                        budget=budget,
+                        detector_components=dict(verdict_pack.get("components", {}))
+                        if isinstance(verdict_pack.get("components"), Mapping)
+                        else {},
+                        mv_info=mv_info,
+                        security_block=security_block,
+                        artifacts=commit_artifacts,
+                        evidence_identity=commit_evidence_identity,
+                        pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False)
+                        if route_info.get("pq_ok") is not None
+                        else None,
+                        build_id=effective_build_id,
+                        image_digest=effective_image_digest,
+                        detector_policy_digest=detector_policy_digest,
+                        route_policy_digest=_safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                        security_policy_digest=policy_digest,
+                    )
+                    if rb_commit.raw and (rb_commit.public or rb_commit.verification):
+                        raw_receipt_payload = dict(rb_commit.raw or {})
+                        receipt_public = dict(rb_commit.public or {})
+                        receipt_verification = dict(rb_commit.verification or {}) if rb_commit.verification is not None else None
+                        receipt_public_explicit = dict(receipt_public)
+                        receipt_verification_explicit = dict(receipt_verification or {}) if receipt_verification is not None else None
+                        receipt_private_payload = dict(raw_receipt_payload)
+                        stored_commit_receipt_ref = rt.receipt_store.put_from_sources(
+                            receipt_verification,
+                            receipt_private_payload,
+                            raw_receipt_payload,
+                        )
+                        commit_receipt_ref = stored_commit_receipt_ref or _derive_receipt_ref(
+                            receipt_public=receipt_public,
+                            receipt_verification=receipt_verification,
+                            receipt_private=receipt_private_payload,
+                            raw_receipt=raw_receipt_payload,
+                            fallback=None,
+                        )
+                        if commit_receipt_ref:
+                            receipt_ref = commit_receipt_ref
+                        commit_artifact_final = _receipt_artifact_from_mapping(raw_receipt_payload, include_verify_key=True)
+                        for obj2 in (receipt_public, receipt_verification, receipt_private_payload, raw_receipt_payload):
+                            if isinstance(obj2, dict) and obj2:
+                                obj2["audit_ref"] = obj2.get("audit_ref") or audit_ref
+                                obj2["receipt_ref"] = obj2.get("receipt_ref") or receipt_ref
+                                obj2["ledger_ref"] = evidence_commit.ledger_ref
+                                obj2["commit_ref"] = evidence_commit.commit_ref
+                                obj2["ledger_stage"] = "committed"
+                                obj2["outbox_status"] = artifacts.get("outbox_status") or "none"
+                                obj2["receipt_surface_kind"] = "durable_committed"
+                                obj2["receipt_delivery_state"] = "committed"
+                                obj2["evidence_durable"] = True
+                                obj2["evidence_storage_ready"] = True
+                                obj2["governance_terminal"] = True
+                                obj2["receipt_governance_ready"] = True
+                        artifacts.update(
+                            {
+                                "decision_receipt_ref": decision_receipt_ref_for_commit,
+                                "decision_receipt_head": decision_artifact_for_commit.head,
+                                "decision_receipt_body_digest": decision_artifact_for_commit.body_digest,
+                                "commit_receipt_ref": receipt_ref,
+                                "commit_receipt_head": commit_artifact_final.head,
+                                "receipt_ref": receipt_ref,
+                                "audit_ref": audit_ref,
+                                "ledger_ref": evidence_commit.ledger_ref,
+                                "commit_ref": evidence_commit.commit_ref,
+                                "ledger_stage": "committed",
+                                "outbox_status": artifacts.get("outbox_status") or "none",
+                                "receipt_surface_kind": "durable_committed",
+                                "receipt_delivery_state": "committed",
+                                "evidence_durable": True,
+                                "evidence_storage_ready": True,
+                                "governance_terminal": True,
+                                "receipt_governance_ready": True,
+                                "durability": "durable_local_sqlite",
+                            }
+                        )
+                        evidence_identity.update(
+                            {
+                                "audit_ref": audit_ref,
+                                "receipt_ref": receipt_ref,
+                                "decision_receipt_ref": decision_receipt_ref_for_commit,
+                                "decision_receipt_head": decision_artifact_for_commit.head,
+                                "ledger_ref": evidence_commit.ledger_ref,
+                                "commit_ref": evidence_commit.commit_ref,
+                                "ledger_stage": "committed",
+                                "outbox_status": artifacts.get("outbox_status") or "none",
+                                "receipt_surface_kind": "durable_committed",
+                                "receipt_delivery_state": "committed",
+                                "evidence_durable": True,
+                                "evidence_storage_ready": True,
+                                "governance_terminal": True,
+                            }
+                        )
+                        commit_receipt_finalized = True
+
+                if not commit_receipt_finalized and _coerce_bool(os.getenv("TCD_HTTP_REQUIRE_COMMIT_RECEIPT_AFTER_DURABLE"), default=True):
+                    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="commit receipt unavailable")
+
+            if (
+                receipt_required
+                and _coerce_bool(os.getenv("TCD_HTTP_REQUIRE_DURABLE_EVIDENCE"), default=False)
+                and not bool(artifacts.get("evidence_storage_ready"))
+            ):
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="durable evidence unavailable")
+
+            receipt_issued = _receipt_surface_available(
+                receipt_public=receipt_public,
+                receipt_verification=receipt_verification,
                 receipt_private=receipt_private_payload,
                 raw_receipt=raw_receipt_payload,
             )
-            if receipt_required
-            else _receipt_surface_available(
-                receipt_public=receipt_public_explicit,
-                receipt_verification=receipt_verification_explicit,
-                receipt_private=receipt_private_payload,
-                raw_receipt=raw_receipt_payload,
+            artifacts["route_receipt_required"] = bool(route_receipt_required)
+            artifacts["service_receipt_required"] = bool(service_receipt_required)
+            artifacts["effective_receipt_required"] = bool(effective_receipt_required)
+            artifacts["receipt_required"] = bool(effective_receipt_required)
+            artifacts["receipt_issued"] = bool(receipt_issued)
+            route_info = {
+                **{k: v for k, v in route_info.items() if k != "receipt_required"},
+                "route_receipt_required": bool(route_receipt_required),
+                "service_receipt_required": bool(service_receipt_required),
+                "effective_receipt_required": bool(effective_receipt_required),
+                "receipt_issued": bool(receipt_issued),
+            }
+
+            artifacts = _normalize_artifact_refs(
+                artifacts,
+                audit_ref=audit_ref,
+                receipt_ref=receipt_ref,
+                body_digest=body_digest,
             )
-        )
 
-        if receipt_required and not receipt_surface_available:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="finalized receipt surface unavailable")
+            identity_status = "ok"
+            if req.tenant == "tenant0" or req.user == "user0" or req.session == "sess0":
+                identity_status = "defaulted"
 
-        decision_id = decision_id or f"hd1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:decision', payload={'event_id': event_id, 'request_id': request_id, 'required_action': required_action, 'route_plan_id': route_plan_id, 'subject': [req.tenant, req.user, req.session]}, out_hex=32)}"
-        route_plan_id = route_plan_id or f"hr1:{_SAFE_DIGEST_ALG}:{_hash_hex(ctx='tcd:http:route_plan', payload={'risk_label': req.risk_label, 'trust_zone': req.trust_zone, 'route_profile': req.route_profile, 'score': _stable_float(score), 'required_action': required_action}, out_hex=32)}"
-        request.state.decision_id = decision_id
-        request.state.route_plan_id = route_plan_id
-
-        if receipt_public_explicit:
-            receipt_public_explicit = {
-                **receipt_public_explicit,
-                "receipt_ref": receipt_public_explicit.get("receipt_ref") or receipt_ref or receipt_public_explicit.get("head"),
-                "audit_ref": receipt_public_explicit.get("audit_ref") or audit_ref,
-                "event_id": receipt_public_explicit.get("event_id") or event_id,
-                "decision_id": receipt_public_explicit.get("decision_id") or decision_id,
-                "route_plan_id": receipt_public_explicit.get("route_plan_id") or route_plan_id,
-                "policy_ref": receipt_public_explicit.get("policy_ref") or policy_ref,
-                "policyset_ref": receipt_public_explicit.get("policyset_ref") or policyset_ref,
-                "cfg_fp": receipt_public_explicit.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
+            auth_proj = getattr(request.state, "auth_projection", None)
+            auth_public = auth_proj.public_view(expose_principal=False) if isinstance(auth_proj, _AuthProjection) else {
+                "mode": _safe_text(getattr(request.state, "auth_mode", None), max_len=64) or "none",
+                "trusted": bool(getattr(request.state, "auth_trusted", False)),
             }
 
-        if raw_receipt_payload and _receipt_payload_has_material(raw_receipt_payload):
-            raw_receipt_payload = {
-                **raw_receipt_payload,
-                "receipt_ref": raw_receipt_payload.get("receipt_ref") or receipt_ref or raw_receipt_payload.get("receipt"),
-                "audit_ref": raw_receipt_payload.get("audit_ref") or audit_ref,
-                "event_id": raw_receipt_payload.get("event_id") or event_id,
-                "decision_id": raw_receipt_payload.get("decision_id") or decision_id,
-                "route_plan_id": raw_receipt_payload.get("route_plan_id") or route_plan_id,
-                "policy_ref": raw_receipt_payload.get("policy_ref") or policy_ref,
-                "policyset_ref": raw_receipt_payload.get("policyset_ref") or policyset_ref,
-                "cfg_fp": raw_receipt_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
-                "state_domain_id": raw_receipt_payload.get("state_domain_id") or state_domain_id,
-                "adapter_registry_fp": raw_receipt_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
-                "build_id": raw_receipt_payload.get("build_id") or req.build_id,
-                "image_digest": raw_receipt_payload.get("image_digest") or req.image_digest,
-                "pq_required": raw_receipt_payload.get("pq_required") if raw_receipt_payload.get("pq_required") is not None else req.pq_required,
-                "pq_ok": raw_receipt_payload.get("pq_ok")
-                if raw_receipt_payload.get("pq_ok") is not None
-                else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
+            evidence_identity = {
+                **evidence_identity,
+                "request_id": request_id,
+                "event_id": event_id,
+                "decision_id": decision_id,
+                "route_plan_id": route_plan_id,
+                "policy_ref": policy_ref,
+                "policyset_ref": policyset_ref,
+                "policy_digest": policy_digest,
+                "security_policy_digest": policy_digest,
+                "route_policy_digest": _safe_text(route_info.get("policy_digest"), max_len=256) or policy_digest,
+                "detector_policy_digest": detector_policy_digest,
+                "route_config_fingerprint": route_config_fingerprint,
+                "config_fingerprint": route_config_fingerprint,
+                "config_fingerprint_kind": "route",
+                "bundle_version": bundle_version or rt.bundle.version,
+                "state_domain_id": state_domain_id,
+                "controller_mode": controller_mode,
+                "statistical_guarantee_scope": guarantee_scope,
+                "adapter_registry_fp": budget.adapter_registry_fp,
+                "selected_source": selected_source,
+                "audit_ref": artifacts.get("audit_ref") or audit_ref,
+                "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
+                "ledger_ref": artifacts.get("ledger_ref"),
+                "attestation_ref": artifacts.get("attestation_ref"),
+                "prepare_ref": artifacts.get("prepare_ref"),
+                "commit_ref": artifacts.get("commit_ref"),
+                "outbox_ref": artifacts.get("outbox_ref"),
+                "outbox_status": artifacts.get("outbox_status"),
+                "ledger_stage": artifacts.get("ledger_stage"),
             }
 
-        if receipt_private_payload and _receipt_payload_has_material(receipt_private_payload):
-            receipt_private_payload = {
-                **receipt_private_payload,
-                "receipt_ref": receipt_private_payload.get("receipt_ref") or receipt_ref or receipt_private_payload.get("receipt"),
-                "audit_ref": receipt_private_payload.get("audit_ref") or audit_ref,
-                "event_id": receipt_private_payload.get("event_id") or event_id,
-                "decision_id": receipt_private_payload.get("decision_id") or decision_id,
-                "route_plan_id": receipt_private_payload.get("route_plan_id") or route_plan_id,
-                "policy_ref": receipt_private_payload.get("policy_ref") or policy_ref,
-                "policyset_ref": receipt_private_payload.get("policyset_ref") or policyset_ref,
-                "cfg_fp": receipt_private_payload.get("cfg_fp") or config_fingerprint or rt.bundle.cfg_fp,
-                "state_domain_id": receipt_private_payload.get("state_domain_id") or state_domain_id,
-                "adapter_registry_fp": receipt_private_payload.get("adapter_registry_fp") or budget.adapter_registry_fp,
-                "build_id": receipt_private_payload.get("build_id") or req.build_id,
-                "image_digest": receipt_private_payload.get("image_digest") or req.image_digest,
-                "pq_required": receipt_private_payload.get("pq_required") if receipt_private_payload.get("pq_required") is not None else req.pq_required,
-                "pq_ok": receipt_private_payload.get("pq_ok")
-                if receipt_private_payload.get("pq_ok") is not None
-                else (_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None),
-            }
-
-        receipt_public, receipt_verification, receipt_private_payload = _receipt_surfaces_from_sources(
-            explicit_public=receipt_public_explicit,
-            explicit_verification=receipt_verification_explicit,
-            explicit_private=receipt_private_payload,
-            raw_payload=raw_receipt_payload,
-            expose_verification_bundle_public=(cfgb.expose_verification_bundle_public or cfgb.expose_legacy_receipt_aliases),
-            expose_verify_key_public=cfgb.expose_verify_key_public,
-        )
-
-        receipt_ref = _derive_receipt_ref(
-            receipt_public=receipt_public,
-            receipt_verification=receipt_verification,
-            receipt_private=receipt_private_payload,
-            raw_receipt=raw_receipt_payload,
-            fallback=receipt_ref,
-        )
-        audit_ref = _derive_audit_ref(
-            receipt_public=receipt_public,
-            receipt_private=receipt_private_payload,
-            raw_receipt=raw_receipt_payload,
-            fallback=audit_ref,
-        )
-
-        stored_receipt_ref = rt.receipt_store.put_from_sources(
-            receipt_verification,
-            receipt_private_payload,
-            raw_receipt_payload,
-        )
-        if stored_receipt_ref:
-            receipt_ref = stored_receipt_ref
-            if receipt_public:
-                receipt_public["receipt_ref"] = stored_receipt_ref
-            if receipt_verification:
-                receipt_verification["receipt_ref"] = stored_receipt_ref
-            if receipt_private_payload:
-                receipt_private_payload["receipt_ref"] = stored_receipt_ref
-            if raw_receipt_payload:
-                raw_receipt_payload["receipt_ref"] = stored_receipt_ref
-            artifacts["receipt_ref"] = stored_receipt_ref
-            evidence_identity["receipt_ref"] = stored_receipt_ref
-            artifacts["receipt_ref_lookup_available"] = True
-            artifacts["receipt_ref_lookup_store"] = rt.receipt_store.backend()
-            artifacts["receipt_ref_lookup_durable"] = rt.receipt_store.durable_enabled()
-
-        artifacts = _normalize_artifact_refs(
-            artifacts,
-            audit_ref=audit_ref,
-            receipt_ref=receipt_ref,
-            body_digest=body_digest,
-        )
-
-        identity_status = "ok"
-        if req.tenant == "tenant0" or req.user == "user0" or req.session == "sess0":
-            identity_status = "defaulted"
-
-        auth_proj = getattr(request.state, "auth_projection", None)
-        auth_public = auth_proj.public_view(expose_principal=False) if isinstance(auth_proj, _AuthProjection) else {
-            "mode": _safe_text(getattr(request.state, "auth_mode", None), max_len=64) or "none",
-            "trusted": bool(getattr(request.state, "auth_trusted", False)),
-        }
-
-        evidence_identity = {
-            **evidence_identity,
-            "request_id": request_id,
-            "event_id": event_id,
-            "decision_id": decision_id,
-            "route_plan_id": route_plan_id,
-            "policy_ref": policy_ref,
-            "policyset_ref": policyset_ref,
-            "config_fingerprint": config_fingerprint or rt.bundle.cfg_fp,
-            "bundle_version": bundle_version or rt.bundle.version,
-            "state_domain_id": state_domain_id,
-            "controller_mode": controller_mode,
-            "statistical_guarantee_scope": guarantee_scope,
-            "adapter_registry_fp": budget.adapter_registry_fp,
-            "selected_source": selected_source,
-            "audit_ref": artifacts.get("audit_ref") or audit_ref,
-            "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
-            "ledger_ref": artifacts.get("ledger_ref"),
-            "attestation_ref": artifacts.get("attestation_ref"),
-            "prepare_ref": artifacts.get("prepare_ref"),
-            "commit_ref": artifacts.get("commit_ref"),
-            "outbox_ref": artifacts.get("outbox_ref"),
-            "outbox_status": artifacts.get("outbox_status"),
-            "ledger_stage": artifacts.get("ledger_stage"),
-        }
-
-        components: Dict[str, Any] = {
-            "detector": _sanitize_json_mapping(
-                {
-                    **(dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {}),
-                    "decision": verdict_pack.get("decision"),
-                    "action": verdict_pack.get("action"),
-                    "risk": verdict_pack.get("risk"),
-                    "p_value": verdict_pack.get("p_value"),
-                    "reason_code": verdict_pack.get("reason_code"),
-                    "error_code": verdict_pack.get("error_code"),
-                    "decision_id": verdict_pack.get("decision_id"),
-                    "config_hash": verdict_pack.get("config_hash"),
-                    "policy_digest": verdict_pack.get("policy_digest"),
-                    "state_digest": verdict_pack.get("state_digest"),
-                },
-                max_depth=5,
-                max_items=64,
-                max_str_len=512,
-                max_total_bytes=64_000,
-            ),
-            "terminal": _sanitize_json_mapping(
-                {
-                    "decision": decision_label,
-                    "required_action": required_action,
-                    "action": action_str,
-                    "allowed": allowed,
-                    "verdict": final_verdict,
-                    "enforcement_mode": enforcement_mode,
-                    "source": "service_http_terminal_contract",
-                },
-                max_depth=4,
-                max_items=16,
-                max_str_len=128,
-                max_total_bytes=8_000,
-            ),
-            "multivariate": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
-            "e_process": _sanitize_json_mapping(av_out.get("e_state", {}), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=96_000),
-            "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
-            "security": _sanitize_json_mapping(security_block, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
-            "security_router": _sanitize_json_mapping(security_public, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
-            "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=32_000),
-            "receipt": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
-            "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=64, max_str_len=256, max_total_bytes=24_000),
-            "auth": _sanitize_json_mapping(auth_public, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
-            "identity": {
-                "status": identity_status,
-                "tenant": req.tenant,
-                "user": req.user,
-                "session": req.session,
-                "model_id": req.model_id,
-            },
-            "request": {
-                "body_digest": body_digest,
-                "tenant": req.tenant,
-                "user": req.user,
-                "session": req.session,
-                "model_id": req.model_id,
-                "gpu_id": req.gpu_id,
-                "task": req.task,
-                "lang": req.lang,
-            },
-        }
-        if receipt_verification is not None:
-            components["receipt_verification_exposed"] = True
-
-        latency_s = max(0.0, time.perf_counter() - t_start)
-        http_metrics.observe_core_latency(latency_s)
-        http_metrics.push_verdict(verdict_pack, labels={"model_id": req.model_id, "gpu_id": req.gpu_id})
-        http_metrics.push_eprocess(
-            model_id=req.model_id,
-            gpu_id=req.gpu_id,
-            tenant=req.tenant,
-            user=req.user,
-            session=req.session,
-            e_value=budget.e_value,
-            alpha_alloc=budget.alpha_alloc,
-            alpha_wealth=budget.alpha_wealth,
-        )
-        http_metrics.update_budget_metrics(req.tenant, req.user, req.session, remaining=budget.alpha_wealth, spent=bool(budget.alpha_spent > 0.0))
-        if required_action != "allow":
-            http_metrics.record_action(req.model_id, req.gpu_id, action=required_action)
-
-        _call_otel(
-            rt.otel,
-            score,
-            {
-                "model_id": req.model_id,
-                "gpu_id": req.gpu_id,
-                "tenant": req.tenant,
-                "user": req.user,
-                "session": req.session,
-                "tcd.event_id": event_id,
-                "tcd.decision_id": decision_id,
-                "tcd.route_plan_id": route_plan_id,
-                "tcd.required_action": required_action,
-                "tcd.allowed": str(bool(allowed)),
-                "tcd.controller_mode": controller_mode or "",
-                "tcd.statistical_guarantee_scope": guarantee_scope or "",
-            },
-        )
-
-        slo_ms = float(getattr(rt.settings, "slo_latency_ms", 0.0) or 0.0)
-        if slo_ms and (latency_s * 1000.0) > slo_ms:
-            http_metrics.record_slo_by_model("diagnose_latency", req.model_id, req.gpu_id)
-
-        if _HAS_LOG and log_decision is not None and rt.logger is not None:
-            with contextlib.suppress(Exception):
-                log_decision(
-                    rt.logger,
-                    verdict=final_verdict,
-                    score=score,
-                    e_value=budget.e_value,
-                    alpha_alloc=budget.alpha_alloc,
-                    message="diagnose",
-                    extra={
-                        "request_id": request_id,
-                        "event_id": event_id,
+            if security_decision is not None:
+                security_block = {
+                    **security_block,
+                    "surface_kind": "security_router",
+                    "produced_by": "tcd.security_router",
+                    "policy_ref": policy_ref,
+                    "policyset_ref": policyset_ref,
+                    "policy_digest": policy_digest,
+                    "audit_ref": artifacts.get("audit_ref") or audit_ref,
+                    "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
+                    "decision_id": decision_id,
+                    "route_plan_id": route_plan_id,
+                }
+                artifacts = {
+                    **artifacts,
+                    "surface_kind": "security_router",
+                    "produced_by": "tcd.security_router",
+                    "audit_ref": artifacts.get("audit_ref") or audit_ref,
+                    "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
+                }
+                evidence_identity = {
+                    **evidence_identity,
+                    "produced_by": "tcd.security_router",
+                    "audit_ref": artifacts.get("audit_ref") or audit_ref,
+                    "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
+                }
+                security_public = _sanitize_json_mapping(
+                    {
+                        **security_public,
+                        "surface_kind": "security_router",
+                        "produced_by": "tcd.security_router",
+                        "policy_ref": policy_ref,
+                        "policyset_ref": policyset_ref,
+                        "policy_digest": policy_digest,
+                        "audit_ref": artifacts.get("audit_ref") or audit_ref,
+                        "receipt_ref": artifacts.get("receipt_ref") or receipt_ref,
                         "decision_id": decision_id,
                         "route_plan_id": route_plan_id,
-                        "route_decoder": route_info.get("decoder"),
-                        "route_temp": route_info.get("temperature"),
-                        "route_top_p": route_info.get("top_p"),
-                        "action": action_str,
-                        "required_action": required_action,
-                        "p_final": float(p_final),
+                        "artifacts": dict(artifacts),
+                        "evidence_identity": dict(evidence_identity),
                     },
+                    max_depth=5,
+                    max_items=96,
+                    max_str_len=512,
+                    max_total_bytes=64_000,
                 )
 
-        response.headers["X-TCD-Decision-Id"] = decision_id
-        response.headers["X-TCD-Route-Plan-Id"] = route_plan_id
+            components: Dict[str, Any] = {
+                "detector": _sanitize_json_mapping(
+                    {
+                        **(dict(verdict_pack.get("components", {})) if isinstance(verdict_pack.get("components"), Mapping) else {}),
+                        "decision": verdict_pack.get("decision"),
+                        "action": verdict_pack.get("action"),
+                        "risk": verdict_pack.get("risk"),
+                        "p_value": verdict_pack.get("p_value"),
+                        "reason_code": verdict_pack.get("reason_code"),
+                        "error_code": verdict_pack.get("error_code"),
+                        "decision_id": verdict_pack.get("decision_id"),
+                        "config_hash": verdict_pack.get("config_hash"),
+                        "policy_digest": verdict_pack.get("policy_digest"),
+                        "detector_policy_digest": detector_policy_digest,
+                        "state_digest": verdict_pack.get("state_digest"),
+                    },
+                    max_depth=5,
+                    max_items=64,
+                    max_str_len=512,
+                    max_total_bytes=64_000,
+                ),
+                "terminal": _sanitize_json_mapping(
+                    {
+                        "decision": decision_label,
+                        "required_action": required_action,
+                        "action": action_str,
+                        "allowed": allowed,
+                        "verdict": final_verdict,
+                        "enforcement_mode": enforcement_mode,
+                        "source": "service_http_terminal_contract",
+                    },
+                    max_depth=4,
+                    max_items=16,
+                    max_str_len=128,
+                    max_total_bytes=8_000,
+                ),
+                "multivariate": _sanitize_json_mapping(mv_info, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=64_000),
+                "e_process": _sanitize_json_mapping(av_out.get("e_state", {}), max_depth=6, max_items=128, max_str_len=1024, max_total_bytes=96_000),
+                "route": _sanitize_json_mapping(route_info, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                "security": _sanitize_json_mapping(security_block, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                "security_router": _sanitize_json_mapping(security_public, max_depth=5, max_items=96, max_str_len=512, max_total_bytes=64_000),
+                "artifacts": _sanitize_json_mapping(artifacts, max_depth=4, max_items=64, max_str_len=512, max_total_bytes=32_000),
+                "receipt": _sanitize_json_mapping(receipt_public, max_depth=4, max_items=32, max_str_len=512, max_total_bytes=32_000),
+                "evidence_identity": _sanitize_json_mapping(evidence_identity, max_depth=4, max_items=64, max_str_len=256, max_total_bytes=24_000),
+                "auth": _sanitize_json_mapping(auth_public, max_depth=4, max_items=32, max_str_len=256, max_total_bytes=16_000),
+                "identity": {
+                    "status": identity_status,
+                    "tenant": req.tenant,
+                    "user": req.user,
+                    "session": req.session,
+                    "model_id": req.model_id,
+                },
+                "request": {
+                    "body_digest": body_digest,
+                    "tenant": req.tenant,
+                    "user": req.user,
+                    "session": req.session,
+                    "model_id": req.model_id,
+                    "gpu_id": req.gpu_id,
+                    "task": req.task,
+                    "lang": req.lang,
+                },
+            }
+            if receipt_verification is not None:
+                components["receipt_verification_exposed"] = True
 
-        legacy_receipt = receipt_verification.get("head") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
-        legacy_body = receipt_verification.get("body") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
-        legacy_sig = receipt_verification.get("sig") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
-        legacy_vk = receipt_verification.get("verify_key") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+            latency_s = max(0.0, time.perf_counter() - t_start)
+            http_metrics.observe_core_latency(latency_s)
+            http_metrics.push_verdict(verdict_pack, labels={"model_id": req.model_id, "gpu_id": req.gpu_id})
+            http_metrics.push_eprocess(
+                model_id=req.model_id,
+                gpu_id=req.gpu_id,
+                tenant=req.tenant,
+                user=req.user,
+                session=req.session,
+                e_value=budget.e_value,
+                alpha_alloc=budget.alpha_alloc,
+                alpha_wealth=budget.alpha_wealth,
+            )
+            http_metrics.update_budget_metrics(req.tenant, req.user, req.session, remaining=budget.alpha_wealth, spent=bool(budget.alpha_spent > 0.0))
+            if required_action != "allow":
+                http_metrics.record_action(req.model_id, req.gpu_id, action=required_action)
 
-        _LOG.error(
-            "DIAG STAGE 10 before RiskResponse request_id=%s decision=%s required_action=%s allowed=%s",
-            request_id,
-            decision_label,
-            required_action,
-            allowed,
-        )
+            _call_otel(
+                rt.otel,
+                score,
+                {
+                    "model_id": req.model_id,
+                    "gpu_id": req.gpu_id,
+                    "tenant": req.tenant,
+                    "user": req.user,
+                    "session": req.session,
+                    "tcd.event_id": event_id,
+                    "tcd.decision_id": decision_id,
+                    "tcd.route_plan_id": route_plan_id,
+                    "tcd.required_action": required_action,
+                    "tcd.allowed": str(bool(allowed)),
+                    "tcd.controller_mode": controller_mode or "",
+                    "tcd.statistical_guarantee_scope": guarantee_scope or "",
+                },
+            )
 
-        return RiskResponse(
-            verdict=final_verdict,
-            allowed=bool(allowed),
-            decision=decision_label,
-            required_action=required_action,
-            enforcement_mode=enforcement_mode,
-            score=score,
-            threshold=budget.threshold,
-            budget_remaining=budget.alpha_wealth,
-            components=_sanitize_json_mapping(
-                components,
-                max_depth=cfgb.max_component_depth,
-                max_items=cfgb.max_component_items,
-                max_str_len=cfgb.max_component_str_len,
-                max_total_bytes=cfgb.max_json_component_bytes,
-            ),
-            cause=_safe_text(cause, max_len=128) or None,
-            action=action_str,
-            step=int(_coerce_int(verdict_pack.get("step")) or 0),
-            e_value=budget.e_value,
-            alpha_alloc=budget.alpha_alloc,
-            alpha_spent=budget.alpha_spent,
-            request_id=request_id,
-            event_id=event_id,
-            decision_id=decision_id,
-            route_plan_id=route_plan_id,
-            policy_ref=policy_ref,
-            policyset_ref=policyset_ref,
-            config_fingerprint=config_fingerprint or rt.bundle.cfg_fp,
-            bundle_version=bundle_version or rt.bundle.version,
-            state_domain_id=state_domain_id,
-            controller_mode=controller_mode,
-            statistical_guarantee_scope=guarantee_scope,
-            audit_ref=artifacts.get("audit_ref") or audit_ref,
-            receipt_ref=artifacts.get("receipt_ref") or receipt_ref,
-            ledger_ref=artifacts.get("ledger_ref"),
-            attestation_ref=artifacts.get("attestation_ref"),
-            prepare_ref=artifacts.get("prepare_ref"),
-            commit_ref=artifacts.get("commit_ref"),
-            outbox_ref=artifacts.get("outbox_ref"),
-            outbox_status=artifacts.get("outbox_status"),
-            ledger_stage=artifacts.get("ledger_stage"),
-            trust_zone=req.trust_zone,
-            route_profile=req.route_profile,
-            threat_kind=req.threat_kind,
-            pq_required=req.pq_required,
-            pq_ok=_coerce_bool(route_info.get("pq_ok"), default=False) if route_info.get("pq_ok") is not None else None,
-            receipt_public=receipt_public,
-            receipt_verification=receipt_verification,
-            evidence_identity=evidence_identity,
-            artifacts=artifacts,
-            receipt=legacy_receipt,
-            receipt_body=legacy_body,
-            receipt_sig=legacy_sig,
-            verify_key=legacy_vk,
-        )
+            slo_ms = float(getattr(rt.settings, "slo_latency_ms", 0.0) or 0.0)
+            if slo_ms and (latency_s * 1000.0) > slo_ms:
+                http_metrics.record_slo_by_model("diagnose_latency", req.model_id, req.gpu_id)
+
+            if _HAS_LOG and log_decision is not None and rt.logger is not None:
+                with contextlib.suppress(Exception):
+                    log_decision(
+                        rt.logger,
+                        verdict=final_verdict,
+                        score=score,
+                        e_value=budget.e_value,
+                        alpha_alloc=budget.alpha_alloc,
+                        message="diagnose",
+                        extra={
+                            "request_id": request_id,
+                            "event_id": event_id,
+                            "decision_id": decision_id,
+                            "route_plan_id": route_plan_id,
+                            "route_decoder": route_info.get("decoder"),
+                            "route_temp": route_info.get("temperature"),
+                            "route_top_p": route_info.get("top_p"),
+                            "action": action_str,
+                            "required_action": required_action,
+                            "p_final": float(p_final),
+                        },
+                    )
+
+            response.headers["X-TCD-Decision-Id"] = decision_id
+            response.headers["X-TCD-Route-Plan-Id"] = route_plan_id
+
+            pq_required_response = _first_optional_bool_from_mappings(
+                "pq_required",
+                receipt_public,
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+                artifacts,
+                evidence_identity,
+                security_block,
+                route_info,
+                {"pq_required": req.pq_required},
+            )
+            pq_signature_required_response = _first_optional_bool_from_mappings(
+                "pq_signature_required",
+                receipt_public,
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+                artifacts,
+                evidence_identity,
+                security_block,
+                route_info,
+            )
+            if pq_signature_required_response is None and pq_required_response is not None:
+                pq_signature_required_response = bool(pq_required_response)
+            pq_signature_ok_response = _first_optional_bool_from_mappings(
+                "pq_signature_ok",
+                receipt_public,
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+                artifacts,
+                evidence_identity,
+                security_block,
+                route_info,
+            )
+            pq_ok_response = _first_optional_bool_from_mappings(
+                "pq_ok",
+                receipt_public,
+                receipt_verification,
+                receipt_private_payload,
+                raw_receipt_payload,
+                artifacts,
+                evidence_identity,
+                security_block,
+                route_info,
+            )
+            if pq_required_response is True and pq_ok_response is None and pq_signature_ok_response is not None:
+                pq_ok_response = bool(pq_signature_ok_response)
+            if pq_required_response is True and pq_ok_response is None:
+                pq_ok_response = False
+            if pq_signature_required_response is True and pq_signature_ok_response is None:
+                pq_signature_ok_response = False
+            for _pq_obj in (receipt_public, receipt_verification, receipt_private_payload, raw_receipt_payload, artifacts, evidence_identity, security_block):
+                if not isinstance(_pq_obj, dict):
+                    continue
+                if pq_required_response is not None and _coerce_optional_bool(_pq_obj.get("pq_required")) is None:
+                    _pq_obj["pq_required"] = pq_required_response
+                if pq_ok_response is not None and _coerce_optional_bool(_pq_obj.get("pq_ok")) is None:
+                    _pq_obj["pq_ok"] = pq_ok_response
+                if pq_signature_required_response is not None and _coerce_optional_bool(_pq_obj.get("pq_signature_required")) is None:
+                    _pq_obj["pq_signature_required"] = pq_signature_required_response
+                if pq_signature_ok_response is not None and _coerce_optional_bool(_pq_obj.get("pq_signature_ok")) is None:
+                    _pq_obj["pq_signature_ok"] = pq_signature_ok_response
+
+            legacy_receipt = receipt_verification.get("head") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+            legacy_body = receipt_verification.get("body") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+            legacy_sig = receipt_verification.get("sig") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+            legacy_vk = receipt_verification.get("verify_key") if (cfgb.expose_legacy_receipt_aliases and receipt_verification) else None
+
+            _LOG.debug(
+                "DIAG STAGE 10 before RiskResponse request_id=%s decision=%s required_action=%s allowed=%s",
+                request_id,
+                decision_label,
+                required_action,
+                allowed,
+            )
+
+            result = RiskResponse(
+                verdict=final_verdict,
+                allowed=bool(allowed),
+                decision=decision_label,
+                required_action=required_action,
+                enforcement_mode=enforcement_mode,
+                score=score,
+                threshold=budget.threshold,
+                budget_remaining=budget.alpha_wealth,
+                components=_sanitize_json_mapping(
+                    components,
+                    max_depth=cfgb.max_component_depth,
+                    max_items=cfgb.max_component_items,
+                    max_str_len=cfgb.max_component_str_len,
+                    max_total_bytes=cfgb.max_json_component_bytes,
+                ),
+                cause=_safe_text(cause, max_len=128) or None,
+                action=action_str,
+                step=int(_coerce_int(verdict_pack.get("step")) or 0),
+                e_value=budget.e_value,
+                alpha_alloc=budget.alpha_alloc,
+                alpha_spent=budget.alpha_spent,
+                request_id=request_id,
+                event_id=event_id,
+                decision_id=decision_id,
+                route_plan_id=route_plan_id,
+                policy_ref=policy_ref,
+                policyset_ref=policyset_ref,
+                config_fingerprint=route_config_fingerprint,
+                config_fingerprint_kind="route",
+                service_config_fingerprint=service_config_fingerprint,
+                route_config_fingerprint=route_config_fingerprint,
+                receipt_cfg_fp=receipt_cfg_fp,
+                bundle_version=bundle_version or rt.bundle.version,
+                state_domain_id=state_domain_id,
+                controller_mode=controller_mode,
+                statistical_guarantee_scope=guarantee_scope,
+                audit_ref=artifacts.get("audit_ref") or audit_ref,
+                receipt_ref=artifacts.get("receipt_ref") or receipt_ref,
+                ledger_ref=artifacts.get("ledger_ref"),
+                attestation_ref=artifacts.get("attestation_ref"),
+                prepare_ref=artifacts.get("prepare_ref"),
+                commit_ref=artifacts.get("commit_ref"),
+                outbox_ref=artifacts.get("outbox_ref"),
+                outbox_status=artifacts.get("outbox_status"),
+                ledger_stage=artifacts.get("ledger_stage"),
+                trust_zone=req.trust_zone,
+                route_profile=req.route_profile,
+                threat_kind=req.threat_kind,
+                pq_required=pq_required_response,
+                pq_ok=pq_ok_response,
+                pq_signature_required=pq_signature_required_response,
+                pq_signature_ok=pq_signature_ok_response,
+                receipt_public=receipt_public,
+                receipt_verification=receipt_verification,
+                evidence_identity=evidence_identity,
+                artifacts=artifacts,
+                receipt=legacy_receipt,
+                receipt_body=legacy_body,
+                receipt_sig=legacy_sig,
+                verify_key=legacy_vk,
+            )
+
+            if idem_owner and idem_scope_key and idem_fingerprint:
+                rt.idempotency_store.commit(
+                    idem_scope_key,
+                    idem_fingerprint,
+                    result.model_dump(mode="json") if hasattr(result, "model_dump") else dict(result),
+                )
+            return result
+
+        except Exception:
+            if idem_owner and idem_scope_key and idem_fingerprint:
+                rt.idempotency_store.abort(idem_scope_key, idem_fingerprint)
+            raise
 
     @app.post("/v1/diagnose", response_model=RiskResponse)
     def diagnose_v1(
@@ -6669,6 +9296,7 @@ def create_app(
         sig = req.receipt_sig_hex or nested_artifact.sig
         verify_key = req.verify_key or req.verify_key_hex or nested_artifact.verify_key
         receipt_ref = req.receipt_ref or nested_artifact.receipt_ref
+        cfg_fp = nested_artifact.cfg_fp
 
         lookup_used = False
         if receipt_ref and not (head and body):
@@ -6680,6 +9308,7 @@ def create_app(
                 sig = sig or looked_up_artifact.sig
                 verify_key = verify_key or looked_up_artifact.verify_key
                 receipt_ref = receipt_ref or looked_up_artifact.receipt_ref
+                cfg_fp = cfg_fp or looked_up_artifact.cfg_fp
                 lookup_used = True
 
         if lookup_used:
@@ -6693,12 +9322,16 @@ def create_app(
         else:
             source = "missing"
 
+        if source == "top_level" and not receipt_ref and head:
+            receipt_ref = head
+
         return {
             "head": head,
             "body": body,
             "sig": sig,
             "verify_key": verify_key,
             "receipt_ref": receipt_ref,
+            "cfg_fp": cfg_fp,
             "source": source,
         }
 
@@ -6752,7 +9385,15 @@ def create_app(
         )
         response.headers["X-Request-Id"] = request_id
         response.headers["X-TCD-Http-Version"] = cfgb.api_version
+        response.headers["X-TCD-Service-Config-Fingerprint"] = rt.bundle.cfg_fp
         response.headers["X-TCD-Config-Fingerprint"] = rt.bundle.cfg_fp
+        response.headers["X-TCD-Config-Fingerprint-Kind"] = "service_http"
+        route_header_fp = _safe_text(getattr(request.state, "route_config_fingerprint", None), max_len=512)
+        if route_header_fp:
+            response.headers["X-TCD-Route-Config-Fingerprint"] = route_header_fp
+        receipt_header_fp = _safe_text(getattr(request.state, "receipt_cfg_fp", None), max_len=512)
+        if receipt_header_fp:
+            response.headers["X-TCD-Receipt-Cfg-Fp"] = receipt_header_fp
         response.headers["X-TCD-Bundle-Version"] = str(rt.bundle.version)
 
         t0 = time.perf_counter()
@@ -6760,13 +9401,73 @@ def create_app(
         reason = "verify_fail"
         report_dict: Dict[str, Any] = {}
         try:
-            if req.heads is not None or req.bodies is not None:
+            storage_window_requested = bool(
+                req.verify_storage_window
+                or req.chain_namespace
+                or req.chain_id
+                or req.expected_latest_chain_head
+                or req.expected_ledger_ref
+                or req.expected_commit_ref
+            )
+            if storage_window_requested:
+                expected_service_cfg_fp = _safe_text(req.expected_service_config_fingerprint, max_len=512) or None
+                if expected_service_cfg_fp and expected_service_cfg_fp != rt.bundle.cfg_fp:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="service_config_fingerprint mismatch")
+
+                limit_eff = _clamp_int(
+                    req.storage_window_limit,
+                    default=min(100, verify_limits.max_window),
+                    lo=1,
+                    hi=verify_limits.max_window,
+                )
+
+                report_dict = rt.evidence_store.verify_window(
+                    chain_namespace=req.chain_namespace,
+                    chain_id=req.chain_id,
+                    limit=limit_eff,
+                    expected_latest_chain_head=req.expected_latest_chain_head,
+                    expected_ledger_ref=req.expected_ledger_ref,
+                    expected_commit_ref=req.expected_commit_ref,
+                )
+                report_dict["expected_service_config_fingerprint"] = expected_service_cfg_fp
+                report_dict["service_config_binding_verified"] = (
+                    expected_service_cfg_fp == rt.bundle.cfg_fp
+                ) if expected_service_cfg_fp else None
+                ok = bool(report_dict.get("ok", False))
+                reason = "storage_window"
+            elif req.heads is not None or req.bodies is not None:
                 _validate_chain_mode(req)
                 ok = bool(verify_chain(req.heads or [], req.bodies or []))
                 reason = "chain"
             else:
                 material = _validate_single_mode(req)
                 verify_key = material.get("verify_key")
+                material_cfg_fp = _safe_text(material.get("cfg_fp"), max_len=512) or None
+                legacy_expected_cfg_fp = _safe_text(req.expected_cfg_fp, max_len=512) or None
+                expected_service_cfg_fp = _safe_text(req.expected_service_config_fingerprint, max_len=512) or None
+                if legacy_expected_cfg_fp and _looks_like_service_config_fingerprint(legacy_expected_cfg_fp):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="expected_cfg_fp is receipt/route cfg, not HTTP service cfg")
+                if material_cfg_fp and _looks_like_service_config_fingerprint(material_cfg_fp):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="receipt cfg_fp must not be HTTP service hcfg")
+                expected_receipt_cfg_fp = _first_route_config_fingerprint(
+                    req.expected_receipt_cfg_fp,
+                    req.expected_route_config_fingerprint,
+                    legacy_expected_cfg_fp,
+                    material_cfg_fp,
+                )
+                if expected_receipt_cfg_fp and _looks_like_service_config_fingerprint(expected_receipt_cfg_fp):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="expected_receipt_cfg_fp must not be HTTP service hcfg")
+                if expected_service_cfg_fp and expected_service_cfg_fp != rt.bundle.cfg_fp:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="service_config_fingerprint mismatch")
+                body_pq_required_for_verify = _receipt_body_pq_value(material.get("body"), "pq_required")
+                body_pq_sig_required_for_verify = _receipt_body_pq_value(material.get("body"), "pq_signature_required")
+                require_signature_eff = req.require_signature
+                if require_signature_eff is None and (
+                    _coerce_bool(req.pq_required, default=False)
+                    or body_pq_required_for_verify is True
+                    or body_pq_sig_required_for_verify is True
+                ):
+                    require_signature_eff = True
                 def _verify_endpoint_call() -> Any:
                     return verify_receipt_ex(
                         receipt_head_hex=material.get("head") or "",
@@ -6781,13 +9482,14 @@ def create_app(
                         expected_policy_ref=req.expected_policy_ref,
                         expected_policyset_ref=req.expected_policyset_ref,
                         expected_policy_digest=req.expected_policy_digest,
-                        expected_cfg_fp=req.expected_cfg_fp,
+                        expected_cfg_fp=expected_receipt_cfg_fp,
                         expected_build_id=req.expected_build_id,
                         expected_image_digest=req.expected_image_digest,
-                        require_signature=req.require_signature,
+                        verify_sig_func=_receipt_hmac_verify_from_env(),
+                        require_signature=require_signature_eff,
                     )
 
-                _LOG.error(
+                _LOG.debug(
                     "VERIFY STAGE 1 before verify_receipt_ex request_id=%s timeout_ms=%s",
                     request_id,
                     cfgb.receipt_verify_timeout_ms,
@@ -6808,6 +9510,10 @@ def create_app(
                         "verify_key_allowed": None,
                         "policy_binding_verified": None,
                         "cfg_binding_verified": None,
+                        "build_binding_verified": None,
+                        "image_binding_verified": None,
+                        "pq_required": _coerce_optional_bool(req.pq_required),
+                        "pq_ok": None,
                         "pq_signature_required": None,
                         "pq_signature_ok": None,
                         "integrity_ok": False,
@@ -6823,29 +9529,89 @@ def create_app(
                 else:
                     ok = bool(_receipt_report_get(report, "ok", False))
                     reason = "receipt"
+                    build_binding_verified = _receipt_report_get(report, "build_binding_verified", None)
+                    if build_binding_verified is None:
+                        build_binding_verified = _receipt_binding_verified_from_body(
+                            material.get("body"),
+                            "build_id",
+                            req.expected_build_id,
+                        )
+                    image_binding_verified = _receipt_report_get(report, "image_binding_verified", None)
+                    if image_binding_verified is None:
+                        image_binding_verified = _receipt_binding_verified_from_body(
+                            material.get("body"),
+                            "image_digest",
+                            req.expected_image_digest,
+                        )
+                    pq_required_report = _receipt_report_get(report, "pq_required", _receipt_body_pq_value(material.get("body"), "pq_required"))
+                    if pq_required_report is None:
+                        pq_required_report = _coerce_optional_bool(req.pq_required)
+                    pq_ok_report = _receipt_report_get(report, "pq_ok", _receipt_body_pq_value(material.get("body"), "pq_ok"))
+                    pq_signature_required_report = _receipt_report_get(report, "pq_signature_required", _receipt_body_pq_value(material.get("body"), "pq_signature_required"))
+                    pq_signature_ok_report = _receipt_report_get(report, "pq_signature_ok", _receipt_body_pq_value(material.get("body"), "pq_signature_ok"))
+                    if pq_signature_required_report is None and pq_required_report is not None:
+                        pq_signature_required_report = bool(pq_required_report)
+                    if pq_signature_required_report is True and pq_signature_ok_report is None:
+                        pq_signature_ok_report = bool(_receipt_report_get(report, "signature_verified", False))
+                    if pq_required_report is True and pq_ok_report is None:
+                        pq_ok_report = bool(pq_signature_ok_report)
                     report_dict = {
                         "head_verified": _receipt_report_get(report, "head_verified", None),
                         "body_canonical_verified": _receipt_report_get(report, "body_canonical_verified", None),
                         "integrity_hash_verified": _receipt_report_get(report, "integrity_hash_verified", None),
                         "signature_verified": _receipt_report_get(report, "signature_verified", None),
                         "verify_key_allowed": _receipt_report_get(report, "verify_key_allowed", None),
-                        "policy_binding_verified": _receipt_report_get(report, "policy_binding_verified", None),
+                        "policy_binding_verified": _normalize_policy_binding_verified(
+                            _receipt_report_get(report, "policy_binding_verified", None),
+                            expected_policy_ref=req.expected_policy_ref,
+                            expected_policyset_ref=req.expected_policyset_ref,
+                            expected_policy_digest=req.expected_policy_digest,
+                        ),
                         "cfg_binding_verified": _receipt_report_get(report, "cfg_binding_verified", None),
-                        "pq_signature_required": _receipt_report_get(report, "pq_signature_required", None),
-                        "pq_signature_ok": _receipt_report_get(report, "pq_signature_ok", None),
+                        "build_binding_verified": build_binding_verified,
+                        "image_binding_verified": image_binding_verified,
+                        "pq_required": pq_required_report,
+                        "pq_ok": pq_ok_report,
+                        "pq_signature_required": pq_signature_required_report,
+                        "pq_signature_ok": pq_signature_ok_report,
                         "integrity_ok": _receipt_report_get(report, "ok", None),
                         "reason_code": _receipt_report_get(report, "reason", None),
                         "errors": _receipt_report_list(report, "errors", "integrity_errors"),
                         "integrity_errors": _receipt_report_list(report, "errors", "integrity_errors"),
                         "warnings": _receipt_report_list(report, "warnings", "compat_warnings", "normalization_warnings"),
                     }
-                    _LOG.error(
+                    report_dict["build_id"] = _receipt_report_get(report, "build_id", _receipt_body_binding_value(material.get("body"), "build_id"))
+                    report_dict["image_digest"] = _receipt_report_get(report, "image_digest", _receipt_body_binding_value(material.get("body"), "image_digest"))
+                    binding_errors: List[str] = []
+                    if build_binding_verified is False:
+                        binding_errors.append("BUILD_BINDING_MISMATCH")
+                    if image_binding_verified is False:
+                        binding_errors.append("IMAGE_BINDING_MISMATCH")
+                    if binding_errors:
+                        ok = False
+                        report_dict["integrity_ok"] = False
+                        report_dict["reason_code"] = binding_errors[0]
+                        errs = list(report_dict.get("errors") or [])
+                        ierrs = list(report_dict.get("integrity_errors") or [])
+                        for err in binding_errors:
+                            if err not in errs:
+                                errs.append(err)
+                            if err not in ierrs:
+                                ierrs.append(err)
+                        report_dict["errors"] = errs
+                        report_dict["integrity_errors"] = ierrs
+
+                    _LOG.debug(
                         "VERIFY STAGE 2 after verify_receipt_ex request_id=%s ok=%s",
                         request_id,
                         ok,
                     )
                     report_dict["verify_input_source"] = material.get("source")
                     report_dict["receipt_ref"] = material.get("receipt_ref")
+                    report_dict["receipt_cfg_fp"] = material.get("cfg_fp")
+                    report_dict["expected_receipt_cfg_fp"] = expected_receipt_cfg_fp
+                    report_dict["expected_service_config_fingerprint"] = expected_service_cfg_fp
+                    report_dict["service_config_binding_verified"] = (expected_service_cfg_fp == rt.bundle.cfg_fp) if expected_service_cfg_fp else None
                     if ok:
                         _verify_pq_from_body_and_request(req, material.get("body"))
         finally:

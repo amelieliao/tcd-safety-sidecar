@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "reason": "receipt",
+  "report": {
+    "body_canonical_verified": true,
+    "build_binding_verified": true,
+    "build_id": "issue11-build-1778034993-1cc9320e",
+    "cfg_binding_verified": true,
+    "errors": [],
+    "expected_receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "expected_service_config_fingerprint": "hcfg3:sha256:83aaa302e104c79d19d4784ae3712ef3e7fc2a65ef0fa43b",
+    "head_verified": true,
+    "image_binding_verified": true,
+    "image_digest": "sha256:73da7fc106d93707bce5c5a1aa366a9bf6460145f77801d4f1b0cd107c0e8be1",
+    "integrity_errors": [],
+    "integrity_hash_verified": true,
+    "integrity_ok": true,
+    "policy_binding_verified": true,
+    "pq_signature_ok": null,
+    "pq_signature_required": null,
+    "reason_code": "OK",
+    "receipt_cfg_fp": "scfg2:sha256:d79f6f1a6746111362e98b9ee184ecf659bfb14dcbcc6dcb7744c2001f63f0d1",
+    "receipt_ref": "3abd8b580d732eb2669bc4a7fbc39c5d61a8a068f2f98a995fed2fc28d58e12c",
+    "service_config_binding_verified": true,
+    "signature_verified": true,
+    "verify_input_source": "receipt_ref_lookup",
+    "verify_key_allowed": null,
+    "warnings": []
+  },
+  "request_id": "38c8d104fcda4d7d"
+}

@@ -75,6 +75,7 @@ __all__ = [
     "VerifyOut",
     "ReceiptGetOut",
     "ReceiptTailOut",
+    "ReceiptVerifyWindowIn",
     "AlphaOut",
     "RuntimeOut",
     # receipt-first upgrades
@@ -223,6 +224,17 @@ class ReceiptStorageProtocol(Protocol):
         ...
 
     def stats(self) -> Dict[str, Any]:
+        ...
+
+    def verify_window(
+        self,
+        head_hex: Optional[str] = None,
+        *,
+        chain_namespace: Optional[str] = None,
+        chain_id: Optional[str] = None,
+        limit: int = 100,
+        expected_latest_chain_head_hex: Optional[str] = None,
+    ) -> Any:
         ...
 
 
@@ -1390,6 +1402,16 @@ class ReceiptTailOut(BaseModel):
     total: int
 
 
+class ReceiptVerifyWindowIn(BaseModel):
+    head_hex: Optional[str] = Field(default=None, max_length=512)
+    chain_namespace: Optional[str] = Field(default=None, max_length=128)
+    chain_id: Optional[str] = Field(default=None, max_length=128)
+    limit: int = Field(default=100, ge=1, le=100000)
+    expected_latest_chain_head_hex: Optional[str] = Field(default=None, max_length=512)
+    expected_ledger_ref: Optional[str] = Field(default=None, max_length=512)
+    expected_commit_ref: Optional[str] = Field(default=None, max_length=512)
+
+
 class AlphaOut(BaseModel):
     tenant: str
     user: str
@@ -2353,6 +2375,123 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
                     )
                 except Exception:
                     logger.warning("receipt_stats audit failed", exc_info=True)
+
+
+    @router.post("/receipts/verify_window")
+    def receipt_verify_window(payload: ReceiptVerifyWindowIn, request: Request):
+        _require_scope(request, "verify")
+
+        if not gate_verify_chain.try_acquire():
+            _ADMIN_HEAVY_REJECT.labels("verify_chain", "overloaded").inc()
+            raise _http_error(status=503, kind="OVERLOADED", message="too many verify_window in-flight")
+
+        started = time.perf_counter()
+        ok = False
+        try:
+            if not ctx.storage:
+                raise _http_error(status=501, kind="STORAGE_DOWN", message="receipt storage not configured")
+
+            verify_fn = getattr(ctx.storage, "verify_window", None)
+            if not callable(verify_fn):
+                raise _http_error(status=501, kind="BAD_REQUEST", message="storage does not support verify_window")
+
+            expected_latest = (
+                payload.expected_latest_chain_head_hex
+                or payload.expected_ledger_ref
+                or payload.expected_commit_ref
+            )
+
+            def _verify_window_call() -> Any:
+                try:
+                    return verify_fn(
+                        head_hex=payload.head_hex,
+                        chain_namespace=payload.chain_namespace,
+                        chain_id=payload.chain_id,
+                        limit=payload.limit,
+                        expected_latest_chain_head_hex=expected_latest,
+                    )
+                except TypeError:
+                    return verify_fn(
+                        head_hex=payload.head_hex,
+                        chain_namespace=payload.chain_namespace,
+                        chain_id=payload.chain_id,
+                        limit=payload.limit,
+                    )
+
+            rep = _dep_call(
+                dep="storage",
+                op="verify_window",
+                timeout_ms=max(_ADMIN_CFG.dep_timeout_storage_ms, _ADMIN_CFG.verify_chain_timeout_ms),
+                breaker=_STORAGE_BREAKER,
+                fn=_verify_window_call,
+                err_kind="STORAGE_DOWN",
+                err_message="storage unavailable",
+            )
+
+            if isinstance(rep, dict):
+                report = dict(rep)
+            elif hasattr(rep, "to_dict"):
+                report = dict(rep.to_dict())
+            elif is_dataclass(rep):
+                report = asdict(rep)
+            else:
+                report = {"ok": bool(rep)}
+
+            latest = str(report.get("latest_chain_head_hex") or "")
+            reasons = list(report.get("reasons") or [])
+            ok = bool(report.get("ok", False))
+
+            report["expected_latest_chain_head_hex"] = expected_latest
+            report["expected_ledger_ref"] = payload.expected_ledger_ref
+            report["expected_commit_ref"] = payload.expected_commit_ref
+
+            if expected_latest:
+                latest_match = bool(latest and hmac.compare_digest(latest, expected_latest))
+                report["latest_matches_expected"] = latest_match
+                if not latest_match:
+                    ok = False
+                    if "latest_chain_head_mismatch" not in reasons:
+                        reasons.append("latest_chain_head_mismatch")
+
+            if payload.expected_ledger_ref:
+                ledger_match = bool(latest and hmac.compare_digest(latest, payload.expected_ledger_ref))
+                report["latest_matches_ledger_ref"] = ledger_match
+                if not ledger_match:
+                    ok = False
+                    if "ledger_ref_mismatch" not in reasons:
+                        reasons.append("ledger_ref_mismatch")
+
+            if payload.expected_commit_ref:
+                commit_match = bool(latest and hmac.compare_digest(latest, payload.expected_commit_ref))
+                report["latest_matches_commit_ref"] = commit_match
+                if not commit_match:
+                    ok = False
+                    if "commit_ref_mismatch" not in reasons:
+                        reasons.append("commit_ref_mismatch")
+
+            report["ok"] = bool(ok)
+            report["integrity_ok"] = bool(ok)
+            report["reasons"] = reasons
+            return {"ok": bool(ok), "report": report}
+        finally:
+            gate_verify_chain.release()
+            if _ADMIN_CFG.audit_read_endpoints:
+                try:
+                    _record_event(
+                        action="receipt_verify_window",
+                        req=request,
+                        ok=bool(ok),
+                        started_at=started,
+                        details={
+                            "chain_namespace": payload.chain_namespace,
+                            "chain_id": payload.chain_id,
+                            "limit": int(payload.limit),
+                        },
+                        require_attestation=False,
+                        require_ledger=False,
+                    )
+                except Exception:
+                    logger.warning("receipt_verify_window audit failed", exc_info=True)
 
     @router.get("/receipts/tail", response_model=ReceiptTailOut)
     def receipt_tail(n: int = 50, request: Request = None):  # type: ignore[assignment]

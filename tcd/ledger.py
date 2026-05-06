@@ -1303,6 +1303,18 @@ def _compute_receipt_head(chain_id: str, prev: Optional[str], body_canon: str, s
     return h.hexdigest()
 
 
+def _receipt_governance_ref(chain_id: str, phase: str, head: Optional[str]) -> Optional[str]:
+    h = str(head or "").strip()
+    if not h:
+        return None
+    ph = str(phase or "append").strip().lower()
+    if ph not in {"prepare", "commit", "append", "receipt", "outbox", "audit"}:
+        ph = "append"
+    cid = str(chain_id or "")
+    chain_digest = hashlib.sha256(cid.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"ledger:{ph}:{chain_digest}:{h}"
+
+
 
 # ---------------------------------------------------------------------------
 # Attestation receipt compatibility
@@ -1523,6 +1535,11 @@ class ReceiptRecord:
     prev: Optional[str]
     ts: float
     chain_id: str = ""  # optional multi-chain support; default preserves legacy behavior
+    event_id: Optional[str] = None
+    phase: Optional[str] = None
+    ledger_ref: Optional[str] = None
+    prepare_ref: Optional[str] = None
+    commit_ref: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1652,7 +1669,32 @@ def _validate_receipt_record(rec: "ReceiptRecord", cfg: LedgerConfig) -> "Receip
     if not math.isfinite(ts) or ts <= 0.0:
         ts = time.time()
 
-    return ReceiptRecord(head=head, body=body_canon, sig=sig, prev=prev, ts=ts, chain_id=chain_id)
+    phase = rec.phase if isinstance(rec.phase, str) else None
+    phase_norm = phase.strip().lower() if phase else None
+    if phase_norm not in {"prepare", "commit", "append", "receipt", "outbox", "audit"}:
+        phase_norm = None
+
+    ledger_ref = rec.ledger_ref or _receipt_governance_ref(chain_id, phase_norm or "append", head)
+    prepare_ref = rec.prepare_ref
+    commit_ref = rec.commit_ref
+    if phase_norm == "prepare" and prepare_ref is None:
+        prepare_ref = _receipt_governance_ref(chain_id, "prepare", head)
+    if phase_norm == "commit" and commit_ref is None:
+        commit_ref = _receipt_governance_ref(chain_id, "commit", head)
+
+    return ReceiptRecord(
+        head=head,
+        body=body_canon,
+        sig=sig,
+        prev=prev,
+        ts=ts,
+        chain_id=chain_id,
+        event_id=rec.event_id,
+        phase=phase_norm,
+        ledger_ref=ledger_ref,
+        prepare_ref=prepare_ref,
+        commit_ref=commit_ref,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1741,16 @@ class Ledger:
 
     def append_receipt_strict(self, rec: ReceiptRecord) -> None:
         self.append_receipt(rec)
+
+    def receipt_governance_ref(self, *, phase: str, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        cid = _validate_chain_id(chain_id, LedgerConfig.from_env())
+        return _receipt_governance_ref(cid, phase, head)
+
+    def prepare_ref(self, *, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        return self.receipt_governance_ref(phase="prepare", head=head, chain_id=chain_id)
+
+    def commit_ref(self, *, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        return self.receipt_governance_ref(phase="commit", head=head, chain_id=chain_id)
 
     def chain_head(self) -> Optional[str]:
         raise NotImplementedError
@@ -1965,7 +2017,19 @@ class InMemoryLedger(Ledger):
             if self._cfg.enforce_monotonic_receipt_ts and rows:
                 last_ts = float(rows[-1].ts)
                 if r.ts <= last_ts:
-                    r = ReceiptRecord(head=r.head, body=r.body, sig=r.sig, prev=r.prev, ts=last_ts + 1e-6, chain_id=chain_id)
+                    r = ReceiptRecord(
+                            head=r.head,
+                            body=r.body,
+                            sig=r.sig,
+                            prev=r.prev,
+                            ts=last_ts + 1e-6,
+                            chain_id=chain_id,
+                            event_id=r.event_id,
+                            phase=r.phase,
+                            ledger_ref=r.ledger_ref,
+                            prepare_ref=r.prepare_ref,
+                            commit_ref=r.commit_ref,
+                        )
 
             rows.append(r)
             heads.add(r.head)
@@ -2883,6 +2947,16 @@ class SQLiteLedger(Ledger):
             except sqlite3.IntegrityError as e:
                 _RCPT_FAIL.inc()
                 raise LedgerError("append_receipt_strict integrity error", code="RECEIPT_INTEGRITY") from e
+
+    def receipt_governance_ref(self, *, phase: str, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        cid = _validate_chain_id(chain_id, self._cfg)
+        return _receipt_governance_ref(cid, phase, head)
+
+    def prepare_ref(self, *, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        return self.receipt_governance_ref(phase="prepare", head=head, chain_id=chain_id)
+
+    def commit_ref(self, *, head: str, chain_id: Optional[str] = None) -> Optional[str]:
+        return self.receipt_governance_ref(phase="commit", head=head, chain_id=chain_id)
 
     def chain_head(self) -> Optional[str]:
         conn = self._get_conn()

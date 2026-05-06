@@ -111,6 +111,7 @@ _DEFAULT_RISK_LABEL_DEFAULTS = MappingProxyType(
 )
 
 _DEFAULT_AV_STRICT_LABELS = ("strict", "critical", "restricted")
+_AV_NON_RISK_LABEL_ALIASES = frozenset({"default", "prod", "dev", "finreg", "lockdown"})
 
 _REASON_CODES = frozenset(
     {
@@ -793,6 +794,18 @@ class Route:
     reason: str
     tags: Tuple[str, ...]
 
+    @property
+    def route_config_fingerprint(self) -> str:
+        return self.config_fingerprint
+
+    @property
+    def cfg_fp(self) -> str:
+        return self.config_fingerprint
+
+    @property
+    def config_fingerprint_kind(self) -> str:
+        return "route"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "schema": self.schema,
@@ -801,6 +814,9 @@ class Route:
             "instance_id": self.instance_id,
             "activation_id": self.activation_id,
             "config_fingerprint": self.config_fingerprint,
+            "route_config_fingerprint": self.config_fingerprint,
+            "cfg_fp": self.config_fingerprint,
+            "config_fingerprint_kind": "route",
             "bundle_version": self.bundle_version,
             "bundle_updated_at_unix_ns": self.bundle_updated_at_unix_ns,
             "policy_ref": self.policy_ref,
@@ -869,6 +885,9 @@ class Route:
             "version": self.version,
             "activation_id": self.activation_id,
             "config_fingerprint": self.config_fingerprint,
+            "route_config_fingerprint": self.config_fingerprint,
+            "cfg_fp": self.config_fingerprint,
+            "config_fingerprint_kind": "route",
             "bundle_version": self.bundle_version,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
@@ -905,6 +924,9 @@ class Route:
             "router_mode": self.router_mode,
             "activation_id": self.activation_id,
             "config_fingerprint": self.config_fingerprint,
+            "route_config_fingerprint": self.config_fingerprint,
+            "cfg_fp": self.config_fingerprint,
+            "config_fingerprint_kind": "route",
             "bundle_version": self.bundle_version,
             "policy_ref": self.policy_ref,
             "policyset_ref": self.policyset_ref,
@@ -1792,6 +1814,24 @@ class StrategyRouter:
                 )
                 continue
 
+            security_raw = item.get("security")
+            security = security_raw if isinstance(security_raw, Mapping) else {}
+
+            e_state_raw = item.get("e_state")
+            e_state = e_state_raw if isinstance(e_state_raw, Mapping) else {}
+            validity_raw = e_state.get("validity") if isinstance(e_state, Mapping) else None
+            validity = validity_raw if isinstance(validity_raw, Mapping) else {}
+            process_raw = e_state.get("process") if isinstance(e_state, Mapping) else None
+            process = process_raw if isinstance(process_raw, Mapping) else {}
+            controller_raw = e_state.get("controller") if isinstance(e_state, Mapping) else None
+            controller = controller_raw if isinstance(controller_raw, Mapping) else {}
+
+            av_label_raw = item.get("av_label") if item.get("av_label") is not None else security.get("av_label")
+            av_label_norm = _safe_label(av_label_raw, default="") if isinstance(av_label_raw, str) else ""
+            if av_label_norm and av_label_norm not in bundle.spec.allowed_av_labels:
+                if av_label_norm in _AV_NON_RISK_LABEL_ALIASES:
+                    av_label_raw = None
+
             ctx = StrategyRouteContext(
                 request_id=item.get("request_id"),
                 trace_id=item.get("trace_id"),
@@ -1802,15 +1842,37 @@ class StrategyRouter:
             )
             signals = StrategySignals(
                 score=item.get("score", 0.0),
-                risk_label=item.get("risk_label", "normal"),
+                risk_label=(
+                    item.get("risk_label")
+                    if item.get("risk_label") is not None
+                    else security.get("risk_label", "normal")
+                ),
                 decision_fail=item.get("decision_fail", False),
                 e_triggered=item.get("e_triggered", False),
                 pq_unhealthy=item.get("pq_unhealthy", False),
-                av_label=item.get("av_label"),
-                av_trigger=item.get("av_trigger"),
+                av_label=av_label_raw,
+                av_trigger=(
+                    item.get("av_trigger")
+                    if item.get("av_trigger") is not None
+                    else security.get("av_trigger", security.get("trigger"))
+                ),
                 threat_tags=_normalize_signal_tags(item.get("threat_kinds") if item.get("threat_kinds") is not None else item.get("threat_tags"), max_items=8),
-                controller_mode=item.get("controller_mode"),
-                guarantee_scope=item.get("guarantee_scope"),
+                controller_mode=(
+                    item.get("controller_mode")
+                    if item.get("controller_mode") is not None
+                    else security.get("controller_mode")
+                ),
+                guarantee_scope=(
+                    item.get("guarantee_scope")
+                    if item.get("guarantee_scope") is not None
+                    else security.get(
+                        "guarantee_scope",
+                        security.get(
+                            "statistical_guarantee_scope",
+                            validity.get("statistical_guarantee_scope", process.get("guarantee_scope")),
+                        ),
+                    )
+                ),
             )
             base = StrategySamplingBase(
                 temperature=item.get("base_temp", item.get("temperature", 1.0)),
@@ -1946,6 +2008,9 @@ class StrategyRouter:
             "version": _ROUTER_VERSION,
             "instance_id": self._instance_id,
             "config_fingerprint": bundle.cfg_fp,
+            "route_config_fingerprint": bundle.cfg_fp,
+            "cfg_fp": bundle.cfg_fp,
+            "config_fingerprint_kind": "route",
             "bundle_version": bundle.version,
             "activation_id": bundle.activation.activation_id,
             "router_mode": eval_out["router_mode"],
@@ -2025,14 +2090,23 @@ class StrategyRouter:
         }
         route_plan_id = f"{_ROUTE_PLAN_ID_VERSION}:{_SAFE_DIGEST_ALG}:{_safe_digest_hex(ctx='tcd:route:plan', payload=route_plan_payload, out_hex=32)}"
 
-        decision_payload = {
-            "instance_id": self._instance_id,
-            "route_plan_id": route_plan_id,
-            "decision_seq": decision_seq,
-            "decision_ts_unix_ns": decision_ts_unix_ns,
-            "request_id": route_context.request_id,
-            "trace_id": route_context.trace_id,
-        }
+        if route_context.request_id or route_context.trace_id:
+            decision_payload = {
+                "route_plan_id": route_plan_id,
+                "request_id": route_context.request_id,
+                "trace_id": route_context.trace_id,
+                "context_digest": eval_out["context_digest"],
+                "signal_digest": eval_out["signal_digest"],
+                "cfg_fp": bundle.cfg_fp,
+                "bundle_version": bundle.version,
+            }
+        else:
+            decision_payload = {
+                "instance_id": self._instance_id,
+                "route_plan_id": route_plan_id,
+                "decision_seq": decision_seq,
+                "decision_ts_unix_ns": decision_ts_unix_ns,
+            }
         decision_id = f"{_DECISION_ID_VERSION}:{_SAFE_DIGEST_ALG}:{_safe_digest_hex(ctx='tcd:route:decision', payload=decision_payload, out_hex=32)}"
 
         return Route(
@@ -2137,8 +2211,11 @@ class StrategyRouter:
 
         av_label = signals.av_label
         if av_label is not None and av_label not in bundle.spec.allowed_av_labels:
-            av_label = None
-            degraded_reason_codes.append("UNKNOWN_AV_LABEL_DROPPED")
+            if av_label in _AV_NON_RISK_LABEL_ALIASES:
+                av_label = None
+            else:
+                av_label = None
+                degraded_reason_codes.append("UNKNOWN_AV_LABEL_DROPPED")
 
         baseline_profile_tier = bundle.spec.profile_defaults.get(resolved_profile, "normal")
         baseline_zone_tier = bundle.spec.zone_defaults.get(resolved_zone, "normal")
