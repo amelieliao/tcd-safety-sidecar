@@ -14,7 +14,7 @@ In practical terms, **TCD turns an LLM call from an opaque application-side oper
 
 The current `service_http` / receipt governance subsystem has moved beyond a runnable PoC.
 
-Based on the latest full receipt governance closure test, the subsystem is best described as:
+Based on the latest full receipt governance closure tests and shared durable evidence-chain consistency tests, the subsystem is best described as:
 
 > **Receipt Governance Subsystem: core governance loop is implemented, end-to-end integration tested, and suitable for staging or internal trial evaluation. It is not yet a production compliance certification or a claim of global distributed consensus.**
 
@@ -27,8 +27,10 @@ This means the current repository has demonstrated a working, test-backed receip
 | Durable evidence | SQLite-backed evidence store and receipt reference store survive process restart. |
 | Integrity verification | Signed receipt body, commit receipt, ledger ref, commit ref, and consistency checks are validated. |
 | Security binding | Build/image supply-chain binding, PQ-required path, PQ-signature path, and negative verification paths are covered. |
-| Operational testability | Uvicorn startup, cleanup, restart, logs, summaries, and pass/fail gates are scripted. |
-| Failure awareness | Wrong build/image and wrong chain head negative tests fail as expected. |
+| Shared persistence | Multi-worker, multi-process, and staged multi-node shared SQLite receipt-chain tests passed without fork or missing predecessor. |
+| Failure recovery | Restart, periodic restart, and `kill -9` recovery paths were tested against shared durable evidence stores. |
+| Operational testability | Uvicorn startup, cleanup, restart, logs, summaries, artifacts, and pass/fail gates are scripted. |
+| Failure awareness | Wrong build/image and wrong chain head negative tests fail as expected; durable evidence faults are surfaced explicitly. |
 
 The current maturity level is therefore:
 
@@ -107,6 +109,396 @@ policy_ref and policyset_ref are validated in the security profile.
 policy_digest is not currently mandatory in the full governance summary.
 If policy_digest becomes a required release gate, add an explicit assertion for it.
 ```
+
+---
+
+## Latest shared durable evidence-chain consistency validation
+
+TCD also completed a staged shared-persistence validation suite covering Phase A through Phase C, from single-machine multi-worker deployment to three-node recovery scenarios.
+
+The suite validated that multiple TCD workers, processes, and nodes can write to a shared durable SQLite evidence store without corrupting the receipt chain, forking the chain, losing receipt references, or reverting to stale chain heads after restart or crash recovery.
+
+### Summary
+
+| Phase | Test | Focus | Result |
+|---|---|---|---|
+| Phase A | M2 | Single machine, 2 workers, shared SQLite store | PASS |
+| Phase A | M3 | Single machine, 4 workers, shared SQLite store | PASS |
+| Phase A | M3b | Single machine, 8 workers, high-pressure shared SQLite store | PASS |
+| Phase B | M4 | Two uvicorn processes, different ports, shared store, A writes and B verifies | PASS |
+| Phase B | M5 | Two uvicorn nodes concurrently writing the same receipt chain | PASS |
+| Phase C | M6 | Three nodes concurrently writing with periodic node restarts | PASS |
+| Phase C | M7 | Three nodes, Node A `kill -9`, B/C continue writing, A recovers | PASS |
+| Phase C | M8 | Recovery verification: latest/window/tail/page/receipt_ref after M7 | PASS |
+
+Overall result:
+
+```bash
+M2_WORKERS2_SHARED_SQLITE_RC=0
+M3_WORKERS4_SHARED_SQLITE_RC=0
+M3B_WORKERS8_SHARED_SQLITE_RC=0
+M4_MULTI_UVICORN_SHARED_STORE_RC=0
+M5_MULTI_UVICORN_CONCURRENT_SAME_CHAIN_RC=0
+M6_THREE_UVICORN_PERIODIC_RESTART_SHARED_CHAIN_RC=0
+M7_A_KILL_RESTART_BC_CONTINUE_SHARED_STORE_RC=0
+M8_RECOVERY_VERIFY_TAIL_PAGE_WINDOW_RC=0
+```
+
+### Phase A: single-machine multi-worker shared store
+
+Phase A validates whether multiple uvicorn workers inside one local service can safely write to the same durable `evidence.sqlite` and `receipt_refs.sqlite`.
+
+#### M2: 2 workers, shared SQLite store
+
+M2 validated the minimum multi-worker shared-store profile.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Cases | cold-start and preinit |
+| Cold-start requests | 4000 / 4000 HTTP 200 |
+| Preinit requests | 4000 / 4000 HTTP 200 |
+| Cold-start durable receipts | 4000 |
+| Preinit durable receipts | 4001 |
+| Restart receipt_ref lookup | 4000 / 4000 and 4001 / 4001 |
+| Storage window verification | Full window verified before and after restart |
+| Critical storage errors | 0 |
+
+M2 passed both cold-start and preinit paths:
+
+```bash
+deployment_gate_passed=true
+m2_cold_start_passed=true
+m2_preinit_passed=true
+```
+
+M2 conclusion:
+
+> A single machine with 2 uvicorn workers can share one SQLite-backed durable receipt store without receipt-chain fork, receipt-ref loss, or restart verification failure.
+
+#### M3: 4 workers, shared SQLite store
+
+M3 increased the worker count to 4 to validate higher writer pressure.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Requests | 5000 / 5000 HTTP 200 |
+| Durable receipts | 5001 including preinit receipt |
+| Storage window checked | 5001 |
+| Restart checked | 5001 |
+| Restart receipt_ref lookup | 5001 / 5001 |
+| Storage window max latency | ~4.05s |
+| Critical storage errors | 0 |
+
+M3 passed all functional, restart, observability, and performance gates:
+
+```bash
+passed=true
+failed_preinit_gates=[]
+failed_pre_restart_gates=[]
+failed_restart_gates=[]
+failed_observability_gates=[]
+```
+
+M3 conclusion:
+
+> A single machine with 4 workers can concurrently append to the shared durable receipt chain and verify the full chain after restart without SQLite lock failure or evidence commit failure.
+
+#### M3b: 8 workers, high-pressure shared SQLite store
+
+M3b extended Phase A to 8 workers, above the expected early MVP worker count, to test whether shared SQLite behavior remains stable under higher local writer pressure.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Requests | 6000 / 6000 HTTP 200 |
+| Durable receipts | 6001 including preinit receipt |
+| Storage window checked | 6001 |
+| Restart checked | 6001 |
+| Restart receipt_ref lookup | 6001 / 6001 |
+| Storage window max latency | ~4.68s |
+| Performance gates | Passed |
+| Critical storage errors | 0 |
+
+M3b conclusion:
+
+> A single machine with 8 uvicorn workers did not produce fork, database locked failures, commit failures, receipt timeouts, or restart verification failures under the tested load.
+
+### Phase B: multiple uvicorn processes, different ports, shared store
+
+Phase B validates cross-process shared persistence. Each uvicorn process runs independently and shares the same durable receipt stores.
+
+#### M4: two uvicorn processes, A writes and B verifies
+
+M4 validated cross-process visibility and verification.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Node A writes | 3200 / 3200 HTTP 200 |
+| Node A receipt refs | 3200 / 3200 |
+| Node B receipt_ref verification | 4784 / 4784 |
+| Node B final all verify | 3200 / 3200 |
+| Final storage window checked | 3200 on A and B |
+| Final A/B latest chain head | Equal |
+| Critical storage errors | 0 |
+
+M4 passed all gates:
+
+```bash
+passed=true
+failed_gates=[]
+```
+
+M4 conclusion:
+
+> One uvicorn process can write durable receipts while another independent uvicorn process reads and verifies those receipts from the same store, including after restart.
+
+#### M5: two uvicorn nodes concurrently writing the same chain
+
+M5 validated two independent uvicorn nodes concurrently appending to the same `service_http/receipts` chain.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Node A writes | 3000 / 3000 HTTP 200 |
+| Node B writes | 3000 / 3000 HTTP 200 |
+| Total writes | 6000 / 6000 HTTP 200 |
+| Receipt refs | 6000 / 6000 |
+| Storage window checked | 6000 on both nodes |
+| Latest chain head | Equal before and after restart |
+| Network errors | 0 |
+| Critical storage errors | 0 |
+
+M5 passed all gates:
+
+```bash
+passed=true
+failed_gates=[]
+a_b_latest_chain_head_equal=true
+restart_a_b_latest_chain_head_equal=true
+checked_count_equals_total_receipt_writes=true
+traffic_covers_block_pq_supply_on_both_nodes=true
+```
+
+M5 observation:
+
+```bash
+evidence_store_file_lock_timeout=3
+```
+
+This did not cause failure. It did not produce commit failure, chain-head mismatch, fork, missing predecessor, or storage-window failure.
+
+M5 conclusion:
+
+> Two independent uvicorn nodes can concurrently write the same shared durable receipt chain while preserving a single latest chain head and complete full-window verification.
+
+### Phase C: three-node concurrency and recovery
+
+Phase C validates scenarios closer to staging: three nodes, shared durable stores, node restarts, crash recovery, and recovery-time global-chain verification.
+
+#### M6: three nodes with concurrent writes and periodic restarts
+
+M6 validated three concurrent writers while periodically restarting nodes.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Node A writes | 2000 / 2000 HTTP 200 |
+| Node B writes | 2000 / 2000 HTTP 200 |
+| Node C writes | 2000 / 2000 HTTP 200 |
+| Total writes | 6000 / 6000 HTTP 200 |
+| Receipt refs | 6000 / 6000 |
+| A/B/C storage window checked | 6000 each |
+| A/B/C latest chain head | Equal |
+| Chain sequence | contiguous, 0 through 5999 |
+| Restart during other-node 5xx | 0 |
+| Critical storage errors | 0 |
+
+M6 passed all core gates:
+
+```bash
+passed=true
+failed_gates=[]
+three_node_http_200_equals_total=true
+storage_window_ok_all=true
+a_b_c_latest_chain_head_equal=true
+checked_count_equals_total_receipt_writes=true
+chain_seq_monotonic_if_available=true
+```
+
+M6 observations:
+
+```bash
+network_error=9
+evidence_store_file_lock_timeout=495
+```
+
+These occurred around restart or file-lock waiting windows and did not cause chain corruption, storage failure, fork, missing predecessor, or commit failure.
+
+M6 conclusion:
+
+> Three uvicorn nodes can write a shared durable receipt chain through periodic restarts while preserving a single chain head, contiguous chain sequence, and full storage-window verification on every node.
+
+#### M7: Node A `kill -9`, B/C continue writing, A recovers
+
+M7 validated a stronger failure case: Node A is killed with inflight requests while B/C continue writing to the shared store.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| Node A acknowledged writes | 800 / 800 HTTP 200 |
+| Node B acknowledged writes | 1200 / 1200 HTTP 200 |
+| Node C acknowledged writes | 1200 / 1200 HTTP 200 |
+| Total acknowledged writes | 3200 / 3200 HTTP 200 |
+| Durable receipts in SQLite | 3207 |
+| B/C continued during A down | true |
+| A restart health | true |
+| A/B/C storage window checked | 3207 each |
+| A/B/C latest chain head | Equal after A restart |
+| Chain sequence | contiguous, 0 through 3206 |
+| Critical storage errors | 0 |
+
+M7 passed all gates:
+
+```bash
+passed=true
+failed_gates=[]
+a_kill9_sent=true
+a_restart_health_ok=true
+b_during_a_down_http_200_continues=true
+c_during_a_down_http_200_continues=true
+a_b_c_latest_chain_head_equal_after_restart=true
+storage_window_ok_all=true
+no_fork_all_storage_windows=true
+receipt_ref_lookup_ok_all_nodes=true
+```
+
+M7 important observation:
+
+```bash
+write_total_http_200=3200
+evidence.receipts_v2=3207
+A network_errors=64
+```
+
+This is expected under `kill -9` with inflight requests. Some durable commits can complete before the HTTP response is returned, then the client observes `RemoteDisconnected` and retries. The important result is that the chain remains valid:
+
+```bash
+chain_seq_contiguous=true
+storage_window_ok_all=true
+forks=0
+missing_prev=0
+tip_count=1
+```
+
+M7 conclusion:
+
+> A crashed node does not roll back or overwrite the global chain. After Node A is killed and restarted, it reads the chain head advanced by B/C, proving recovery from shared durable state rather than stale local cache.
+
+#### M8: recovery verification after M7
+
+M8 validated that after M7 recovery, Node A can verify global state, old receipt references, selected receipt references, newest receipt references, bounded tail windows, and SQL page windows.
+
+Key results:
+
+| Metric | Result |
+|---|---|
+| M7 summary loaded | true |
+| M7 passed | true |
+| Shared evidence store exists | true |
+| Shared receipt_ref store exists | true |
+| A/B/C health | true |
+| B/C continued M8 writes | 2 / 2 HTTP 200 |
+| Final durable receipts | 3211 |
+| A/B/C latest chain head | Equal |
+| Full storage window checked | 3211 on A/B/C |
+| Tail window checked | 128 on A/B/C |
+| SQL chain sequence | contiguous, 0 through 3210 |
+| Critical storage errors | 0 |
+
+M8 passed all gates:
+
+```bash
+passed=true
+failed_gates=[]
+M8_RECOVERY_VERIFY_TAIL_PAGE_WINDOW_RC=0
+```
+
+M8 receipt_ref verification passed for:
+
+- old M7 receipt_ref
+- selected M7 receipt_ref
+- newest M8 receipt_ref
+
+All used durable lookup:
+
+```bash
+verify_input_source=receipt_ref_lookup
+signature_verified=true
+integrity_ok=true
+```
+
+M8 also confirmed signing-key continuity with M7:
+
+```bash
+must_match_m7=true
+shared_hmac_key_id=tcd-attestor:hmac:m7-local
+```
+
+Tail-window note:
+
+The raw service response for bounded tail-window verification may return `ok=false` when only a limited tail window is selected from a longer chain. M8 treats this as acceptable only when the bounded-window gates pass:
+
+```bash
+status=200
+checked=128
+latest_matches_expected=true
+forks=0
+missing_prev=0
+tip_count=1
+reasons include window_limit_exceeded
+unacceptable_reasons=[]
+```
+
+M8 conclusion:
+
+> After crash recovery, Node A can read and verify the global chain head advanced by B/C, verify old and new receipt references, validate bounded tail windows, and confirm contiguous SQL page windows. This proves the recovered node is reading shared global state rather than stale local state.
+
+### Shared-chain validation conclusion
+
+The M2–M8 validation suite supports the following engineering claim:
+
+> Under the tested shared SQLite deployment profiles, TCD preserves a single durable receipt chain across multi-worker, multi-process, and staged multi-node writes. Restart and crash-recovery scenarios did not produce fork, missing predecessor, latest-head mismatch, receipt-ref loss, or evidence commit failure.
+
+This is a shared-persistence consistency result, not a claim of global distributed consensus.
+
+### Shared-chain production observations to monitor
+
+The following counters should remain part of staging and production observability:
+
+- `evidence_store_file_lock_timeout`
+- `database is locked`
+- `sqlite_busy`
+- `sqlite3.OperationalError`
+- `evidence_store_commit_failed`
+- `latest_chain_head_mismatch`
+- `fork`
+- `missing_prev`
+- `receipt_timeout`
+- `receipt_issue_timeout`
+- storage-window verification latency
+- receipt_ref lookup latency
+- RSS growth under worker scaling
+- durable receipts vs acknowledged HTTP responses during crash windows
 
 ---
 
@@ -215,7 +607,7 @@ TCD can be used in more than one way.
 | Shared gateway mode | One TCD cluster fronts multiple model runtimes. | Platform teams, shared routing, and centralized governance. |
 | Control-plane-first mode | Existing serving path remains; TCD is introduced first for admin, verify, storage, and policy governance. | Incremental adoption. |
 | Verify / audit mode | TCD is used primarily for verify, receipt ingest, storage, ledger, and audit workflows. | Audit-first deployments or staged rollout. |
-| Shared-persistence mode | Multiple TCD processes or nodes write to a shared durable receipt store. | Multi-worker or staged multi-node durability validation. |
+| Shared-persistence mode | Multiple TCD processes or nodes write to a shared durable receipt store. | Multi-worker, multi-process, or staged multi-node durability validation. |
 | Hybrid mode | HTTP/gRPC inference surfaces are used in some paths and receipt/verify/storage/admin in others. | Large mixed estates. |
 
 ---
@@ -229,6 +621,13 @@ cd ~/tcd-safety-sidecar
 source venv/bin/activate
 ```
 
+If your virtual environment is named `.venv`, use:
+
+```bash
+cd ~/tcd-safety-sidecar
+source .venv/bin/activate
+```
+
 ### 2. Always clean old uvicorn and curl processes first
 
 Before every local server or full governance test run, check and clean port `8080`.
@@ -240,6 +639,19 @@ pkill -f "uvicorn.*tcd\.service_http:create_app" 2>/dev/null || true
 pkill -f "curl .*127\.0\.0\.1:8080" 2>/dev/null || true
 pkill -f "curl .*localhost:8080" 2>/dev/null || true
 lsof -nP -iTCP:8080 -sTCP:LISTEN || true
+```
+
+For multi-node local tests, also clean ports `8081` and `8082`:
+
+```bash
+for port in 8080 8081 8082; do
+  lsof -nP -iTCP:${port} -sTCP:LISTEN || true
+  for p in $(lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+done
+
+pkill -f "uvicorn.*tcd\.service_http:create_app" 2>/dev/null || true
+pkill -f "curl .*127\.0\.0\.1:808[0-2]" 2>/dev/null || true
+pkill -f "curl .*localhost:808[0-2]" 2>/dev/null || true
 ```
 
 ### 3. Start the HTTP service
@@ -443,6 +855,42 @@ The current full governance validation passed these assertions with exit code `0
 
 ---
 
+## Shared durable evidence-chain regression gate
+
+The shared durable evidence-chain gate validates multi-worker, multi-process, and multi-node shared persistence.
+
+A passing validation should include:
+
+```bash
+M2_WORKERS2_SHARED_SQLITE_RC=0
+M3_WORKERS4_SHARED_SQLITE_RC=0
+M3B_WORKERS8_SHARED_SQLITE_RC=0
+M4_MULTI_UVICORN_SHARED_STORE_RC=0
+M5_MULTI_UVICORN_CONCURRENT_SAME_CHAIN_RC=0
+M6_THREE_UVICORN_PERIODIC_RESTART_SHARED_CHAIN_RC=0
+M7_A_KILL_RESTART_BC_CONTINUE_SHARED_STORE_RC=0
+M8_RECOVERY_VERIFY_TAIL_PAGE_WINDOW_RC=0
+```
+
+Minimum assertions for this gate:
+
+| Test area | Required assertion |
+|---|---|
+| Multi-worker shared SQLite | M2, M3, and M3b pass without fork, database lock failure, or commit failure. |
+| Cross-process shared visibility | M4 proves one process can write and another process can verify receipt_ref and storage_window. |
+| Concurrent same-chain writes | M5 proves two processes can concurrently append to one chain with one latest head. |
+| Three-node restart recovery | M6 proves periodic node restart does not break shared chain verification. |
+| Kill/restart recovery | M7 proves `kill -9` on one node does not roll back global chain state. |
+| Recovery verification | M8 proves the recovered node can verify latest head, historical receipt refs, newest receipt refs, tail window, and SQL page window. |
+| Full-window verification | `storage_window` checks all durable receipts expected by each test. |
+| Chain topology | `forks=0`, `missing_prev=0`, and `tip_count=1` where reported. |
+| SQL chain sequence | `chain_seq` is unique and contiguous where available. |
+| Critical errors | `database is locked`, `sqlite_busy`, `evidence_store_commit_failed`, `latest_chain_head_mismatch`, `fork`, and `missing_prev` remain zero or non-failing. |
+
+This gate supports shared-storage consistency under tested profiles. It does not replace a consensus protocol or a multi-region ordering backend.
+
+---
+
 ## Runtime model
 
 A typical inference path through TCD looks like this:
@@ -556,7 +1004,7 @@ Gives degraded evidence delivery a governed path:
 
 ## Validated behavior
 
-The following behaviors have passed the current manual, regression, fault-injection, concurrency, soak, and full receipt governance closure tests recorded for this repository.
+The following behaviors have passed the current manual, regression, fault-injection, concurrency, soak, full receipt governance closure, and shared durable evidence-chain tests recorded for this repository.
 
 These are test-backed engineering claims, not formal mathematical proofs. They are intentionally scoped to the tested runtime profiles, storage backends, and deployment shapes.
 
@@ -582,8 +1030,12 @@ These are test-backed engineering claims, not formal mathematical proofs. They a
 | Outbox failure/retry | Ledger unavailable forced queueing into outbox, and later flush committed the item. | Ledger outage can degrade into explicit queued outbox state and later recover. |
 | Outbox conflict handling | Same dedupe key + same digest was idempotent; same key + different digest conflicted. | Outbox dedupe avoids silent overwrite. |
 | Storage fault injection | Permission denied, disk full simulation, invalid SQLite path, WAL lock, corrupted row, and oversized receipt body were handled or detected. | Storage fails explicitly and can detect integrity corruption under common SQLite fault scenarios. |
-| Multi-process shared storage | Two uvicorn workers wrote concurrent durable block requests to shared SQLite storage without chain ambiguity. | Shared-storage multi-worker writes preserve an unambiguous chain under tested load. |
-| Multi-node shared persistence | Node A issued a receipt, Node B verified and tailed it, and A/B concurrent commits preserved a single chain. | Shared persistence supports cross-node read/verify and concurrent server-assigned appends under the tested SQLite profile. |
+| Multi-worker shared storage | M2, M3, and M3b passed with 2, 4, and 8 workers sharing one SQLite evidence store. | Multiple local workers can write one durable receipt chain without fork under tested load. |
+| Multi-process shared visibility | M4 passed with two uvicorn processes sharing one durable store. | One process can write receipts and another process can verify receipt refs and full storage windows. |
+| Concurrent same-chain writes | M5 passed with two uvicorn nodes concurrently writing the same receipt chain. | Shared persistence supports concurrent server-assigned appends under the tested SQLite profile. |
+| Three-node restart recovery | M6 passed with three nodes writing concurrently while nodes restarted periodically. | Node restarts did not break shared-store chain consistency under tested load. |
+| Kill/restart recovery | M7 passed with Node A killed by `kill -9`, while B/C continued writing and A later recovered. | A crashed node did not roll back, fork, or overwrite the global chain head. |
+| Recovery-time verification | M8 passed after M7 by verifying latest head, old receipt refs, newest receipt refs, tail window, and SQL page window. | A recovered node can read and verify the global shared-store state advanced by other nodes. |
 | Capacity boundary | A 5,000-request / 100-concurrent-client staging run completed with zero diagnose failures and sampled receipt verification success. | The tested local staging profile handled 100-way concurrent request pressure. |
 | Soak window | A 30-minute mixed-load soak completed without observed failures. | The HTTP/control-plane surface did not show receipt deadlock or verify failure in that soak window. |
 
@@ -599,7 +1051,9 @@ The current validation set supports these scoped claims:
 - prepare-only crashes do not create false commits
 - outbox queue/flush can bridge ledger unavailability
 - storage faults are explicit and corruption is detectable
-- shared SQLite persistence can support concurrent multi-process and tested multi-node writers without chain ambiguity
+- shared SQLite persistence can support concurrent multi-worker, multi-process, and tested multi-node writers without chain ambiguity
+- restarted nodes can recover and verify the latest shared chain head
+- a killed node does not overwrite the global chain head after recovery under the tested shared-store profile
 - local single-process staging capacity testing has passed at 5,000 requests and 100 concurrent clients
 - full receipt governance closure passes in local and security profiles
 
@@ -615,7 +1069,7 @@ The current validation set does **not** imply:
 - third-party security audit approval
 - regulatory certification
 
-Longer soak windows, restart-interval tests, mixed receipt soak tests, key rotation tests, and larger multi-node capacity tests should be tracked as separate validation artifacts when completed.
+Longer soak windows, restart-interval tests, mixed receipt soak tests, key rotation tests, backend migration tests, and larger multi-node capacity tests should be tracked as separate validation artifacts when completed.
 
 ---
 
@@ -706,6 +1160,8 @@ TCD_ATTEST_HMAC_KEY_ID
 TCD_RECEIPT_HMAC_KEY_ID
 ```
 
+When running shared-store recovery tests across multiple phases, use a fixed signing key and key ID across the phases that need to verify historical receipts.
+
 ### Receipt surfaces
 
 ```bash
@@ -741,6 +1197,27 @@ Alternative:
 
 ```bash
 export TCD_HTTP_EVIDENCE_STORE_PATH="/tmp/tcd_evidence_store.sqlite3"
+```
+
+### Shared SQLite concurrency settings used by shared-store tests
+
+The shared-store tests used explicit SQLite timeout and retry settings to make contention visible and recoverable rather than silently failing:
+
+```bash
+export TCD_HTTP_EVIDENCE_STORE_CHAIN_LOCK_ENABLE=1
+export TCD_HTTP_EVIDENCE_STORE_CHAIN_LOCK_TIMEOUT_S=300
+export TCD_HTTP_EVIDENCE_STORE_INIT_LOCK_TIMEOUT_S=300
+export TCD_HTTP_EVIDENCE_STORE_RETRY_ATTEMPTS=64
+export TCD_HTTP_EVIDENCE_STORE_RETRY_BASE_S=0.01
+export TCD_HTTP_EVIDENCE_STORE_RETRY_MAX_S=1
+
+export TCD_HTTP_RECEIPT_REF_STORE_RETRY_ATTEMPTS=64
+export TCD_HTTP_RECEIPT_REF_STORE_INIT_LOCK_TIMEOUT_S=300
+
+export TCD_STORAGE_SQLITE_TIMEOUT_S=300
+export TCD_STORAGE_SQLITE_BUSY_TIMEOUT_MS=300000
+export TCD_STORAGE_SQLITE_SYNCHRONOUS=FULL
+export TCD_STORAGE_SQLITE_WAL_AUTOCHECKPOINT=10000
 ```
 
 ### SecurityRouter and PolicyStore
@@ -826,10 +1303,15 @@ TCD provides strong local or single-process / single-node semantics for:
 
 With a shared SQLite receipt store and server-assigned chain positioning, the validation suite has demonstrated:
 
-- cross-node read/verify after one node writes
-- tail/page access from a second node
+- multi-worker writes to one receipt chain
+- cross-process read/verify after one process writes
 - concurrent A/B commits into one chain
-- no duplicate receipt heads under tested load
+- three-node concurrent shared-store writes
+- node restart without chain-head divergence
+- node crash recovery without old-head overwrite
+- old receipt_ref lookup after process restart or node recovery
+- bounded tail-window verification against expected latest chain head
+- SQL page-window continuity checks
 - no duplicate chain sequence under tested load
 - no fork, cycle, or missing predecessor under tested load
 - one genesis and one leaf in the tested chain
@@ -928,6 +1410,7 @@ TCD treats crash windows as part of the control-plane contract:
 - duplicate write, same digest
 - duplicate write, different digest
 - restart, lookup, and verify
+- node crash, recovery, and shared-chain latest-head verification
 
 These are not afterthoughts. They are part of the system semantics.
 
@@ -1014,8 +1497,14 @@ Recommended validation artifacts include:
 - outbox failure/retry test
 - outbox conflict test
 - storage fault injection test
-- multi-process shared-storage write test
-- multi-node shared-persistence test
+- M2 single-machine 2-worker shared SQLite test
+- M3 single-machine 4-worker shared SQLite test
+- M3b single-machine 8-worker shared SQLite test
+- M4 multi-uvicorn shared-store visibility test
+- M5 multi-uvicorn concurrent same-chain write test
+- M6 three-node periodic restart shared-chain test
+- M7 node kill/restart with other nodes continuing writes test
+- M8 recovery verify tail/page/window/receipt_ref test
 - capacity-boundary concurrency test
 - soak test
 - key rotation test
@@ -1051,6 +1540,21 @@ ALL_FULL_RECEIPT_GOVERNANCE_TESTS_PASSED
 FULL_RECEIPT_GOVERNANCE_EXIT_CODE=0
 ```
 
+### Shared durable evidence-chain gate
+
+Expected for the current shared-store consistency suite:
+
+```bash
+M2_WORKERS2_SHARED_SQLITE_RC=0
+M3_WORKERS4_SHARED_SQLITE_RC=0
+M3B_WORKERS8_SHARED_SQLITE_RC=0
+M4_MULTI_UVICORN_SHARED_STORE_RC=0
+M5_MULTI_UVICORN_CONCURRENT_SAME_CHAIN_RC=0
+M6_THREE_UVICORN_PERIODIC_RESTART_SHARED_CHAIN_RC=0
+M7_A_KILL_RESTART_BC_CONTINUE_SHARED_STORE_RC=0
+M8_RECOVERY_VERIFY_TAIL_PAGE_WINDOW_RC=0
+```
+
 ### Runtime cleanup gate
 
 Before every local server or integration run:
@@ -1062,6 +1566,16 @@ pkill -f "uvicorn.*tcd\.service_http:create_app" 2>/dev/null || true
 pkill -f "curl .*127\.0\.0\.1:8080" 2>/dev/null || true
 pkill -f "curl .*localhost:8080" 2>/dev/null || true
 lsof -nP -iTCP:8080 -sTCP:LISTEN || true
+```
+
+For multi-node tests:
+
+```bash
+for port in 8080 8081 8082; do
+  lsof -nP -iTCP:${port} -sTCP:LISTEN || true
+  for p in $(lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+done
+pkill -f "uvicorn.*tcd\.service_http:create_app" 2>/dev/null || true
 ```
 
 ### Evidence gate
@@ -1086,6 +1600,23 @@ Verify that the release candidate exercises:
 - wrong build/image negative verification
 - wrong chain head negative verification
 
+### Shared-store consistency gate
+
+Verify that the release candidate exercises or references validated artifacts for:
+
+- multi-worker shared SQLite writes
+- multi-process shared-store read/verify
+- two-node concurrent same-chain writes
+- three-node shared-chain writes
+- periodic node restart
+- `kill -9` crash recovery
+- recovered-node latest-head verification
+- old receipt_ref lookup after recovery
+- newest receipt_ref lookup after recovery
+- bounded tail-window verification
+- SQL page-window continuity verification
+- absence of fork, missing predecessor, latest-head mismatch, and evidence commit failure
+
 ### Production hardening gate
 
 Before describing a deployment as production-grade, add or document:
@@ -1104,6 +1635,7 @@ Before describing a deployment as production-grade, add or document:
 - multi-node or multi-region consistency model
 - threat model
 - third-party security review, if required by the deployment environment
+- production SLOs for receipt issue, receipt verify, storage-window verify, and recovery windows
 
 ---
 
@@ -1126,6 +1658,10 @@ The current repository includes:
 - explicit outbox queue/flush/conflict behavior
 - admin control plane with explicit DoD semantics
 - crash-aware prepare/commit/idempotency behavior
+- shared SQLite multi-worker validation
+- shared SQLite multi-process validation
+- staged three-node shared-chain validation
+- node restart and kill/recovery validation
 - staging capacity-boundary validation
 - full receipt governance closure validation for local and security profiles
 
@@ -1136,7 +1672,7 @@ The current repository includes:
 The current system should still be treated as an engineering Alpha / Pre-Beta candidate because these areas need more hardening before broad production claims:
 
 - long-running soak beyond current windows
-- high-concurrency receipt-heavy workloads
+- high-concurrency receipt-heavy workloads beyond the current shared-store tests
 - storage backend migration and schema versioning
 - key rotation and multi-key verification
 - stronger external KMS or hardware-rooted signing profile
@@ -1149,6 +1685,7 @@ The current system should still be treated as an engineering Alpha / Pre-Beta ca
 - external security audit
 - compatibility matrix across dependency versions
 - CI automation for the full governance closure suite
+- CI automation for the shared durable evidence-chain M2–M8 suite
 
 ---
 
