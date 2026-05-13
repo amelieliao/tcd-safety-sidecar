@@ -1,7 +1,3 @@
-cd /Users/amelieliao/tcd-safety-sidecar
-cp README.md "README.md.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
-
-cat > README.md <<'README'
 # TCD
 
 > **Trusted Control Plane for Governed, Quantified, and Verifiable AI Inference**
@@ -2446,39 +2442,3 @@ The current system should still be treated as an Engineering Beta Candidate, not
 ## In one sentence
 
 > **TCD turns inference from an opaque application call into a governed systems event with identity, policy binding, statistical budget state, route contracts, verifiable evidence, durable receipt semantics, replay-aware control-plane actions, KMS/HSM-governed signing, hardware-root provenance under the tested profile, auditable persistence, and tested staging governance boundaries.**
-README
-
-python3 - <<'PY'
-from pathlib import Path
-
-p = Path("README.md")
-text = p.read_text(encoding="utf-8")
-
-required = [
-    "K7_HARDWARE_ROOT_PROFILE_RC=0",
-    "KMS_K1_TO_K7_COMPLETED=true",
-    "M8_RECOVERY_VERIFY_TAIL_PAGE_WINDOW_RC=0",
-    "ALL_FULL_RECEIPT_GOVERNANCE_TESTS_PASSED",
-    "Engineering Beta Candidate",
-    "Current final KMS gate: K7 hardware-root profile",
-]
-
-forbidden = [
-    "K8 status",
-    "K8 reserved",
-    "K8, if introduced",
-    "Use K8 only",
-    "No separate K8",
-]
-
-missing = [x for x in required if x not in text]
-present_forbidden = [x for x in forbidden if x in text]
-
-if missing:
-    raise SystemExit("README validation failed; missing: " + ", ".join(missing))
-if present_forbidden:
-    raise SystemExit("README validation failed; forbidden KMS K8 text remains: " + ", ".join(present_forbidden))
-
-print("README.md updated")
-print("README.md bytes=", p.stat().st_size)
-PY
