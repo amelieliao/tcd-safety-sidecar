@@ -1075,6 +1075,201 @@ These identifiers let operators correlate the live request with policy/config id
 
 ---
 
+## Receipt full-chain local demo
+
+TCD includes a reproducible local receipt full-chain demo for partners, investors, and technical reviewers.
+
+This demo runs on a MacBook or local developer machine without cloud KMS credentials. It uses:
+
+- local HMAC receipt signing
+- strict receipt self-check
+- durable SQLite evidence storage
+- durable `receipt_ref` lookup
+- direct receipt verification
+- storage-window chain verification
+- process restart verification
+- idempotent replay verification
+- negative verification cases for wrong build/image, tampered receipt body, and wrong chain head
+
+This is the recommended first live demo for reviewers because it is deterministic, low-friction, and does not require a cloud KMS or hardware HSM setup.
+
+### Run the demo
+
+From the repository root:
+
+```bash
+cd /path/to/tcd-safety-sidecar
+
+# Optional: activate your local environment if it is not already active.
+# The script also auto-detects .venv/ or venv/ when present.
+source .venv/bin/activate 2>/dev/null || source venv/bin/activate 2>/dev/null || true
+
+bash scripts/demo_receipt_full_chain.sh
+```
+
+Optional custom port:
+
+```bash
+TCD_DEMO_PORT=8088 bash scripts/demo_receipt_full_chain.sh
+```
+
+The script creates a timestamped artifact directory under:
+
+```bash
+demo_artifacts/receipt_full_chain_<timestamp>/
+```
+
+### Expected result
+
+A successful run ends with:
+
+```bash
+PY_COMPILE_OK
+readyz_initial=PASS
+healthz=PASS
+runtime_public=PASS
+
+diagnose=PASS
+verify_bundle=PASS
+verify_ref_lookup=PASS
+verify_storage_window=PASS
+readyz_after_restart=PASS
+verify_ref_after_restart=PASS
+verify_storage_window_after_restart=PASS
+idempotency_replay=PASS
+
+wrong_build_image_negative=PASS_NEGATIVE
+tampered_body_negative=PASS_NEGATIVE
+wrong_chain_head_negative=PASS_NEGATIVE
+
+RECEIPT_FULL_CHAIN_DEMO_RC=0
+passed=true
+failed_gates=[]
+```
+
+A representative successful run also reports:
+
+```bash
+receipt_signer_backend=hmac
+receipt_sig_alg=hmac-sha256
+receipt_ref_store_backend=sqlite
+evidence_store_backend=sqlite
+evidence_store_durable=True
+hardware_root_required=False
+
+receipt_surface_kind=durable_committed
+ledger_stage=committed
+receipt_ref_lookup_store=sqlite durable=True
+
+signature_verified=True
+integrity_ok=True
+head_verified=True
+body_canonical_verified=True
+integrity_hash_verified=True
+cfg_binding_verified=True
+build_binding_verified=True
+image_binding_verified=True
+pq_required=True
+pq_ok=True
+pq_signature_required=True
+pq_signature_ok=True
+
+latest_matches_expected=True
+forks=0
+missing_prev=0
+tip_count=1
+```
+
+Per-run identifiers such as `receipt_ref`, `ledger_ref`, `commit_ref`, `attestation_ref`, `event_id`, `decision_id`, and `route_plan_id` are generated dynamically and will differ between runs.
+
+### What the demo proves
+
+The demo validates the local receipt governance loop end to end:
+
+| Demo gate | What it proves |
+|---|---|
+| `diagnose=PASS` | `/diagnose` can issue a governed decision with a receipt. |
+| `receipt_surface_kind=durable_committed` | The surfaced receipt is durable and committed, not merely ephemeral. |
+| `ledger_ref` / `commit_ref` present | The receipt is bound to durable evidence commit state. |
+| `verify_bundle=PASS` | The receipt can be verified directly from the returned verification bundle. |
+| `verify_ref_lookup=PASS` | The receipt can be verified later using only `receipt_ref`. |
+| `verify_storage_window=PASS` | The durable evidence chain can be verified through `storage_window`. |
+| `verify_ref_after_restart=PASS` | `receipt_ref` lookup survives process restart. |
+| `verify_storage_window_after_restart=PASS` | Chain verification still works after restart. |
+| `idempotency_replay=PASS` | Replaying the same request with the same idempotency key returns the same `receipt_ref`. |
+| `wrong_build_image_negative=PASS_NEGATIVE` | Supply-chain binding mismatches are rejected. |
+| `tampered_body_negative=PASS_NEGATIVE` | Receipt body tampering is detected by head, integrity, and signature checks. |
+| `wrong_chain_head_negative=PASS_NEGATIVE` | Storage-window verification rejects an incorrect expected chain head. |
+
+In one sentence:
+
+> A single local machine can run TCD, issue a durable committed receipt, verify it directly, verify it through durable `receipt_ref` lookup, verify the durable evidence chain, survive process restart, replay idempotently, and reject negative verification cases.
+
+### Demo artifacts
+
+Each run writes the following artifacts:
+
+```bash
+demo_artifacts/receipt_full_chain_<timestamp>/diagnose.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_bundle.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_ref.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_window.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_ref_after_restart.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_window_after_restart.json
+demo_artifacts/receipt_full_chain_<timestamp>/diagnose_replay.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_wrong_build.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_tampered.json
+demo_artifacts/receipt_full_chain_<timestamp>/verify_wrong_head.json
+demo_artifacts/receipt_full_chain_<timestamp>/evidence.sqlite
+demo_artifacts/receipt_full_chain_<timestamp>/receipt_refs.sqlite
+demo_artifacts/receipt_full_chain_<timestamp>/FINAL_RECEIPT_FULL_CHAIN_DEMO_SUMMARY.json
+demo_artifacts/receipt_full_chain_<timestamp>/server.log
+```
+
+The summary artifact is the best single file to share with reviewers:
+
+```bash
+demo_artifacts/receipt_full_chain_<timestamp>/FINAL_RECEIPT_FULL_CHAIN_DEMO_SUMMARY.json
+```
+
+It records the positive gates, negative gates, receipt identifiers, durable evidence refs, and final pass/fail state.
+
+### Important scope boundary
+
+This demo intentionally uses local HMAC signing:
+
+```bash
+receipt_signer_backend=hmac
+receipt_sig_alg=hmac-sha256
+hardware_root_required=False
+```
+
+It is a **local receipt full-chain governance demo**, not a KMS/HSM hardware-root demo.
+
+KMS/HSM validation is covered separately by the K1-K7 regression track:
+
+```bash
+K1_SIGNER_ADAPTER_COMPATIBILITY=PASS
+K2_KMS_SIGN_LOCAL_VERIFY_RC=0
+K3_KMS_ALLOWLIST_RC=0
+K4_KMS_TIMEOUT_FAIL_CLOSED_RC=0
+K5_KMS_KEY_ROTATION_RC=0
+K6_KMS_KEY_REVOCATION_RC=0
+K7_HARDWARE_ROOT_PROFILE_RC=0
+```
+
+This demo is suitable for first-pass reviewer reproduction. It does not replace:
+
+- K7 hardware-root validation
+- KMS rotation/revocation validation
+- multi-worker or multi-node shared-chain validation
+- load testing
+- long-running soak testing
+- real cloud KMS/HSM certification
+- third-party security audit
+
+---
+
 ## Receipt governance quickstart
 
 The receipt governance path becomes meaningful when these are enabled together:
